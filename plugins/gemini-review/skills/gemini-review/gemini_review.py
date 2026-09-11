@@ -26,7 +26,7 @@
     python gemini_review.py                    # 마지막 커밋
     python gemini_review.py --base HEAD~3      # 최근 3커밋
     python gemini_review.py --staged           # 스테이징된 변경 (커밋 직전)
-    python gemini_review.py --base main        # 브랜치 전체 (PR 전)
+    python gemini_review.py --model gemini-3.8-flash-high   # 빠르게
 
 종료 코드: 0 통과(approve·approve_with_comments) / 1 파싱 실패 / 2 실행 실패 /
           3 민감 경로 / 4 빈 응답 / **5 request_changes** / **6 구조화 실패**
@@ -40,14 +40,15 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
-import atexit
-import shutil
+import time
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -71,7 +72,7 @@ _AGY_CANDIDATES = [
 # `--allow-sensitive` 라, 매번 막히면 그 플래그가 습관이 된다. 그 시점부터
 # 진짜 `.env` 도 무경고 통과한다 — 느슨한 매칭이 가드를 영구히 끄는 경로다.
 # ⚠ `.env` 가 **확장자로도** 온다 — `production.env`·`devel.env` 는 배포
-# 스크립트의 흔한 관례다. 실측한 어느 저장소에서는 `.build/devel.env` ·
+# 스크립트의 흔한 관례다. 실측(회사 저장소 cak-front): `.build/devel.env` ·
 # `live.env` · `stage.env` 3건이 세그먼트 규칙만으로는 전부 통과했다.
 # 종전 부분문자열 구현은 이것을 잡았으므로 **놓치면 회귀**다 [26.08.13].
 _SECRET_EXTS = frozenset((
@@ -208,7 +209,50 @@ def _classify_path(path: str) -> str:
     return ""
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
+_DEFAULT_FALLBACK_MODEL = "gemini-3.6-flash-high"
 _CONTEXT_FILE = ".gemini-review.md"
+
+# [26.09.10] **도구 계층 생존 확인.** 빈 응답이 났을 때 원인이 둘 중 어느
+# 쪽인지 가른다: ① agy/모델 계층이 통째로 응답하지 않는다 ② 이 프롬프트·스키마
+# 조합만 빈 응답을 낸다. 실측 근거는 26.09.10 이다 — 다섯 단어 프롬프트가
+# 2분 무응답이었고(`print timeout with turn in progress`), 같은 시각 폴백
+# 모델도 439초 output 0 이었다. ①이면 재시도는 전부 낭비다(그날 400~550초
+# 짜리 호출이 4회 헛돌았다). 그래서 재시도 **전에** 한 줄을 던져 본다.
+_PROBE_PROMPT = "Reply with exactly: OK"
+_PROBE_TIMEOUT = "60s"
+# ⚠ [26.09.10 리뷰] agy 의 `--print-timeout` 은 **응답 불능이 의심되는 그 도구**
+#   에게 상한을 맡기는 것이다. 그것이 지켜지지 않으면(재인증 프롬프트 · 자체
+#   타임아웃 실패) 프로세스가 영원히 매달리고, 시간 낭비를 막으려던 확인이
+#   가장 큰 낭비가 된다. 그래서 **바깥에서도** 벽시계 상한을 건다. agy 가 스스로
+#   끝낼 여유를 주려고 자기 타임아웃보다 넉넉하게 둔다.
+_HARD_TIMEOUT_MARGIN = 120
+
+
+def _duration_seconds(spec: str, default: int) -> int:
+    """agy 표기(`1h`·`10m`·`90s`·`600`)를 초로. 해석할 수 없으면 `default`.
+
+    ⚠ [26.09.10 2회차 리뷰] `--timeout` 원문은 agy 에 그대로 넘어가지만 **바깥
+      하드 상한은 이 파서가 읽은 값**으로 정해진다. 그래서 못 읽는 표기는 그냥
+      기본값이 아니라 **요청보다 훨씬 짧은 상한**이 된다.
+      · `1h` 를 못 읽어 720초에 죽였다(agy 는 1시간을 기다린다).
+      · `--timeout 0`("제한 없음" 의도)이 120초가 됐다 → 0 이하는 기본값으로 본다.
+      · `inf` 는 `int(float("inf"))` 가 **OverflowError** 라 `except ValueError` 를
+        비껴가 스택 트레이스로 죽었다.
+    """
+    text = (spec or "").strip().lower()
+    try:
+        if text.endswith("h"):
+            secs = float(text[:-1]) * 3600
+        elif text.endswith("m"):
+            secs = float(text[:-1]) * 60
+        elif text.endswith("s"):
+            secs = float(text[:-1])
+        else:
+            secs = float(text)
+        value = int(secs)
+    except (ValueError, OverflowError):
+        return default
+    return value if value > 0 else default
 
 
 def _ensure_utf8_stdout() -> None:
@@ -442,15 +486,40 @@ def main(argv=None) -> int:
     # ⚠ `--effort` 는 두지 않는다. agy 는 **모델명에 effort 가 내장**돼 있고
     # (`gemini-3.1-pro-high`/`-low`, `gemini-3.6-flash-medium` …), 모델 접미사와
     # 다른 --effort 를 주면 즉시 status=ERROR 로 죽는다 (실측: 0초, tokens 0).
+    # ⚠ [26.09.10 리뷰] 종전 help 는 "빠르게: gemini-3.6-flash-high" 를 **리터럴**
+    #   로 권했는데, 그 값이 곧 `_DEFAULT_FALLBACK_MODEL` 이라 그대로 주면 폴백이
+    #   침묵한 채 죽었다. 두 상수의 **관계**가 어디에도 표현되지 않은 탓이다.
     ap.add_argument("--model", default=_DEFAULT_MODEL,
-                    help="기본 %s — 바꾸지 말 것. flash 계열은 빈 응답이 잦아 "
-                         "게이트로 쓸 수 없다(실측). 다른 계열이 필요하면 "
-                         "사람에게 먼저 묻는다. `agy models` 로 목록 확인" % _DEFAULT_MODEL)
+                    help="기본 %s. `agy models` 로 목록 확인. 폴백 기본값은 %s 라, "
+                         "그 값을 --model 로 주면 폴백이 자동으로 다른 모델로 "
+                         "바뀐다" % (_DEFAULT_MODEL, _DEFAULT_FALLBACK_MODEL))
+    ap.add_argument("--fallback-model", default=_DEFAULT_FALLBACK_MODEL,
+                    help="주 모델이 빈 응답을 내면 이 모델로 한 번 더 "
+                         "구조화 시도 (기본 %s)" % _DEFAULT_FALLBACK_MODEL)
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="폴백 모델 재시도를 끈다")
     ap.add_argument("--timeout", default="10m", help="agy --print-timeout")
     ap.add_argument("--out", default=None, help="결과 JSON 저장 경로")
     ap.add_argument("--allow-sensitive", action="store_true",
                     help="민감 경로가 diff 에 있어도 강행 (기본: 중단)")
     args = ap.parse_args(argv)
+
+    # ⛔ **시작하자마자 `--out` 을 무효화한다** [26.09.10 2회차 리뷰 high].
+    #   `_write_out` 은 정상 판정·텍스트 폴백·계층 장애·리뷰 불가 **네 곳**에만
+    #   있었다. 그 밖의 종료 경로(파싱 실패 1 · 실행 실패 2 · 민감 경로 3 ·
+    #   **변경분 없음 0** · 새로 만든 하드 타임아웃 2)는 파일을 손대지 않아,
+    #   호출자가 **직전 실행의 낡은 JSON** 을 읽는다. 실측으로 셋을 재현했다.
+    #   가장 나쁜 것은 exit 0 이다 — `--staged` 인데 스테이징을 빠뜨리면 종료코드도
+    #   0, 파일도 어제의 `approve` 라 **양쪽에서 통과로 읽힌다.**
+    #   ⚠ 갈래마다 `_write_out` 을 더하는 대신 여기서 한 번 무효화한다. 종료 경로가
+    #     늘어도 자동으로 덮이고, 중간에 죽어도 낡은 값이 남지 않는다.
+    if args.out:
+        _write_out(args.out, {
+            "mode": "in_progress",
+            "note": "리뷰가 시작됐고 아직 끝나지 않았다. 이 파일이 이 상태로 남아 "
+                    "있으면 리뷰가 중간에 죽은 것이다 — 통과가 아니다.",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }, quiet=True)
 
     agy = _find_agy()
     if not agy:
@@ -493,7 +562,12 @@ def main(argv=None) -> int:
     _safe_print("=" * 74)
     _safe_print("Gemini 교차 리뷰 (Antigravity CLI · %s)" % args.model)
     _safe_print("저장소: %s" % root)
-    _safe_print("범위: %s / 변경 파일 %d개 / diff %d자" % (scope, len(files), len(diff)))
+    # ⚠ [26.09.10] `diff N자` 를 **프롬프트 길이로 읽지 말 것.** diff 는 임시
+    #   파일 경로로 넘어가므로 프롬프트에는 실리지 않는다(`_build_prompt`).
+    #   실측에서 이 수치를 프롬프트 크기로 읽고 빈 응답의 원인을 두 번 잘못
+    #   짚었다("크기 때문" → 실제로는 다섯 단어 프롬프트도 무응답이었다).
+    _safe_print("범위: %s / 변경 파일 %d개 / diff %d자 (파일로 전달 — 프롬프트에 싣지 않는다)"
+                % (scope, len(files), len(diff)))
     _safe_print("맥락: %s" % (_CONTEXT_FILE if project_ctx else "범용 (프로젝트 파일 없음)"))
     _safe_print("민감: %s" % sensitive_label)
     _safe_print("모드: plan (read-only — Gemini 는 파일을 수정할 수 없다)")
@@ -510,8 +584,21 @@ def main(argv=None) -> int:
     if blocked or warned:
         _safe_print("")
 
-    # ⚠ 정리를 등록해 두고 만든다. 예전에는 mkdtemp 만 하고 지우지 않아
-    #   /tmp 에 50개 1.5MB 가 쌓였고, 그 안에 diff 전문이 평문으로 남아 있었다.
+    # ⛔ **정리를 등록해 두고 만든다** — `mkdtemp` 만 하면 지워지지 않는다.
+    #   이 결함은 **두 번째**다. 처음엔 `/tmp` 에 50개 1.5MB 가 쌓였고 그 안에
+    #   diff 전문이 평문으로 남아 있어 고쳤는데(그 주석이 플러그인 v1.2.0 에
+    #   그대로 있다), 그 뒤 Windows 쪽 편집에서 `atexit`·`shutil` import 와
+    #   함께 **통째로 사라졌다.**
+    #   ⚠ 재발 규모가 훨씬 컸다 [26.09.11 실측]: `%TEMP%` 에 **2,875개 ·
+    #     24MB**(09-07~09-11). 테스트가 `main()` 을 반복 호출하므로 스위트를
+    #     한 번 돌릴 때마다 수십 개씩 늘어난다 — 사람이 리뷰를 돌린 횟수와
+    #     무관하게 증폭된다.
+    #   ⚠ 담기는 것이 `changes.diff`(저장소 코드 전문)라 **용량보다 내용이
+    #     문제**다. 비공개 저장소의 diff 가 평문으로 남는다.
+    # → 가드: `tests/test_gemini_review_guards.py::
+    #   test_the_temp_dir_is_registered_for_cleanup` (배선) ·
+    #   `test_a_real_run_leaves_no_temp_dir_behind` (프로세스를 실제로 돌려
+    #   종료 후 남는지 본다 — `atexit` 는 프로세스가 끝나야 돌기 때문이다).
     tmpdir = tempfile.mkdtemp(prefix="gemini_review_")
     atexit.register(shutil.rmtree, tmpdir, True)
     diff_path = os.path.join(tmpdir, "changes.diff")
@@ -521,75 +608,171 @@ def main(argv=None) -> int:
     with open(schema_path, "w", encoding="utf-8") as f:
         json.dump(_SCHEMA, f, ensure_ascii=False)
 
-    cmd = [
-        agy,
-        "--mode", "plan",                 # ★ read-only 고정 (협상 대상 아님)
-        "--model", args.model,
-        "--output-format", "json",
-        "--json-schema", schema_path,
-        "--print-timeout", args.timeout,
-        "--add-dir", root,
-        "-p", _build_prompt(diff_path, files, project_ctx),
-    ]
-    try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        _safe_print("agy 실행 실패: %s" % exc)
-        return 2
-
-    raw = proc.stdout.decode("utf-8", "replace").strip()
-    if proc.returncode != 0 and not raw:
-        _safe_print("agy 종료코드 %d" % proc.returncode)
-        _safe_print(proc.stderr.decode("utf-8", "replace")[:800])
-        return 2
+    prompt = _build_prompt(diff_path, files, project_ctx)
+    used_model = args.model
+    raw, elapsed, fatal = _invoke_schema(agy, used_model, args, root,
+                                         schema_path, prompt)
+    if fatal is not None:
+        return fatal
+    _safe_print("응답: %s · %.0f초" % (used_model, elapsed))
 
     # agy 래퍼를 먼저 본다 — 모델이 **빈 응답**을 낸 경우를 '파싱 실패'로
     # 뭉뚱그리면 원인을 오해한다 (실측: status=SUCCESS 인데 response="" 이고
     # output_tokens 14077·thinking_tokens 13849 — 생각은 했으나 전달 실패).
-    wrapper = None
-    try:
-        wrapper = json.loads(raw)
-    except ValueError:
-        pass
-    if isinstance(wrapper, dict) and "response" in wrapper:
-        usage = wrapper.get("usage") or {}
-        if not str(wrapper.get("response") or "").strip():
-            _safe_print("⚠ 스키마 강제 출력이 빈 응답을 반환했다 "
-                        "(status=%s · %.0fs · output %s · thinking %s)."
-                        % (wrapper.get("status"), wrapper.get("duration_seconds") or 0,
-                           usage.get("output_tokens"), usage.get("thinking_tokens")))
-            # [26.08.12] **텍스트 모드로 재시도한다.**
-            # 진단 결과 `--json-schema` 강제가 원인이다 — 같은 diff·같은 모델로
-            # 스키마 없이 요청하면 정상 응답한다(thinking 은 3만 토큰까지 도는데
-            # 스키마에 맞춘 최종 출력만 비어서 온다). 여기서 그냥 포기하면
-            # **리뷰가 통째로 유실**되므로, 형식을 포기하고 내용을 건진다.
-            _safe_print("   → 텍스트 모드로 재시도한다 (형식만 포기, 리뷰는 받는다)")
-            text = _retry_as_text(agy, args, root, diff_path, files, project_ctx)
-            if text:
-                _safe_print("")
-                _safe_print("-" * 74)
-                _safe_print("[텍스트 모드 리뷰 — 구조화 실패로 원문 그대로]")
-                _safe_print("-" * 74)
-                _safe_print(text)
-                # ⚠ [26.08.13 Gemini 교차리뷰 지적 — 실측 확인] 여기서 `--out`
-                # 을 건너뛰면 호출자가 exit 0 을 받고도 파일이 없어 터지거나,
-                # 더 나쁘게는 **직전 실행의 낡은 JSON** 을 읽어 어제 리뷰로
-                # 오늘 변경을 승인한다. 구조화에 실패했으니 verdict 를 지어내지
-                # 말고, 형식이 다르다는 사실 자체를 파일에 남긴다.
-                _write_out(args.out, {
-                    "mode": "text_fallback",
-                    "note": "스키마 강제가 빈 응답을 반환해 텍스트로 재시도했다 "
-                            "— verdict·findings 없음. 원문을 사람이 읽어야 한다.",
-                    "raw_text": text,
-                })
-                # ⚠ [26.08.25] 종전엔 0 이었다. 그런데 바로 위 note 가 스스로
-                #   *"원문을 사람이 읽어야 한다"* 고 적는다 — 종료코드가 성공이면
-                #   그 당부는 자동화에 전달되지 않는다. 실측 236건 중 28건(12%)이
-                #   이 경로다.
-                return EXIT_UNSTRUCTURED
-            _safe_print("   ⛔ 텍스트 재시도도 실패했다 — 리뷰가 안 된 것이다.")
-            _safe_print("     이 결과를 '지적 없음'으로 읽지 말 것.")
+    info = _empty_info(raw)
+    if info is not None:
+        _safe_print("⚠ 스키마 강제 출력이 빈 응답을 반환했다 "
+                    "(status=%s · %.0fs · output %s · thinking %s)."
+                    % (info["status"], info["duration_seconds"],
+                       info["output_tokens"], info["thinking_tokens"]))
+
+        # ① **도구 계층이 살아 있는가**를 먼저 가른다 [26.09.10].
+        #    이 확인이 없으면 계층 장애일 때 400~550초짜리 재시도를 두세 번 더
+        #    돌게 된다(실측: 그날 4회가 그렇게 헛돌았고, 폴백 모델도 439초
+        #    output 0 이었다). 재시도가 의미 있는 상황인지부터 확인한다.
+        #
+        # ⛔ **[26.09.10 리뷰] 한 모델만 찔러 보고 '계층' 을 단정하면 안 된다.**
+        #    종전 구현은 `used_model` 로만 프로브해 놓고 실패 시 *"도구 계층
+        #    장애 · 모델 변경으로는 넘어가지 않는다"* 고 적었다. 그것은 프로브가
+        #    확인한 적 없는 명제다 — 주 모델 하나만 쿼터·용량 문제로 죽은 상황과
+        #    구분되지 않고, 바로 그 상황을 위해 있는 폴백이 영영 안 불린다.
+        #    → **주 모델이 죽으면 폴백 모델로도 찔러 본다.** 둘 다 죽어야 계층이다.
+        fb = "" if args.no_fallback else (args.fallback_model or "").strip()
+        if fb and fb == used_model:
+            # ⚠ [26.09.10] 종전에는 **문서가 급행 경로로 권하는 값**이 폴백
+            #   기본값과 같아서, 그 값을 주면 폴백이 **침묵한 채** 건너뛰어졌다
+            #   (`--no-fallback` 을 준 실행과 화면이 구분되지 않았다).
+            #   같은 날 문서 넷의 권장값을 `gemini-3.8-flash-high` 로 옮겨 그
+            #   충돌 자체는 없앴지만, 운영자가 손으로 같은 값을 줄 수는 있으므로
+            #   이 갈래는 남긴다.
+            alt = (_DEFAULT_MODEL if used_model != _DEFAULT_MODEL
+                   else _DEFAULT_FALLBACK_MODEL)
+            _safe_print("   ⚠ 폴백 모델이 주 모델과 같다(%s) — 대신 %s 를 쓴다."
+                        % (fb, alt))
+            fb = alt
+
+        _safe_print("   → 계층 생존 확인 (한 줄 프롬프트, %s)" % _PROBE_TIMEOUT)
+        alive, probe_secs = _probe_alive(agy, used_model, root)
+        probe_model, fb_alive, fb_probe_secs = used_model, None, 0.0
+        if not alive and fb:
+            _safe_print("   주 모델 프로브 실패 (%.0f초) — 폴백 모델로 확인한다: %s"
+                        % (probe_secs, fb))
+            fb_alive, fb_probe_secs = _probe_alive(agy, fb, root)
+            if fb_alive:
+                alive, probe_model = True, fb
+        if not alive:
+            _safe_print("   ⛔ agy 가 한 줄 프롬프트에도 응답하지 않는다 "
+                        "(%s). **도구 계층 장애**다."
+                        % ("주 %.0f초 · 폴백 %.0f초" % (probe_secs, fb_probe_secs)
+                           if fb else "%.0f초" % probe_secs))
+            # ⛔ [26.09.10 2회차 리뷰] **확인한 만큼만 말한다.** 종전에는 이 문장이
+            #   조건 없이 찍혀, `--no-fallback` 으로 **주 모델 하나만** 찌른 경우에도
+            #   "모델 변경으로는 안 된다" 고 단정했다. 그러면 주 모델만 죽은 날
+            #   운영자가 다른 모델을 시도하지 않는다 — 1회차가 지적한 오단정이
+            #   기본 경로에서만 고쳐지고 이 갈래에 남아 있었다.
+            if fb:
+                _safe_print("     재시도·모델 변경으로는 넘어가지 않는다 — "
+                            "diff 크기나 프롬프트 내용의 문제가 아니다 "
+                            "(두 모델을 확인했다).")
+                _safe_print("     `agy models` 로 인증을 확인하고, 시간을 두고 "
+                            "다시 돌릴 것. 이 결과를 '지적 없음'으로 읽지 말 것.")
+            else:
+                _safe_print("     ⚠ **주 모델 하나만 확인했다**(폴백 없음) — 다른 "
+                            "모델은 살아 있을 수 있다.")
+                _safe_print("     `--no-fallback` 을 빼고 다시 돌려 볼 것. "
+                            "이 결과를 '지적 없음'으로 읽지 말 것.")
+            _write_out(args.out, {
+                "mode": "tool_unavailable",
+                "note": "agy 계층이 한 줄 프롬프트에도 응답하지 않았다"
+                        "%s — 리뷰가 수행되지 않았다. 통과가 아니다."
+                        % (" (주 모델·폴백 모델 둘 다)" if fb else " (주 모델)"),
+                "model": used_model,
+                "probed_models": [used_model] + ([fb] if fb else []),
+                "elapsed_seconds": round(elapsed, 1),
+                "probe_seconds": round(probe_secs, 1),
+                "fallback_probe_seconds": round(fb_probe_secs, 1),
+            })
             return 4
+        if probe_model != used_model:
+            _safe_print("   생존 확인 OK — **주 모델만 죽었다**(폴백 %s 는 %.0f초에 "
+                        "응답). 계층 장애가 아니다." % (probe_model, fb_probe_secs))
+        else:
+            _safe_print("   생존 확인 OK (%.0f초) — 계층은 살아 있다. "
+                        "프롬프트·스키마 쪽 문제로 좁혀진다." % probe_secs)
+
+        # ② 폴백 모델로 **구조화**를 한 번 더 시도한다. 텍스트보다 먼저 두는
+        #    이유는 판정이 종료코드에 실리기 때문이다(26.08.25) — 텍스트로
+        #    떨어지면 exit 6 이 되어 사람이 원문을 읽어야 한다.
+        text_model = used_model
+        if fb:
+            _safe_print("   → 폴백 모델로 구조화 재시도: %s" % fb)
+            raw2, elapsed2, fatal2 = _invoke_schema(agy, fb, args, root,
+                                                    schema_path, prompt)
+            info2 = None if fatal2 is not None else _empty_info(raw2)
+            if fatal2 is None and info2 is None and _extract_json(raw2) is not None:
+                _safe_print("   폴백 성공: %s · %.0f초" % (fb, elapsed2))
+                raw, used_model, elapsed, info = raw2, fb, elapsed2, None
+            else:
+                _safe_print("   폴백도 실패 (%.0f초) — 텍스트 모드로 내려간다."
+                            % elapsed2)
+                # ⚠ 텍스트 재시도는 **살아 있다고 확인된 모델**로 한다.
+                #   주 모델이 죽은 것이 확인됐는데 그 모델로 텍스트를 요청하면
+                #   같은 시간을 또 태운다(26.09.10 리뷰: 종전에는 이 인자가
+                #   언제나 `args.model` 이라 값이 갈릴 여지가 구조적으로 없었다).
+                text_model = probe_model
+        else:
+            _safe_print("   → 폴백 재시도 없음 (%s)"
+                        % ("--no-fallback" if args.no_fallback
+                           else "폴백 모델 미지정"))
+
+    if info is not None:
+        # [26.08.12] **텍스트 모드로 재시도한다.**
+        # 진단 결과 `--json-schema` 강제가 원인이다 — 같은 diff·같은 모델로
+        # 스키마 없이 요청하면 정상 응답한다(thinking 은 3만 토큰까지 도는데
+        # 스키마에 맞춘 최종 출력만 비어서 온다). 여기서 그냥 포기하면
+        # **리뷰가 통째로 유실**되므로, 형식을 포기하고 내용을 건진다.
+        _safe_print("   → 텍스트 모드로 재시도한다 (형식만 포기, 리뷰는 받는다)")
+        text = _retry_as_text(agy, text_model, args, root, diff_path,
+                              files, project_ctx)
+        if text:
+            _safe_print("")
+            _safe_print("-" * 74)
+            _safe_print("[텍스트 모드 리뷰 — 구조화 실패로 원문 그대로]")
+            _safe_print("-" * 74)
+            _safe_print(text)
+            # ⚠ [26.08.13 Gemini 교차리뷰 지적 — 실측 확인] 여기서 `--out`
+            # 을 건너뛰면 호출자가 exit 0 을 받고도 파일이 없어 터지거나,
+            # 더 나쁘게는 **직전 실행의 낡은 JSON** 을 읽어 어제 리뷰로
+            # 오늘 변경을 승인한다. 구조화에 실패했으니 verdict 를 지어내지
+            # 말고, 형식이 다르다는 사실 자체를 파일에 남긴다.
+            _write_out(args.out, {
+                "mode": "text_fallback",
+                "note": "스키마 강제가 빈 응답을 반환해 텍스트로 재시도했다 "
+                        "— verdict·findings 없음. 원문을 사람이 읽어야 한다.",
+                "model": text_model,
+                "raw_text": text,
+            })
+            # ⚠ [26.08.25] 종전엔 0 이었다. 그런데 바로 위 note 가 스스로
+            #   *"원문을 사람이 읽어야 한다"* 고 적는다 — 종료코드가 성공이면
+            #   그 당부는 자동화에 전달되지 않는다. 실측 236건 중 28건(12%)이
+            #   이 경로다.
+            return EXIT_UNSTRUCTURED
+        _safe_print("   ⛔ 텍스트 재시도도 실패했다 — 리뷰가 안 된 것이다.")
+        _safe_print("     이 결과를 '지적 없음'으로 읽지 말 것.")
+        # ⚠ [26.09.10 리뷰] 이 갈래에도 `--out` 을 남긴다. 종전에는 계층 장애
+        #   경로만 파일을 썼고 여기서는 그냥 `return 4` 였다 — 그러면 호출자가
+        #   **직전 실행의 낡은 JSON** 을 읽어 어제 리뷰로 오늘 변경을 승인한다
+        #   (26.08.13 에 텍스트 성공 경로에서 실제로 확인된 계열인데, 실패
+        #   경로에 같은 구멍이 남아 있었다).
+        _write_out(args.out, {
+            "mode": "review_unavailable",
+            "note": "스키마·폴백·텍스트가 모두 빈 응답이었다 — 리뷰가 수행되지 "
+                    "않았다. 통과가 아니다.",
+            "model": used_model,
+            "text_model": text_model,
+            "elapsed_seconds": round(elapsed, 1),
+        })
+        return 4
 
     payload = _extract_json(raw)
     if payload is None:
@@ -597,6 +780,14 @@ def main(argv=None) -> int:
         _safe_print(raw[:4000])
         return 1
 
+    # ⚠ [26.09.10 리뷰] **어느 모델이 이 판정을 냈는지** 기록한다. 폴백으로
+    #   되찾은 경우 화면의 "폴백 성공" 한 줄은 스크롤백에만 남고, 며칠 뒤
+    #   `--out` JSON 으로 "커밋 전 리뷰 통과" 를 재구성하면 pro 가 냈는지
+    #   flash 가 냈는지 알 방법이 없다(종전에는 `used_model` 이 재대입된 뒤
+    #   한 번도 읽히지 않는 dead store 였다).
+    if isinstance(payload, dict):
+        payload.setdefault("model", used_model)
+        payload.setdefault("elapsed_seconds", round(elapsed, 1))
     _render(payload)
     _write_out(args.out, payload)
     rc = _exit_code_for(payload)
@@ -607,8 +798,12 @@ def main(argv=None) -> int:
     return rc
 
 
-def _write_out(out_path: Optional[str], payload: dict) -> None:
-    """결과 JSON 저장. 실패해도 리뷰 자체는 이미 화면에 나갔으므로 무시한다."""
+def _write_out(out_path: Optional[str], payload: dict,
+               quiet: bool = False) -> None:
+    """결과 JSON 저장. 실패해도 리뷰 자체는 이미 화면에 나갔으므로 무시한다.
+
+    `quiet` 는 **시작 시점 무효화**용이다 — 저장 안내를 두 번 찍지 않는다.
+    """
     path = out_path or os.path.join(
         tempfile.gettempdir(),
         "gemini_review_%s.json" % datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -618,13 +813,129 @@ def _write_out(out_path: Optional[str], payload: dict) -> None:
             os.makedirs(d, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        _safe_print("")
-        _safe_print("결과 저장: %s" % path)
+        if not quiet:
+            _safe_print("")
+            _safe_print("결과 저장: %s" % path)
     except OSError as exc:
-        _safe_print("결과 저장 실패(무시): %s" % exc)
+        if not quiet:
+            _safe_print("결과 저장 실패(무시): %s" % exc)
 
 
-def _retry_as_text(agy: str, args, root: str, diff_path: str,
+def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
+                   prompt: str) -> Tuple[str, float, Optional[int]]:
+    """스키마 강제 호출 1회. 반환 `(raw, 소요초, 치명적 종료코드 or None)`.
+
+    ⚠ **소요를 재는 것이 이 함수의 절반**이다 [26.09.10]. 종전에는 호출 시간이
+      화면에 남지 않아, 25~43초가 400~550초로 열화된 사실을 사람이 알아채지
+      못했다. 그날 원인을 두 번 잘못 짚었는데(프롬프트 크기 → 모델 계층),
+      두 오진 모두 "얼마나 걸렸는가" 가 보였으면 첫 회에 갈렸을 것이다.
+    """
+    cmd = [
+        agy,
+        "--mode", "plan",                 # ★ read-only 고정 (협상 대상 아님)
+        "--model", model,
+        "--output-format", "json",
+        "--json-schema", schema_path,
+        "--print-timeout", args.timeout,
+        "--add-dir", root,
+        "-p", prompt,
+    ]
+    started = time.time()
+    hard = _duration_seconds(args.timeout, 600) + _HARD_TIMEOUT_MARGIN
+    try:
+        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
+                              stdin=subprocess.DEVNULL, timeout=hard)
+    except subprocess.TimeoutExpired:
+        # ⚠ 원인을 정확히 지목한다. 종전 문구는 "`--print-timeout <원문>` 초과" 라
+        #   적어, 래퍼가 그 표기를 못 읽어 상한이 짧아진 경우에도 agy 탓으로
+        #   보이게 했다(26.09.10 2회차 리뷰).
+        _safe_print("agy 를 강제 종료했다 — 바깥 상한 %d초 초과 "
+                    "(--print-timeout %s 요청 · 래퍼는 %d초로 읽었다)."
+                    % (hard, args.timeout, hard - _HARD_TIMEOUT_MARGIN))
+        return "", time.time() - started, 2
+    except (OSError, subprocess.SubprocessError) as exc:
+        _safe_print("agy 실행 실패: %s" % exc)
+        return "", time.time() - started, 2
+    elapsed = time.time() - started
+    raw = proc.stdout.decode("utf-8", "replace").strip()
+    if proc.returncode != 0 and not raw:
+        _safe_print("agy 종료코드 %d (%.0f초)" % (proc.returncode, elapsed))
+        _safe_print(proc.stderr.decode("utf-8", "replace")[:800])
+        return raw, elapsed, 2
+    return raw, elapsed, None
+
+
+def _empty_info(raw: str) -> Optional[dict]:
+    """agy 래퍼가 **빈 응답**을 담고 있으면 진단용 dict, 아니면 None.
+
+    래퍼를 먼저 보는 이유는 원인을 오해하지 않기 위해서다 — 실측은
+    `status=SUCCESS` 인데 `response=""` 이고 output 14077 · thinking 13849
+    이었다(생각은 했으나 전달 실패). 이것을 '파싱 실패' 로 뭉뚱그리면 진단이
+    통째로 빗나간다.
+    """
+    try:
+        wrapper = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(wrapper, dict) or "response" not in wrapper:
+        return None
+    if str(wrapper.get("response") or "").strip():
+        return None
+    usage = wrapper.get("usage") or {}
+    return {
+        "status": wrapper.get("status"),
+        "duration_seconds": wrapper.get("duration_seconds") or 0,
+        "output_tokens": usage.get("output_tokens"),
+        "thinking_tokens": usage.get("thinking_tokens"),
+    }
+
+
+def _probe_alive(agy: str, model: str, root: str) -> Tuple[bool, float]:
+    """agy 계층이 **한 줄 프롬프트**에 응답하는가. 반환 `(살아있음, 초)`.
+
+    이 저장소도 diff 도 읽지 않는 최소 호출이다 — 그래야 결과가 '계층 생존'
+    하나만 뜻한다. 실패하면 재시도(폴백 모델 · 텍스트 모드)는 전부 낭비다.
+
+    ⚠ 살아 있다고 해서 긴 프롬프트가 된다는 뜻은 아니다. 이 확인은 **한쪽
+      방향으로만** 결정적이다 — 죽어 있으면 재시도가 무의미하다는 것.
+    """
+    cmd = [agy, "--mode", "plan", "--model", model,
+           "--output-format", "text",
+           "--print-timeout", _PROBE_TIMEOUT,
+           "-p", _PROBE_PROMPT]
+    started = time.time()
+    hard = _duration_seconds(_PROBE_TIMEOUT, 60) + _HARD_TIMEOUT_MARGIN
+    try:
+        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
+                              stdin=subprocess.DEVNULL, timeout=hard)
+    except subprocess.TimeoutExpired:
+        # 상한을 넘겼다는 것 자체가 '응답하지 않는다' 는 답이다.
+        return False, time.time() - started
+    except (OSError, subprocess.SubprocessError):
+        return False, time.time() - started
+    elapsed = time.time() - started
+    return _probe_says_ok(proc.stdout.decode("utf-8", "replace")), elapsed
+
+
+def _probe_says_ok(text: str) -> bool:
+    """생존 확인 응답이 **실제 답변**인가.
+
+    ⛔ '출력이 비지 않았다' 를 생존으로 읽으면 안 된다. agy 는 응답을 못 받아도
+      안내문을 뱉는다 — 실측 문구가
+      `[agy] print timeout after 2m0s with turn in progress; returning partial
+      output` 이다. 그것을 생존으로 세면 계층 장애일 때 재시도로 넘어가고,
+      이 확인이 막으려던 낭비가 그대로 재발한다(그날 400~550초 × 4회).
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    if "print timeout" in lowered or "turn in progress" in lowered:
+        return False
+    return any(w.strip(".,!?:;\"'`*").upper() == "OK" for w in body.split())
+
+
+def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
                    files: List[str], project_ctx: str) -> str:
     """스키마 없이 텍스트로 재요청 — 형식을 포기하고 내용을 건진다.
 
@@ -645,23 +956,27 @@ def _retry_as_text(agy: str, args, root: str, diff_path: str,
         "지적이 없으면 '지적 사항 없음' 한 줄만 쓰라.",
     )
     cmd = [
-        agy, "--mode", "plan", "--model", args.model,
+        agy, "--mode", "plan", "--model", model,
         "--output-format", "text",
         "--print-timeout", args.timeout,
         "--add-dir", root,
         "-p", prompt,
     ]
+    started = time.time()
+    hard = _duration_seconds(args.timeout, 600) + _HARD_TIMEOUT_MARGIN
     try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False)
+        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
+                              stdin=subprocess.DEVNULL, timeout=hard)
+    except subprocess.TimeoutExpired:
+        _safe_print("   텍스트 재시도: %s · %d초 초과로 강제 종료" % (model, hard))
+        return ""
     except (OSError, subprocess.SubprocessError):
         return ""
-    # ⚠ [26.08.27 교차리뷰 지적] 종료 코드를 보지 않으면, agy 가 타임아웃·인증
-    #   오류로 죽으며 남긴 **에러 문구를 리뷰 원문으로 저장**한다. 그러면 exit 6
-    #   (구조화 실패)이 되어 "리뷰는 받았다"로 읽힌다. 실패는 실패로 돌린다 —
-    #   호출부가 이 빈 문자열을 보고 exit 4(리뷰 안 됨)로 끝낸다.
-    if proc.returncode != 0:
-        return ""
-    return proc.stdout.decode("utf-8", "replace").strip()
+    text = proc.stdout.decode("utf-8", "replace").strip()
+    _safe_print("   텍스트 재시도: %s · %.0f초 · %s"
+                % (model, time.time() - started,
+                   "응답 있음" if text else "빈 응답"))
+    return text
 
 
 def _looks_like_review(d) -> bool:

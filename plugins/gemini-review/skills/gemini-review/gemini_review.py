@@ -769,6 +769,10 @@ def _main(argv, ctx: dict) -> int:
             return EXIT_TOOL_ERROR
         return rc
 
+    if args.check:
+        rc, body = _run_check(args, calls)
+        return finish("check", body, rc)
+
     try:
         root = _git_root(os.getcwd())
         diff, files = _collect_diff(root, args.base, args.head, args.staged,
@@ -1106,6 +1110,128 @@ def _recover_empty_response(agy: str, model: str, args, root: str, diff_path: st
                 "통과가 아니다."}, {}
 
 
+def _run_check(args, calls: List[dict]) -> Tuple[int, dict]:
+    """`--check` — **코드를 보내지 않고** 리뷰가 돌 준비가 됐는지 본다. 반환 `(종료 코드, 결과 본문)`.
+
+    [1.4.0 결정 6 · E15] 첫 실제 리뷰에서야 agy 부재 · 로그인 · 모델 · 인터프리터 문제가 드러났다
+    (DX 리뷰 TTHW 8~15분). 그리고 해석 계층은 **agy 의 출력 표면**(래퍼 필드 · 시간 초과
+    안내문 · 모델 없음 문구)에 기댄다 — agy 가 판을 올려 문구를 바꾸면 시간 초과가 빈 응답으로,
+    모델명 오류가 도구 오류로 조용히 오진된다. 그 표면을 한 줄 프롬프트로 직접 찔러 본다.
+
+    종료 코드: 0 모두 정상 / 2 설치 · 인증 · 출력 형식 문제 / 4 모델 무응답 · 쿼터(기다리면 풀림).
+    ⚠ 결과 JSON 의 `_meta.passed` 는 언제나 false 다 — 점검은 리뷰가 아니다.
+    ⛔ agy 에는 **한 줄 프롬프트만** 보낸다. `--add-dir` · diff · 저장소 경로를 넘기지 않는다(테스트가 본다).
+    """
+    checks: List[dict] = []
+    bad = set()
+
+    def mark(name: str, ok, detail: str, rc_if_bad: int = EXIT_TOOL_ERROR) -> None:
+        # ok: True 정상 · False 문제 · None 참고(종료 코드에 영향 없음)
+        checks.append({"name": name, "ok": ok, "detail": detail})
+        _safe_print("  %s %s: %s" % ({True: "✓", False: "✗", None: "·"}[ok], name, detail))
+        if ok is False:
+            bad.add(rc_if_bad)
+
+    def done() -> Tuple[int, dict]:
+        # 설치 · 인증 · 형식 문제(2)가 기다리면 풀리는 문제(4)보다 먼저다 — 고칠 것이 있다는 뜻이다.
+        rc = (EXIT_TOOL_ERROR if EXIT_TOOL_ERROR in bad
+              else EXIT_NOT_REVIEWED if bad else EXIT_PASSED)
+        _safe_print("점검 %s (종료코드 %d) — 리뷰는 수행하지 않았다." % ("정상" if rc == 0 else "문제 있음", rc))
+        return rc, {"checks": checks, "note": "점검 결과다 — 리뷰가 아니다. 통과가 아니다."}
+
+    _safe_print("gemini-review v%s 점검 — 코드는 보내지 않는다 (한 줄 프롬프트만)" % __version__)
+    _safe_print("스크립트: %s" % os.path.abspath(__file__))
+    mark("python", sys.version_info >= (3, 7),
+         "%s (%s)" % (sys.version.split()[0], sys.executable))
+    cwd = os.getcwd()
+    root = None
+    try:
+        mark("git", True, _git(["--version"], cwd).strip())
+        try:
+            root = _git_root(cwd)
+            mark("저장소", True, root)
+        except RuntimeError:
+            mark("저장소", None, "현재 폴더는 git 저장소가 아니다 — 리뷰는 저장소 안에서 돌린다")
+    except RuntimeError as exc:
+        mark("git", False, str(exc))
+
+    agy = _find_agy(root)
+    if not agy:
+        mark("agy", False, "찾지 못했다 — https://antigravity.google/cli 에서 설치하고 `agy` 로 로그인")
+        return done()
+    mark("agy", True, agy)
+    # ⛔ agy 의 작업 폴더를 **빈 임시 폴더**로 둔다. 저장소에서 돌리면 agy 가 그 폴더를 작업
+    #   공간으로 삼는다 — "코드를 보내지 않는다" 를 프롬프트 내용이 아니라 구조로 지킨다.
+    where = tempfile.mkdtemp(prefix="gemini_review_check_")
+    try:
+        return _check_agy_surface(agy, args, where, mark, done, calls)
+    finally:
+        shutil.rmtree(where, True)
+
+
+def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]) -> Tuple[int, dict]:
+    """`--check` 의 agy 부분 — 모델 응답 · 래퍼 필드 · 시간 초과 안내 · 모델 없음 안내."""
+    # ① 주 모델이 한 줄 프롬프트에 구조화 래퍼로 답하는가 (로그인 · 모델 · 래퍼 필드)
+    run = _run_agy(agy, args.model, ["--output-format", "json",
+                                     "--print-timeout", _PROBE_TIMEOUT,
+                                     "-p", _PROBE_PROMPT], where, _PROBE_TIMEOUT, 60)
+    cause, kind, detail = _classify_run(run, structured=True)
+    calls.append(_call_record("check_model", args.model, run, cause, kind, detail))
+    if cause != "ok":
+        mark("모델 응답", False, "%s · %s%s" % (args.model, cause, " · " + detail if detail else ""),
+             EXIT_NOT_REVIEWED if cause in ("timeout", "quota", "empty") else EXIT_TOOL_ERROR)
+        return done()
+    # ⚠ 래퍼를 **먼저** 본다. 형식이 바뀌어 `response` 를 못 찾으면 OK 판별도 틀리는데, 그것을
+    #   "모델 무응답(4)" 으로 적으면 기다리라는 뜻이 된다 — 고칠 것은 이 스크립트다(2).
+    try:
+        wrapper = json.loads(run.stdout)
+    except ValueError:
+        wrapper = None
+    missing = [k for k in ("status", "response") if not (isinstance(wrapper, dict) and k in wrapper)]
+    if missing:
+        mark("모델 응답", None, "%s · %.0f초 · agy 는 응답했으나 래퍼를 읽지 못해 내용은 확인하지 못했다"
+             % (args.model, run.elapsed))
+        mark("출력 래퍼", False, "필드 %s 가 없다 — agy 출력 형식이 바뀌어 빈 응답 판별이 틀릴 수 "
+             "있다" % ", ".join(missing))
+    else:
+        says_ok = _probe_says_ok(_response_text(run.stdout))
+        mark("모델 응답", says_ok, "%s · %.0f초%s" % (
+            args.model, run.elapsed, "" if says_ok else " · 응답이 OK 가 아니다: %s"
+            % _first_line(_response_text(run.stdout))[:80]))
+        mark("출력 래퍼", True, "status · response 필드 있음")
+
+    # ② 출력 시간 초과 안내문을 알아보는가 — 못 알아보면 시간 초과가 '빈 응답' 으로 오진된다
+    run = _run_agy(agy, args.model, ["--output-format", "json", "--print-timeout", "1s",
+                                     "-p", _CHECK_SLOW_PROMPT], where, "1s", 30)
+    cause, kind, detail = _classify_run(run, structured=True)
+    calls.append(_call_record("check_timeout", args.model, run, cause, kind, detail))
+    if cause == "timeout" and kind == "agy":
+        mark("시간 초과 안내", True, "1초 상한에서 안내문을 알아봤다 (agy 종료코드 %s)" % run.rc)
+    elif cause == "ok":
+        mark("시간 초과 안내", None, "1초 안에 끝나 확인하지 못했다")
+    else:
+        mark("시간 초과 안내", False,
+             "1초 상한에서 원인을 %s 로 읽었다%s — agy 안내문이 바뀌었을 수 있다"
+             % (cause, " (" + detail + ")" if detail else ""))
+
+    # ③ 없는 모델명을 알아보는가 — 못 알아보면 모델명 오류가 도구 오류 · 빈 응답으로 읽힌다
+    run = _run_agy(agy, _CHECK_NO_SUCH_MODEL, ["--output-format", "json", "--print-timeout", "30s",
+                                               "-p", _PROBE_PROMPT], where, "30s", 30)
+    cause, kind, detail = _classify_run(run, structured=True)
+    calls.append(_call_record("check_no_model", _CHECK_NO_SUCH_MODEL, run, cause, kind, detail))
+    mark("모델 없음 안내", cause == "model_unavailable",
+         "없는 모델명을 알아봤다" if cause == "model_unavailable" else
+         "없는 모델명을 %s 로 읽었다%s — agy 문구가 바뀌었을 수 있다"
+         % (cause, " (" + detail + ")" if detail else ""))
+    return done()
+
+
+# 1초 안에 끝나지 않을 만큼 출력이 긴 요청 — 시간 초과 안내문을 일부러 부른다(코드는 보내지 않는다).
+_CHECK_SLOW_PROMPT = "Write the integers from 1 to 400, one per line, with no other text."
+# agy 가 모를 것이 분명한 모델명. 이름 자체가 점검용임을 드러낸다.
+_CHECK_NO_SUCH_MODEL = "gemini-review-check-no-such-model"
+
+
 def _resolve_probe_model(args) -> str:
     """진단 모델. 끄면 빈 문자열. 주 모델과 같으면 다른 모델로 바꾼다(같으면 확인이 무의미하다)."""
     probe = "" if args.no_probe_fallback else (args.probe_model or "").strip()
@@ -1239,6 +1365,10 @@ def _build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_exit_code_epilog())
     ap.add_argument("--version", action=_PrintVersion)
+    ap.add_argument("--check", action="store_true",
+                    help="코드를 보내지 않고 python · git · agy · 로그인 · 모델 응답과 agy 출력 "
+                         "형식(시간 초과 · 모델 없음 안내)을 점검한다. 0 정상 · 2 설치 · 인증 · "
+                         "형식 문제 · 4 무응답 · 쿼터")
     ap.add_argument("--base", default="HEAD~1",
                     help="비교 기준 (기본 HEAD~1). merge-base 기준 3-dot 이다")
     ap.add_argument("--head", default="HEAD", help="비교 끝 (기본 HEAD)")

@@ -388,27 +388,52 @@ def _check_agy_calls_are_plan_mode(gr):
         ("_probe_alive", lambda: gr._probe_alive("agy", "m", ".")),
         ("_retry_as_text", lambda: gr._retry_as_text(
             "agy", "m", args, ".", "changes.diff", ["a.py"], "")),
+        ("_run_check", lambda: gr._run_check(
+            types.SimpleNamespace(model="m", timeout="10m"), [])),
     )
     for name, invoke in sites:
         calls = []
         with _quiet(), _patched(gr, "subprocess",
-                                _fake_subprocess(calls, stdout=b"OK")):
+                                _fake_subprocess(calls, stdout=b"OK")), \
+                _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                _patched(gr, "_git", lambda *a, **k: "git version test"), \
+                _patched(gr, "_git_root", lambda start: "."):
             invoke()
-        if len(calls) != 1:
-            yield "%s 가 agy 를 %d번 불렀다 (기대 1번)" % (name, len(calls))
+        want = 3 if name == "_run_check" else 1
+        if len(calls) != want:
+            yield "%s 가 agy 를 %d번 불렀다 (기대 %d번)" % (name, len(calls), want)
             continue
-        cmd = calls[0]
-        # `--mode plan` 과 `--mode=plan` 을 같은 것으로 본다 [26.09.14 Gemini 교차리뷰].
-        values = []
-        for i, a in enumerate(cmd):
-            if a == "--mode":
-                values.append(cmd[i + 1] if i + 1 < len(cmd) else None)
-            elif a.startswith("--mode="):
-                values.append(a.split("=", 1)[1])
-        ok = values == ["plan"]
-        yield (None if ok else
-               "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다 — "
-               "Gemini 가 파일을 수정할 수 있게 된다: %s" % (name, cmd[:6]))
+        # ⚠ [1.4.0 교차리뷰 HIGH — 실측 확인] 점검 경로(명령 셋)를 더하며 둘째 명령부터 따로
+        #   `cmd.index("--mode")` 로 봤더니 `--mode=plan` 꼴에서 ValueError 였다. **모든 명령**을
+        #   같은 판별(`_mode_values`)로 본다.
+        for cmd in calls:
+            yield (None if _mode_values(cmd) == ["plan"] else
+                   "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다 — "
+                   "Gemini 가 파일을 수정할 수 있게 된다: %s" % (name, cmd[:6]))
+
+
+def _mode_values(cmd):
+    """명령의 `--mode` 값 목록. `--mode plan` 과 `--mode=plan` 을 같은 것으로 본다 [26.09.14 Gemini 교차리뷰].
+
+    값이 빠진 `--mode`(마지막 인자)는 None 으로 센다 — 예외를 내지 않는다.
+    """
+    values = []
+    for i, a in enumerate(cmd):
+        if a == "--mode":
+            values.append(cmd[i + 1] if i + 1 < len(cmd) else None)
+        elif a.startswith("--mode="):
+            values.append(a.split("=", 1)[1])
+    return values
+
+
+def _check_mode_values_parser(gr):
+    """`_mode_values` 가 두 꼴 · 값 빠짐 · 중복을 예외 없이 가른다(가드의 가드)."""
+    del gr
+    for cmd, want in ((["agy", "--mode", "plan"], ["plan"]), (["agy", "--mode=plan"], ["plan"]),
+                      (["agy", "--mode"], [None]), (["agy"], []),
+                      (["agy", "--mode", "plan", "--mode=agent"], ["plan", "agent"])):
+        got = _mode_values(cmd)
+        yield None if got == want else "_mode_values(%r) → %r (기대 %r)" % (cmd, got, want)
 
 
 def _check_run_agy_contract(gr):
@@ -1989,9 +2014,90 @@ def _check_scope_records_resolved_shas(gr):
         _rmtree_sandbox(sandbox, sandbox)
 
 
+def _check_check_mode(gr):
+    """`--check` 는 **코드를 보내지 않고** 점검하며, agy 출력 표면이 바뀌면 빨간불(2)을 낸다(1.4.0 결정 6).
+
+    ⚠ 해석 계층은 agy 의 래퍼 필드 · 시간 초과 안내문 · 모델 없음 문구에 기댄다. agy 판이 바뀌어
+      문구가 달라지면 시간 초과가 빈 응답으로, 모델명 오류가 도구 오류로 **조용히** 오진된다.
+      점검이 그것을 알아보는지 본다. 실물 확인(26.09.15, agy 1.2.2): 세 가지 모두 정상, 21초.
+    """
+    P = "m-main"
+    R = gr._AgyRun
+    NO = gr._CHECK_NO_SUCH_MODEL
+    GOOD = {
+        ("probe", P): R(0, stdout=_wrap("OK")),
+        ("text", P): R(0, stdout=_wrap(""), stderr="[agy] print timeout after 1s with turn in progress; returning partial output"),
+        ("probe", NO): R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG)),
+    }
+    # (이름, 응답 덮어쓰기, agy 경로, 기대 exit, 기대 agy 호출 수, 빨개져야 할 점검 항목)
+    #   ⚠ [변이 검사로 보강] 종료 코드만 보면 "래퍼가 바뀜" 을 "모델 응답 이상" 으로 적어도 2 라
+    #     통과했다 — **어느 항목**이 빨개졌는지까지 본다.
+    rows = [
+        ("모두 정상", {}, "agy", 0, 3, []),
+        ("시간 초과 안내문이 바뀜", {("text", P): R(0, stdout=_wrap(""), stderr="timed out")}, "agy", 2, 3,
+         ["시간 초과 안내"]),
+        ("모델 없음 문구가 바뀜", {("probe", NO): R(1, stdout=_wrap("", status="ERROR", error="unknown thing"))},
+         "agy", 2, 3, ["모델 없음 안내"]),
+        ("래퍼 필드가 바뀜", {("probe", P): R(0, stdout=json.dumps({"state": "SUCCESS", "result": "OK"}))},
+         "agy", 2, 3, ["출력 래퍼"]),
+        ("주 모델 무응답", {("probe", P): R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE)}, "agy", 4, 1,
+         ["모델 응답"]),
+        ("쿼터", {("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG))}, "agy", 4, 1,
+         ["모델 응답"]),
+        ("인증 오류", {("probe", P): R(1, stdout="Error: authentication required.")}, "agy", 2, 1,
+         ["모델 응답"]),
+        ("agy 없음", {}, None, 2, 0, ["agy"]),
+    ]
+    for label, override, agy, want_rc, want_calls, want_bad in rows:
+        sandbox = tempfile.mkdtemp(prefix="gr_test_check_")
+        try:
+            responses = dict(GOOD)
+            responses.update(override)
+            fake, log = _agy_script(gr, responses)
+            extras, cwds = [], []
+
+            def spy(agy_, model, extra, cwd, timeout_spec, default_secs):
+                extras.append(list(extra))
+                cwds.append(cwd)
+                return fake(agy_, model, extra, cwd, timeout_spec, default_secs)
+
+            out = os.path.join(sandbox, "o.json")
+            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                    _patched(gr, "_find_agy", lambda *a, **k: agy), \
+                    _patched(gr, "_git", lambda *a, **k: "git version test"), \
+                    _patched(gr, "_git_root", lambda start: sandbox), \
+                    _patched(gr, "_collect_diff", lambda *a, **k: (_ for _ in ()).throw(
+                        AssertionError("점검이 diff 를 모았다"))), \
+                    _patched(gr, "_run_agy", spy):
+                rc = gr.main(["--check", "--model", P, "--out", out])
+            body = _read_json(out)
+            meta = body.get("_meta") or {}
+            leaked = [e for e in extras if "--add-dir" in e or "--json-schema" in e]
+            leaked += ["cwd=%s" % c for c in cwds if os.path.realpath(c) == os.path.realpath(sandbox)
+                       or os.path.exists(c)]
+            problems = []
+            if rc != want_rc or meta.get("exit_code") != want_rc:
+                problems.append("exit %s · _meta.exit_code %r (기대 %d)" % (rc, meta.get("exit_code"), want_rc))
+            if body.get("mode") != "check" or meta.get("passed") is not False:
+                problems.append("mode %r · passed %r (기대 check · false)" % (body.get("mode"), meta.get("passed")))
+            if len(log) != want_calls:
+                problems.append("agy 호출 %d회 (기대 %d)" % (len(log), want_calls))
+            got_bad = [c.get("name") for c in body.get("checks") or [] if c.get("ok") is False]
+            if got_bad != want_bad:
+                problems.append("빨간 항목 %r (기대 %r)" % (got_bad, want_bad))
+            if leaked:
+                problems.append("점검이 저장소 · 스키마를 넘겼거나 저장소 · 남는 폴더에서 agy 를 돌렸다"
+                                "(코드를 보내면 안 된다): %r" % leaked[:1])
+            yield (None if not problems else "--check [%s]: %s" % (label, " · ".join(problems)))
+        finally:
+            _rmtree_sandbox(sandbox, sandbox)
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
+    _check_mode_values_parser,
     _check_run_agy_contract,
     _check_find_agy_skips_relative_candidates,
     _check_tmpdir_removed_after_real_run,
@@ -2025,6 +2131,7 @@ _BEHAVIOR_CHECKS = (
     _check_small_parsers,
     _check_help_survives_cp949,
     _check_scope_records_resolved_shas,
+    _check_check_mode,
 )
 
 

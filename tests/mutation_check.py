@@ -174,6 +174,20 @@ _MUTATIONS = [
     ("도움말에 cp949 밖 문자", _G,
      [('    ("3", "민감 경로: 전송 중단"),', '    ("3", "민감 경로 \u2014 전송 중단"),')],
      "cp949"),
+    # ── --check (1.4.0) ──
+    ("점검이 저장소에서 agy 를 돌림", _G,
+     [('    where = tempfile.mkdtemp(prefix="gemini_review_check_")\n',
+       '    where = root or cwd\n'),
+      ("        shutil.rmtree(where, True)\n\n\ndef _check_agy_surface(",
+       "        pass\n\n\ndef _check_agy_surface(")],
+     "코드를 보내면 안 된다"),
+    ("점검이 시간 초과 안내 변화를 못 알아봄", _G,
+     [('    if cause == "timeout" and kind == "agy":\n        mark("시간 초과 안내", True',
+       '    if True:\n        mark("시간 초과 안내", True')],
+     "--check [시간 초과 안내문이 바뀜]"),
+    ("점검이 래퍼 변화를 모델 무응답으로", _G,
+     [("    if missing:\n        mark(\"모델 응답\", None,", "    if False:\n        mark(\"모델 응답\", None,")],
+     "--check [래퍼 필드가 바뀜]"),
 ]
 
 

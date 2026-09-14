@@ -278,15 +278,18 @@ def _quiet():
         yield
 
 
-def _fake_subprocess(calls, returncode=0, stdout=b"", stderr=b"", raises=None):
+def _fake_subprocess(calls, returncode=0, stdout=b"", stderr=b"", raises=None,
+                     kwargs_log=None):
     """`gr.subprocess` 자리에 넣을 가짜 모듈. `run` 만 바꾼다.
 
     ⚠ 진짜 `subprocess.run` 을 덮어쓰지 않는다 — 그러면 같은 프로세스의
       다른 검사(자식 프로세스를 띄우는 검사)까지 가짜를 탄다.
       예외 클래스·`DEVNULL` 은 진짜를 그대로 쓴다.
     """
-    def run(cmd, **_kwargs):
+    def run(cmd, **kwargs):
         calls.append(list(cmd))
+        if kwargs_log is not None:
+            kwargs_log.append(kwargs)
         if raises is not None:
             raise raises
         return types.SimpleNamespace(returncode=returncode,
@@ -406,6 +409,33 @@ def _check_agy_calls_are_plan_mode(gr):
         yield (None if ok else
                "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다 — "
                "Gemini 가 파일을 수정할 수 있게 된다: %s" % (name, cmd[:6]))
+
+
+def _check_run_agy_contract(gr):
+    """`_run_agy` 가 **바깥 하드 상한 · stdin 차단**을 걸고, 끝까지 못 기다린 호출을 구분한다.
+
+    ⚠ [26.09.15 S5] agy 호출 세 자리를 한 곳으로 모았다. 그 한 곳에서 상한이 빠지면 응답
+      불능인 agy 에 리뷰가 영원히 매달린다(26.09.10 — 재인증 프롬프트 · 자체 타임아웃 실패).
+    """
+    kw = []
+    with _patched(gr, "subprocess", _fake_subprocess([], stdout=b" out \n", kwargs_log=kw)):
+        run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
+    want = 90 + gr._HARD_TIMEOUT_MARGIN
+    yield (None if kw and kw[0].get("timeout") == want
+           and kw[0].get("stdin") is subprocess.DEVNULL else
+           "_run_agy 의 subprocess.run 에 하드 상한(%d) · stdin 차단이 없다: %r" % (want, kw[:1]))
+    yield (None if run.rc == 0 and run.stdout == "out" and not run.hard_timeout else
+           "대조군: 정상 호출 결과를 옮기지 못했다: rc %r · stdout %r" % (run.rc, run.stdout))
+    with _patched(gr, "subprocess", _fake_subprocess(
+            [], raises=subprocess.TimeoutExpired(["agy"], want))):
+        run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
+    yield (None if run.rc is None and run.hard_timeout and run.hard_limit == want else
+           "하드 상한 초과를 구분하지 못한다: rc %r · hard_timeout %r" % (run.rc, run.hard_timeout))
+    with _patched(gr, "subprocess", _fake_subprocess(
+            [], raises=OSError(8, "Exec format error"))):
+        run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
+    yield (None if run.rc is None and run.error and not run.hard_timeout else
+           "실행 실패(OSError)를 구분하지 못한다: rc %r · error %r" % (run.rc, run.error))
 
 
 def _check_find_agy_skips_relative_candidates(gr):
@@ -1283,7 +1313,8 @@ def _check_diff_is_independent_of_user_git_config(gr):
 
 
 # 이 함수들 **안에서만** subprocess 를 쓴다. 새 자리가 생기면 여기와 위 검사들을 함께 늘릴 것.
-_SUBPROCESS_SITES = {"_git", "_invoke_schema", "_probe_alive", "_retry_as_text"}
+#   [26.09.15 S5] agy 는 `_run_agy` 한 곳에서만 부른다 — `--mode plan` · 하드 상한이 거기 있다.
+_SUBPROCESS_SITES = {"_git", "_run_agy"}
 
 
 def _check_subprocess_use_is_contained(gr):
@@ -1622,6 +1653,7 @@ def _check_empty_response_names_its_cause(gr):
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
+    _check_run_agy_contract,
     _check_find_agy_skips_relative_candidates,
     _check_tmpdir_removed_after_real_run,
     _check_out_never_keeps_stale_result,

@@ -1201,6 +1201,55 @@ def _write_json_atomic(path: str, payload: dict) -> None:
         raise
 
 
+class _AgyRun(object):
+    """agy 호출 한 번의 결과. **`_run_agy` 만 만든다.**
+
+    `rc` 는 agy 의 종료 코드, 프로세스를 끝까지 기다리지 못했으면 None 이다
+    (`hard_timeout` · `error` 중 하나가 원인을 말한다).
+    """
+
+    def __init__(self, rc, stdout="", stderr="", elapsed=0.0, hard_limit=0,
+                 hard_timeout=False, error=""):
+        self.rc = rc
+        self.stdout = stdout
+        self.stderr = stderr
+        self.elapsed = elapsed
+        self.hard_limit = hard_limit
+        self.hard_timeout = hard_timeout
+        self.error = error
+
+
+def _run_agy(agy: str, model: str, extra: List[str], cwd: str,
+             timeout_spec: str, default_secs: int) -> _AgyRun:
+    """agy 를 부르는 **유일한** 자리. `--mode plan` · stdin 차단 · 바깥 하드 상한을 여기서만 건다.
+
+    ⛔ [26.09.14 Eng 교차리뷰 S5] 종전에는 세 함수(구조화 · 생존 확인 · 텍스트 재시도)가
+      각자 `subprocess.run` · 상한 · `--mode plan` 을 적었다. "종료 코드를 안 본다" 결함이
+      그 세 자리에서 **한 번씩 따로** 났다 — 모아 두면 빠질 자리가 하나다.
+    ⚠ `extra` 에 `--mode` 를 넣지 말 것. 두 번 주면 어느 값이 이기는지 agy 에 달린다
+      (테스트가 명령마다 `--mode plan` 이 정확히 한 번인지 본다).
+    ⚠ 바깥 상한은 agy 자신의 `--print-timeout` 보다 넉넉하다(`_HARD_TIMEOUT_MARGIN`).
+      응답 불능이 의심되는 도구에게 상한을 맡기지 않기 위한 것이다(26.09.10).
+    """
+    cmd = [agy, "--mode", "plan",         # ★ read-only 고정 (협상 대상 아님)
+           "--model", model] + list(extra)
+    hard = _duration_seconds(timeout_spec, default_secs) + _HARD_TIMEOUT_MARGIN
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, check=False,
+                              stdin=subprocess.DEVNULL, timeout=hard)
+    except subprocess.TimeoutExpired:
+        return _AgyRun(None, elapsed=time.time() - started, hard_limit=hard,
+                       hard_timeout=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _AgyRun(None, elapsed=time.time() - started, hard_limit=hard,
+                       error=str(exc) or exc.__class__.__name__)
+    return _AgyRun(proc.returncode,
+                   stdout=proc.stdout.decode("utf-8", "replace").strip(),
+                   stderr=proc.stderr.decode("utf-8", "replace").strip(),
+                   elapsed=time.time() - started, hard_limit=hard)
+
+
 def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
                    prompt: str) -> Tuple[str, float, Optional[int]]:
     """스키마 강제 호출 1회. 반환 `(raw, 소요초, 치명적 종료코드 or None)`.
@@ -1210,45 +1259,36 @@ def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
       못했다. 그날 원인을 두 번 잘못 짚었는데(프롬프트 크기 → 모델 계층),
       두 오진 모두 "얼마나 걸렸는가" 가 보였으면 첫 회에 갈렸을 것이다.
     """
-    cmd = [
-        agy,
-        "--mode", "plan",                 # ★ read-only 고정 (협상 대상 아님)
-        "--model", model,
+    run = _run_agy(agy, model, [
         "--output-format", "json",
         "--json-schema", schema_path,
         "--print-timeout", args.timeout,
         "--add-dir", root,
         "-p", prompt,
-    ]
-    started = time.time()
-    hard = _duration_seconds(args.timeout, 600) + _HARD_TIMEOUT_MARGIN
-    try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
-                              stdin=subprocess.DEVNULL, timeout=hard)
-    except subprocess.TimeoutExpired:
+    ], root, args.timeout, 600)
+    elapsed = run.elapsed
+    if run.hard_timeout:
         # ⚠ 원인을 정확히 지목한다. 종전 문구는 "`--print-timeout <원문>` 초과" 라
         #   적어, 래퍼가 그 표기를 못 읽어 상한이 짧아진 경우에도 agy 탓으로
         #   보이게 했다(26.09.10 2회차 리뷰).
         _safe_print("agy 를 강제 종료했다 — 바깥 상한 %d초 초과 "
                     "(--print-timeout %s 요청 · 래퍼는 %d초로 읽었다)."
-                    % (hard, args.timeout, hard - _HARD_TIMEOUT_MARGIN))
-        return "", time.time() - started, 2
-    except (OSError, subprocess.SubprocessError) as exc:
-        _safe_print("agy 실행 실패: %s" % exc)
-        return "", time.time() - started, 2
-    elapsed = time.time() - started
-    raw = proc.stdout.decode("utf-8", "replace").strip()
-    err = proc.stderr.decode("utf-8", "replace").strip()
+                    % (run.hard_limit, args.timeout, run.hard_limit - _HARD_TIMEOUT_MARGIN))
+        return "", elapsed, 2
+    if run.rc is None:
+        _safe_print("agy 실행 실패: %s" % run.error)
+        return "", elapsed, 2
+    raw, err = run.stdout, run.stderr
     # ⛔ [26.09.14 실측] 종전 조건은 `returncode != 0 and not raw` 였다.
     #   · 없는 모델명 → agy exit 1 + stdout 에 `{"status":"ERROR","response":"",
     #     "error":"invalid model selection …"}` → 빈 응답으로 읽혀 생존 확인 ·
     #     **폴백 모델 판정**으로 이어졌다(주 모델이 없어도 flash 의 approve 가 exit 0).
     #   · 인증 오류처럼 stdout 에 평문이 오면 "JSON 파싱 실패" exit 1 로 끝났다.
     #   → agy 가 실패를 알리면(종료 코드 · 래퍼 status) stdout 과 무관하게 실패다.
-    if proc.returncode != 0 or _wrapper_status(raw) == "ERROR":
+    if run.rc != 0 or _wrapper_status(raw) == "ERROR":
         detail = _agy_error_detail(raw, err)
         _safe_print("⛔ agy 가 실패했다(종료코드 %d · %.0f초) — 리뷰가 수행되지 않았다."
-                    % (proc.returncode, elapsed))
+                    % (run.rc, elapsed))
         if detail:
             _safe_print("   %s" % detail.splitlines()[0][:300])
         if _looks_like_model_error(detail):
@@ -1328,28 +1368,19 @@ def _probe_alive(agy: str, model: str, root: str) -> Tuple[bool, float]:
     ⚠ 살아 있다고 해서 긴 프롬프트가 된다는 뜻은 아니다. 이 확인은 **한쪽
       방향으로만** 결정적이다 — 죽어 있으면 재시도가 무의미하다는 것.
     """
-    cmd = [agy, "--mode", "plan", "--model", model,
-           "--output-format", "text",
-           "--print-timeout", _PROBE_TIMEOUT,
-           "-p", _PROBE_PROMPT]
-    started = time.time()
-    hard = _duration_seconds(_PROBE_TIMEOUT, 60) + _HARD_TIMEOUT_MARGIN
-    try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
-                              stdin=subprocess.DEVNULL, timeout=hard)
-    except subprocess.TimeoutExpired:
-        # 상한을 넘겼다는 것 자체가 '응답하지 않는다' 는 답이다.
-        return False, time.time() - started
-    except (OSError, subprocess.SubprocessError):
-        return False, time.time() - started
-    elapsed = time.time() - started
+    run = _run_agy(agy, model, [
+        "--output-format", "text",
+        "--print-timeout", _PROBE_TIMEOUT,
+        "-p", _PROBE_PROMPT,
+    ], root, _PROBE_TIMEOUT, 60)
+    # 상한을 넘겼거나 실행 자체가 안 됐으면(rc None) '응답하지 않는다' 는 답이다.
     # ⛔ [26.09.14 Eng 교차리뷰] 종전에는 stdout 만 봤다 — `_retry_as_text` ·
     #   `_invoke_schema` 에서 고친 "종료 코드를 안 본다" 계열의 세 번째 자리다.
     #   에러 문구에 OK 라는 낱말이 섞이면 살아 있다고 판정해 긴 재시도로 넘어간다.
-    alive = (proc.returncode == 0
-             and not _is_print_timeout(proc.stderr.decode("utf-8", "replace"))
-             and _probe_says_ok(proc.stdout.decode("utf-8", "replace")))
-    return alive, elapsed
+    alive = (run.rc == 0
+             and not _is_print_timeout(run.stderr)
+             and _probe_says_ok(run.stdout))
+    return alive, run.elapsed
 
 
 def _probe_says_ok(text: str) -> bool:
@@ -1446,26 +1477,18 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
         "  실패 시나리오: <구체적 입력/상태 → 잘못된 결과>\n"
         "지적이 없으면 '지적 사항 없음' 한 줄만 쓰라.",
     )
-    cmd = [
-        agy, "--mode", "plan", "--model", model,
+    run = _run_agy(agy, model, [
         "--output-format", "text",
         "--print-timeout", args.timeout,
         "--add-dir", root,
         "-p", prompt,
-    ]
-    started = time.time()
-    hard = _duration_seconds(args.timeout, 600) + _HARD_TIMEOUT_MARGIN
-    try:
-        proc = subprocess.run(cmd, cwd=root, capture_output=True, check=False,
-                              stdin=subprocess.DEVNULL, timeout=hard)
-    except subprocess.TimeoutExpired:
-        _safe_print("   텍스트 재시도: %s · %d초 초과로 강제 종료" % (model, hard))
+    ], root, args.timeout, 600)
+    if run.hard_timeout:
+        _safe_print("   텍스트 재시도: %s · %d초 초과로 강제 종료" % (model, run.hard_limit))
         return ""
-    except (OSError, subprocess.SubprocessError):
+    if run.rc is None:
         return ""
-    elapsed = time.time() - started
-    text = proc.stdout.decode("utf-8", "replace").strip()
-    err = proc.stderr.decode("utf-8", "replace").strip()
+    elapsed, text, err = run.elapsed, run.stdout, run.stderr
     # ⚠ [26.08.27 교차리뷰 지적] 종료 코드를 보지 않으면, agy 가 타임아웃·인증
     #   오류로 죽으며 남긴 **에러 문구를 리뷰 원문으로 저장**한다. 그러면 exit 6
     #   (구조화 실패)이 되어 "리뷰는 받았다" 로 읽힌다. 실패는 실패로 돌린다.
@@ -1475,9 +1498,9 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
     #   authentication required…` 가 그대로 exit 6 의 리뷰 원문이 됐다.
     #   → 가드: `tests/test_gemini_review.py::_check_retry_as_text_rejects_failed_agy`
     #     (문자열이 아니라 이 함수를 가짜 agy 로 직접 돌린다).
-    if proc.returncode != 0:
+    if run.rc != 0:
         _safe_print("   텍스트 재시도: %s · %.0f초 · agy 종료코드 %d — 리뷰로 쓰지 않는다"
-                    % (model, elapsed, proc.returncode))
+                    % (model, elapsed, run.rc))
         if err or text:
             _safe_print("     %s" % (err or text)[:800])
         return ""

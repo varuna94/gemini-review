@@ -13,10 +13,12 @@
 
 import contextlib
 import importlib.util
+import json
 import os
 import io
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -193,6 +195,27 @@ def _patched(obj, name, value):
         setattr(obj, name, old)
 
 
+def _rmtree_sandbox(path, sandbox):
+    """`sandbox` **안**의 경로만 지운다. 밖이면 지우지 않고 예외를 낸다.
+
+    ⛔ [26.09.14 사고] 결과 폴더 검사의 정리 코드가 "경로가 임시 폴더 아래면 그
+      폴더를 지운다" 는 조건이었다. 변이(기본 결과 폴더를 `tempfile.gettempdir()`
+      로 되돌림) 아래에서 그 폴더가 **`/tmp` 자체**가 되어 `shutil.rmtree("/tmp")`
+      가 실행됐고, 사용자 소유 `/tmp` 파일과 **다른 Claude Code 세션의 작업
+      폴더**가 지워졌다. 테스트는 코드가 계산한 경로를 지우면 안 된다 — 코드가
+      틀리면(바로 그것을 검사하는 중이다) 그 경로가 어디든 될 수 있다.
+    """
+    real = os.path.realpath(path)
+    root = os.path.realpath(sandbox)
+    # 샌드박스 자체도 확인한다: 테스트가 만든 `gr_test_*` 폴더여야 하고 임시 폴더 루트면 안 된다.
+    if (not os.path.basename(root).startswith("gr_test_")
+            or root == os.path.realpath(tempfile.gettempdir())):
+        raise RuntimeError("샌드박스가 아닌 폴더 삭제 거부: %s" % sandbox)
+    if real != root and not real.startswith(root + os.sep):
+        raise RuntimeError("샌드박스 밖 삭제 거부: %s (샌드박스 %s)" % (path, sandbox))
+    shutil.rmtree(real, True)
+
+
 @contextlib.contextmanager
 def _quiet():
     """스킬이 찍는 진행 문구를 삼킨다 — 검사 결과만 화면에 남긴다."""
@@ -263,6 +286,15 @@ def _check_retry_as_text_rejects_failed_agy(gr):
     got = call(returncode=0, stdout=review.encode("utf-8"))
     yield (None if got == review else
            "대조군: _retry_as_text 가 정상 응답(exit 0)을 버린다: %r" % got[:60])
+
+    # 대조군 3 — [26.09.14 Gemini 교차리뷰 2회차] 리뷰 **중간** 줄이 안내문 꼴로
+    #   시작해도 버리지 않는다(안내문은 출력 끝에 붙는다).
+    mid = ("판정: request_changes\n[agy] print timeout after 10m0s with turn in progress; "
+           "returning partial output\n  내용: 위 안내문이 stdout 에 섞이는 경우를 다룬다\n요약: 끝")
+    got = call(returncode=0, stdout=mid.encode("utf-8"))
+    yield (None if got == mid else
+           "대조군: 중간 줄이 '[agy] print timeout' 으로 시작하는 정상 리뷰를 버린다: %r"
+           % got[:60])
 
     # 대조군 2 — 이 저장소를 리뷰한 정상 결과는 "print timeout" 을 **인용**한다.
     #   본문 전체에서 문구를 찾으면 그런 리뷰를 버린다(오탐 → exit 4).
@@ -342,7 +374,7 @@ def _check_find_agy_skips_relative_candidates(gr):
                "대조군: _find_agy 가 절대 경로 후보를 찾지 못한다: %r" % got)
     finally:
         os.chdir(old_cwd)
-        shutil.rmtree(sandbox, True)
+        _rmtree_sandbox(sandbox, sandbox)
 
 
 # 자식 프로세스에서 `main()` 을 가짜 agy 로 끝까지 돌린다.
@@ -408,7 +440,237 @@ def _check_tmpdir_removed_after_real_run(gr):
                "프로세스가 끝났는데 diff 를 담은 임시 디렉터리 %s 가 남았다 — "
                "저장소 코드가 평문으로 쌓인다" % dirs[0])
     finally:
-        shutil.rmtree(sandbox, True)
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+class _Skip(object):
+    """동작 검사를 이 환경에서 돌릴 수 없을 때 낸다. 검사 수에 넣지 않고 따로 알린다.
+
+    ⚠ 조용히 건너뛰지 않는다 — 요약 줄에 "건너뜀 N건: 이유" 로 남긴다.
+    """
+    def __init__(self, reason):
+        self.reason = reason
+
+
+_STALE_APPROVE = {"verdict": "approve", "summary": "어제의 리뷰", "findings": []}
+
+
+def _main_inprocess(gr, argv, sandbox, payload=None):
+    """가짜 agy · git 으로 `main()` 을 같은 프로세스에서 돌린다. 반환 `(rc, 모델 호출 목록)`.
+
+    ⚠ `--out` 을 주지 않는 호출은 기본 결과 폴더(`$XDG_STATE_HOME`)를 쓰므로,
+      이 함수는 그 변수를 샌드박스로 돌려 **실제 홈에 흔적을 남기지 않는다.**
+    """
+    calls = []
+
+    def fake_invoke(agy, model, args, root, schema_path, prompt):
+        calls.append(model)
+        body = payload if payload is not None else {
+            "verdict": "approve", "summary": "t", "findings": []}
+        return json.dumps(body), 0.0, None
+
+    env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+    with _quiet(), \
+            _patched(os, "environ", env), \
+            _patched(gr, "_find_agy", lambda: "agy"), \
+            _patched(gr, "_git_root", lambda start: sandbox), \
+            _patched(gr, "_collect_diff",
+                     lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])), \
+            _patched(gr, "_invoke_schema", fake_invoke):
+        try:
+            rc = gr.main(argv)
+        except SystemExit as exc:          # argparse 오류 · --help
+            rc = exc.code
+    return rc, calls
+
+
+def _read_json(path):
+    with io.open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _check_out_never_keeps_stale_result(gr):
+    """`--out` 에 **직전 실행의 결과가 남는 경로가 없다.**
+
+    ⛔ [26.09.14 Eng 교차리뷰 P1 — 재현] ① 인자 오류면 무효화 전에 argparse 가
+      exit 2 로 끝나 파일이 어제의 approve 그대로였다. ② 쓸 수 없는 `--out` 이면
+      무효화 · 최종 기록이 모두 조용히 실패해 **exit 5 인데 파일은 approve** 였다.
+      파일만 믿는 자동화(hook)는 둘 다 통과로 읽는다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_out_")
+    try:
+        out = os.path.join(sandbox, "out.json")
+        with io.open(out, "w", encoding="utf-8") as fh:
+            json.dump(_STALE_APPROVE, fh)
+        rc, _ = _main_inprocess(gr, ["--out", out, "--no-such-flag"], sandbox)
+        body = _read_json(out)
+        yield (None if body.get("verdict") != "approve" else
+               "인자 오류(exit %s)인데 --out 에 직전 실행의 approve 가 남았다" % rc)
+
+        # 시작 무효화는 됐는데 **최종 기록만** 실패 → 판정(approve)이 아니라 exit 2
+        out2 = os.path.join(sandbox, "out2.json")
+        real_atomic = gr._write_json_atomic
+
+        def fail_on_verdict(path, payload):
+            if "verdict" in payload:
+                raise OSError("디스크 가득 참(흉내)")
+            return real_atomic(path, payload)
+
+        with _patched(gr, "_write_json_atomic", fail_on_verdict):
+            rc, _ = _main_inprocess(gr, ["--out", out2], sandbox)
+        mode = _read_json(out2).get("mode")
+        yield (None if rc == 2 and mode == "in_progress" else
+               "최종 기록이 실패했는데 exit %s · 파일 mode %r — 통과로 읽힐 수 있다"
+               % (rc, mode))
+
+        # ⚠ 아래는 환경에 따라 건너뛴다 — 환경과 무관한 검사는 **이 앞에** 둘 것
+        #   [26.09.14 Gemini 교차리뷰: 건너뜀 뒤 return 이 뒤 검사까지 삼켰다].
+        # 쓸 수 없는 --out → 리뷰를 시작하지 않고(외부 호출 0회) exit 2
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            yield _Skip("쓰기 불가 폴더를 만들 수 없는 환경(Windows · root)")
+            return
+        locked = os.path.join(sandbox, "locked")
+        os.makedirs(locked)
+        target = os.path.join(locked, "out.json")
+        with io.open(target, "w", encoding="utf-8") as fh:
+            json.dump(_STALE_APPROVE, fh)
+        os.chmod(locked, 0o500)
+        try:
+            rc, calls = _main_inprocess(
+                gr, ["--out", target], sandbox,
+                payload={"verdict": "request_changes", "summary": "s", "findings": []})
+        finally:
+            os.chmod(locked, 0o700)
+        yield (None if rc == 2 and not calls else
+               "쓸 수 없는 --out 인데 리뷰가 진행됐다(exit %s · agy 호출 %d회) — "
+               "종료 코드와 파일이 다른 이야기를 한다" % (rc, len(calls)))
+
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_write_out_is_atomic(gr):
+    """결과 기록 도중 끊겨도 **잘린 JSON 이 남지 않는다.**
+
+    [26.09.14 실측] `open(path, "w")` + `json.dump` 도중 `SystemExit` 이면
+    잘린 JSON 이 남았다(`JSONDecodeError`).
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_atomic_")
+    try:
+        out = os.path.join(sandbox, "out.json")
+        with io.open(out, "w", encoding="utf-8") as fh:
+            json.dump({"mode": "in_progress"}, fh)
+
+        def dying_dump(obj, fp, **kw):
+            fp.write('{"verdict": "appro')
+            raise SystemExit(143)
+
+        with _quiet(), _patched(gr.json, "dump", dying_dump):
+            try:
+                gr._write_out(out, _STALE_APPROVE)
+            except SystemExit:
+                pass
+        try:
+            body = _read_json(out)
+            ok = body == {"mode": "in_progress"}
+        except ValueError:
+            ok = False
+        leftovers = [n for n in os.listdir(sandbox) if n != "out.json"]
+        yield (None if ok and not leftovers else
+               "기록 도중 끊기자 결과 파일이 깨졌거나 임시 파일이 남았다(%s)" % leftovers)
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_verdict_model_is_recorded_by_code(gr):
+    """`--out` 의 `model` 은 **코드가 실제로 부른 모델**이다.
+
+    ⛔ [26.09.14 CEO 스펙 리뷰 — 확인] `payload.setdefault("model", used_model)` 은
+      LLM 응답에 `model` 키가 있으면 그 값을 남겼다. 폴백 모델이 판정했는데
+      `"model": "gemini-3.1-pro-high"` 가 기록될 수 있고, diff 속 프롬프트 주입으로도
+      위조된다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_model_")
+    try:
+        out = os.path.join(sandbox, "out.json")
+        forged = {"verdict": "approve", "summary": "t", "findings": [],
+                  "model": "gemini-3.1-pro-high", "elapsed_seconds": 0.0}
+        rc, calls = _main_inprocess(gr, ["--out", out, "--model", "m-actual"],
+                                    sandbox, payload=forged)
+        body = _read_json(out)
+        yield (None if body.get("model") == "m-actual" else
+               "LLM 응답의 model 값(%r)이 실제 판정 모델(m-actual) 대신 기록됐다"
+               % body.get("model"))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_default_result_dir_is_private(gr):
+    """`--out` 이 없을 때 결과는 **사용자 전용** 폴더에 0600 으로 쌓인다.
+
+    [26.09.14 실측] 종전에는 공유 `/tmp` 에 `-rw-rw-r--` 로 쌓였다(137개).
+    남이 먼저 만든 폴더 · 링크는 쓰지 않는다(Eng 리뷰).
+    """
+    if os.name == "nt":
+        yield _Skip("POSIX 권한 검사(Windows 는 %LOCALAPPDATA% 가 사용자별)")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_resdir_")
+    real_mkdtemp = tempfile.mkdtemp
+
+    def mkdtemp_in_sandbox(suffix=None, prefix=None, dir=None):
+        # 코드가 대체 폴더를 만들더라도 샌드박스 안에 만들게 한다 — 정리는 샌드박스째.
+        return real_mkdtemp(suffix=suffix, prefix=prefix, dir=sandbox)
+
+    stray = []                             # 코드가 샌드박스 밖에 쓴 **파일**(폴더는 안 지움)
+    try:
+        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        with _quiet(), _patched(os, "environ", env), \
+                _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
+            path = gr._write_out(None, _STALE_APPROVE)
+        if path and not os.path.realpath(path).startswith(os.path.realpath(sandbox) + os.sep):
+            stray.append(path)
+        mode_dir = stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode)
+        mode_file = stat.S_IMODE(os.stat(path).st_mode)
+        inside = os.path.dirname(path) == os.path.join(sandbox, "state", "gemini-review")
+        yield (None if inside and mode_dir == 0o700 and mode_file == 0o600 else
+               "기본 결과 위치 · 권한이 기대와 다르다: %s (폴더 %o · 파일 %o)"
+               % (path, mode_dir, mode_file))
+
+        # [26.09.14 Gemini 교차리뷰 HIGH] 내 소유인데 쓰기 권한이 없는 폴더(0500)도 고쳐 쓴다
+        state3 = os.path.join(sandbox, "state3")
+        locked = os.path.join(state3, "gemini-review")
+        os.makedirs(locked)
+        os.chmod(locked, 0o500)
+        env = dict(os.environ, XDG_STATE_HOME=state3)
+        with _quiet(), _patched(os, "environ", env), \
+                _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
+            path = gr._write_out(None, _STALE_APPROVE)
+        os.chmod(locked, 0o700)            # 검사 결과와 무관하게 정리할 수 있게
+        if path and not os.path.realpath(path).startswith(os.path.realpath(sandbox) + os.sep):
+            stray.append(path)
+        yield (None if path and os.path.dirname(path) == locked else
+               "쓰기 권한 없는 내 결과 폴더(0500)를 고치지 않아 결과가 %r 에 갔다" % path)
+
+        # 결과 폴더 자리가 다른 곳을 가리키는 링크면 따라가지 않는다
+        state2 = os.path.join(sandbox, "state2")
+        elsewhere = os.path.join(sandbox, "elsewhere")
+        os.makedirs(state2)
+        os.makedirs(elsewhere)
+        os.symlink(elsewhere, os.path.join(state2, "gemini-review"))
+        env = dict(os.environ, XDG_STATE_HOME=state2)
+        with _quiet(), _patched(os, "environ", env), \
+                _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
+            path = gr._write_out(None, _STALE_APPROVE)
+        if path and not os.path.realpath(path).startswith(os.path.realpath(sandbox) + os.sep):
+            stray.append(path)
+        yield (None if not os.listdir(elsewhere) else
+               "결과 폴더 자리의 심볼릭 링크를 따라가 다른 곳에 결과를 썼다")
+    finally:
+        # ⛔ 샌드박스 밖에 생긴 것은 **그 파일 하나**만, 이름 규칙이 맞을 때만 지운다.
+        for f in stray:
+            if os.path.isfile(f) and os.path.basename(f).startswith("gemini_review_"):
+                os.remove(f)
+        _rmtree_sandbox(sandbox, sandbox)
 
 
 _BEHAVIOR_CHECKS = (
@@ -416,6 +678,10 @@ _BEHAVIOR_CHECKS = (
     _check_agy_calls_are_plan_mode,
     _check_find_agy_skips_relative_candidates,
     _check_tmpdir_removed_after_real_run,
+    _check_out_never_keeps_stale_result,
+    _check_write_out_is_atomic,
+    _check_verdict_model_is_recorded_by_code,
+    _check_default_result_dir_is_private,
 )
 
 
@@ -517,9 +783,13 @@ def main():
     # [26.09.14] 문자열 검사 넷(상대경로 스킵 · tmpdir 정리 · --mode plan ·
     #   텍스트 재시도 종료코드)을 동작 검사로 바꿨다 — 위 「동작 검사」 주석 참조.
     behavior_total = 0
+    skipped = []
     for check in _BEHAVIOR_CHECKS:
         try:
             for failure in check(gr):
+                if isinstance(failure, _Skip):
+                    skipped.append("%s: %s" % (check.__name__, failure.reason))
+                    continue
                 behavior_total += 1
                 if failure:
                     fails.append(failure)
@@ -552,12 +822,15 @@ def main():
     #   `${CLAUDE_PLUGIN_ROOT}` 존재 · 실행 예시 회귀.
     #   [26.09.14] 9 → 5: 문자열 검사 넷을 동작 검사로 옮겼다(`behavior_total`).
     total = len(_PATH_CASES) + len(_EXIT_CASES) + 5 + behavior_total
+    # 건너뛴 검사는 조용히 넘기지 않는다 — 결과 앞에 이유와 함께 남긴다.
+    for sk in skipped:
+        print("  - 건너뜀: %s" % sk)
     if fails:
         print("회귀 %d건 / 검사 %d건" % (len(fails), total))
         for f in fails:
             print("  ✗ %s" % f)
         return 1
-    print("통과 — 검사 %d건" % total)
+    print("통과 — 검사 %d건%s" % (total, " (건너뜀 %d건)" % len(skipped) if skipped else ""))
     return 0
 
 

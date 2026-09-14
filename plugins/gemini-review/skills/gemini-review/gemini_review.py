@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -475,6 +476,27 @@ def main(argv=None) -> int:
     # (실측: `--help` → exit 1). help 문자열에서 em dash 를 뺀 것과 함께
     # 이중 방어다.
     _ensure_utf8_stdout()
+
+    # ⛔ **argparse 보다 먼저 `--out` 을 무효화한다** [26.09.10 2회차 리뷰 high →
+    #   26.09.14 Eng 교차리뷰 P1 로 위치 이동]. 종전에는 이 무효화가 `parse_args`
+    #   **뒤**에 있어, 인자 오류(exit 2) · `--help` 에서 파일이 손대지 않은 채
+    #   남았다(재현: 어제의 approve 를 넣어 두고 `--bogus` → exit 2 · 파일 approve).
+    #   ⛔ 무효화 자체가 실패하면(쓸 수 없는 경로) **리뷰를 시작하지 않는다.**
+    #     종전에는 조용히 넘어가 최종 기록도 실패했고, 재현에서 **exit 5 인데 파일은
+    #     어제 approve** 였다 — 종료 코드와 파일이 다른 이야기를 한다.
+    #   ⚠ 갈래마다 `_write_out` 을 더하는 대신 여기서 한 번 무효화한다. 종료 경로가
+    #     늘어도 자동으로 덮이고, 중간에 죽어도 낡은 값이 남지 않는다.
+    out_early = _peek_out(argv)
+    if out_early and _write_out(out_early, {
+            "mode": "in_progress",
+            "note": "리뷰가 시작됐고 아직 끝나지 않았다. 이 파일이 이 상태로 남아 "
+                    "있으면 리뷰가 중간에 죽은 것이다 — 통과가 아니다.",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+    }, quiet=True) is None:
+        _safe_print("⛔ --out 경로에 쓸 수 없다: %s" % out_early)
+        _safe_print("   리뷰를 시작하지 않는다(외부 전송 없음). 경로 · 권한을 확인할 것.")
+        return 2
+
     ap = argparse.ArgumentParser(
         description="Gemini cross-review via Antigravity CLI (agy)")
     ap.add_argument("--base", default="HEAD~1")
@@ -504,22 +526,17 @@ def main(argv=None) -> int:
                     help="민감 경로가 diff 에 있어도 강행 (기본: 중단)")
     args = ap.parse_args(argv)
 
-    # ⛔ **시작하자마자 `--out` 을 무효화한다** [26.09.10 2회차 리뷰 high].
-    #   `_write_out` 은 정상 판정·텍스트 폴백·계층 장애·리뷰 불가 **네 곳**에만
-    #   있었다. 그 밖의 종료 경로(파싱 실패 1 · 실행 실패 2 · 민감 경로 3 ·
-    #   **변경분 없음 0** · 새로 만든 하드 타임아웃 2)는 파일을 손대지 않아,
-    #   호출자가 **직전 실행의 낡은 JSON** 을 읽는다. 실측으로 셋을 재현했다.
-    #   가장 나쁜 것은 exit 0 이다 — `--staged` 인데 스테이징을 빠뜨리면 종료코드도
-    #   0, 파일도 어제의 `approve` 라 **양쪽에서 통과로 읽힌다.**
-    #   ⚠ 갈래마다 `_write_out` 을 더하는 대신 여기서 한 번 무효화한다. 종료 경로가
-    #     늘어도 자동으로 덮이고, 중간에 죽어도 낡은 값이 남지 않는다.
-    if args.out:
-        _write_out(args.out, {
-            "mode": "in_progress",
-            "note": "리뷰가 시작됐고 아직 끝나지 않았다. 이 파일이 이 상태로 남아 "
-                    "있으면 리뷰가 중간에 죽은 것이다 — 통과가 아니다.",
-            "started_at": datetime.now().isoformat(timespec="seconds"),
-        }, quiet=True)
+    def finish(payload: dict, rc: int) -> int:
+        """최종 결과를 `--out` 에 남긴다. **명시한 `--out` 에 못 쓰면 exit 2.**
+
+        ⛔ [26.09.14] 종전에는 기록 실패를 무시해, 판정 코드와 파일 내용이 갈렸다.
+          파일을 믿는 자동화에게는 종료 코드보다 파일이 먼저다.
+        """
+        if _write_out(args.out, payload) is None and args.out:
+            _safe_print("⛔ --out 에 결과를 쓰지 못했다 — 종료코드 %d 대신 2 로 끝낸다."
+                        % rc)
+            return 2
+        return rc
 
     agy = _find_agy()
     if not agy:
@@ -683,7 +700,7 @@ def main(argv=None) -> int:
                             "모델은 살아 있을 수 있다.")
                 _safe_print("     `--no-fallback` 을 빼고 다시 돌려 볼 것. "
                             "이 결과를 '지적 없음'으로 읽지 말 것.")
-            _write_out(args.out, {
+            return finish({
                 "mode": "tool_unavailable",
                 "note": "agy 계층이 한 줄 프롬프트에도 응답하지 않았다"
                         "%s — 리뷰가 수행되지 않았다. 통과가 아니다."
@@ -693,8 +710,7 @@ def main(argv=None) -> int:
                 "elapsed_seconds": round(elapsed, 1),
                 "probe_seconds": round(probe_secs, 1),
                 "fallback_probe_seconds": round(fb_probe_secs, 1),
-            })
-            return 4
+            }, 4)
         if probe_model != used_model:
             _safe_print("   생존 확인 OK — **주 모델만 죽었다**(폴백 %s 는 %.0f초에 "
                         "응답). 계층 장애가 아니다." % (probe_model, fb_probe_secs))
@@ -747,18 +763,17 @@ def main(argv=None) -> int:
             # 더 나쁘게는 **직전 실행의 낡은 JSON** 을 읽어 어제 리뷰로
             # 오늘 변경을 승인한다. 구조화에 실패했으니 verdict 를 지어내지
             # 말고, 형식이 다르다는 사실 자체를 파일에 남긴다.
-            _write_out(args.out, {
+            return finish({
                 "mode": "text_fallback",
                 "note": "스키마 강제가 빈 응답을 반환해 텍스트로 재시도했다 "
                         "— verdict·findings 없음. 원문을 사람이 읽어야 한다.",
                 "model": text_model,
                 "raw_text": text,
-            })
             # ⚠ [26.08.25] 종전엔 0 이었다. 그런데 바로 위 note 가 스스로
             #   *"원문을 사람이 읽어야 한다"* 고 적는다 — 종료코드가 성공이면
             #   그 당부는 자동화에 전달되지 않는다. 실측 236건 중 28건(12%)이
             #   이 경로다.
-            return EXIT_UNSTRUCTURED
+            }, EXIT_UNSTRUCTURED)
         _safe_print("   ⛔ 텍스트 재시도도 실패했다 — 리뷰가 안 된 것이다.")
         _safe_print("     이 결과를 '지적 없음'으로 읽지 말 것.")
         # ⚠ [26.09.10 리뷰] 이 갈래에도 `--out` 을 남긴다. 종전에는 계층 장애
@@ -766,15 +781,14 @@ def main(argv=None) -> int:
         #   **직전 실행의 낡은 JSON** 을 읽어 어제 리뷰로 오늘 변경을 승인한다
         #   (26.08.13 에 텍스트 성공 경로에서 실제로 확인된 계열인데, 실패
         #   경로에 같은 구멍이 남아 있었다).
-        _write_out(args.out, {
+        return finish({
             "mode": "review_unavailable",
             "note": "스키마·폴백·텍스트가 모두 빈 응답이었다 — 리뷰가 수행되지 "
                     "않았다. 통과가 아니다.",
             "model": used_model,
             "text_model": text_model,
             "elapsed_seconds": round(elapsed, 1),
-        })
-        return 4
+        }, 4)
 
     payload = _extract_json(raw)
     if payload is None:
@@ -787,40 +801,122 @@ def main(argv=None) -> int:
     #   `--out` JSON 으로 "커밋 전 리뷰 통과" 를 재구성하면 pro 가 냈는지
     #   flash 가 냈는지 알 방법이 없다(종전에는 `used_model` 이 재대입된 뒤
     #   한 번도 읽히지 않는 dead store 였다).
+    # ⛔ [26.09.14 CEO 스펙 리뷰 — 확인] `setdefault` 는 LLM 응답에 `model` 키가
+    #   **이미 있으면** 그 값을 남긴다. 폴백 모델이 판정했는데 응답이
+    #   `"model": "gemini-3.1-pro-high"` 를 담고 있으면 주 모델이 판정한 것으로
+    #   기록되고, diff 속 프롬프트 주입으로도 위조된다 → **코드가 대입한다.**
     if isinstance(payload, dict):
-        payload.setdefault("model", used_model)
-        payload.setdefault("elapsed_seconds", round(elapsed, 1))
+        payload["model"] = used_model
+        payload["elapsed_seconds"] = round(elapsed, 1)
     _render(payload)
-    _write_out(args.out, payload)
     rc = _exit_code_for(payload)
     if rc:
         _safe_print("")
         _safe_print("   (종료코드 %d — 지적을 실측 검증한 뒤 반영하고 다시 돌릴 것)"
                     % rc)
-    return rc
+    return finish(payload, rc)
 
 
 def _write_out(out_path: Optional[str], payload: dict,
-               quiet: bool = False) -> None:
-    """결과 JSON 저장. 실패해도 리뷰 자체는 이미 화면에 나갔으므로 무시한다.
+               quiet: bool = False) -> Optional[str]:
+    """결과 JSON 저장. 반환: 기록한 경로, **실패하면 None**.
 
     `quiet` 는 **시작 시점 무효화**용이다 — 저장 안내를 두 번 찍지 않는다.
+    ⚠ 실패를 어떻게 다룰지는 호출부가 정한다(명시한 `--out` 이면 exit 2).
     """
-    path = out_path or os.path.join(
-        tempfile.gettempdir(),
-        "gemini_review_%s.json" % datetime.now().strftime("%Y%m%d_%H%M%S"))
     try:
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        if not quiet:
-            _safe_print("")
-            _safe_print("결과 저장: %s" % path)
+        path = out_path or os.path.join(
+            _default_result_dir(),
+            "gemini_review_%s_%d.json"
+            % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid()))
+        d = os.path.dirname(os.path.abspath(path))
+        os.makedirs(d, exist_ok=True)
+        _write_json_atomic(path, payload)
     except OSError as exc:
         if not quiet:
-            _safe_print("결과 저장 실패(무시): %s" % exc)
+            _safe_print("결과 저장 실패: %s" % exc)
+        return None
+    if not quiet:
+        _safe_print("")
+        _safe_print("결과 저장: %s" % path)
+    return path
+
+
+def _peek_out(argv) -> Optional[str]:
+    """argparse **보다 먼저** `--out` 값만 뽑는다.
+
+    ⚠ 이 파서는 `--out` 만 안다. 값이 빠진 `--out` 처럼 여기서 파싱이 실패하면
+      None 을 돌려주고, 본 파서가 같은 오류를 사용자에게 알린다.
+    ⚠ 본 파서와 같은 규칙(약어 허용 · 마지막 값 우선)이라 두 파서가 고르는
+      경로가 같다.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--out", default=None)
+    try:
+        known, _ = pre.parse_known_args(argv)
+    except SystemExit:
+        return None
+    return known.out
+
+
+def _default_result_dir() -> str:
+    """`--out` 을 주지 않았을 때 결과 JSON 을 둘 **사용자 전용** 폴더.
+
+    ⛔ [26.09.14] 종전 기본값은 `tempfile.gettempdir()` 바로 아래
+      `gemini_review_<시각>.json` 이었다. 이 PC 실측으로 `-rw-rw-r--` 파일
+      137개가 공유 `/tmp` 에 쌓여 있었고, 담긴 것은 코드가 인용된 지적이다.
+      같은 초에 끝난 두 실행은 서로 덮어썼다(→ 파일명에 PID).
+    → POSIX 는 `$XDG_STATE_HOME/gemini-review`(기본 `~/.local/state`), Windows 는
+      `%LOCALAPPDATA%\\gemini-review`(이미 사용자별).
+    ⚠ 폴더가 **링크이거나 남의 소유**면 쓰지 않고 새 임시 폴더로 대체한다.
+      이름을 짐작할 수 있는 경로는 다른 사용자가 먼저 만들어 둘 수 있다
+      (26.09.14 Eng 리뷰). 내 소유인데 권한만 느슨하면 0700 으로 좁힌다.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        d = os.path.join(base, "gemini-review")
+        os.makedirs(d, exist_ok=True)
+        return d
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):          # XDG 규약: 상대 경로는 무시한다
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    d = os.path.join(base, "gemini-review")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if (stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid()):
+            raise OSError("안전하지 않은 결과 폴더: %s" % d)
+        # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] "느슨하면 좁힌다"만으로는 부족하다.
+        #   내 소유 폴더가 쓰기 권한 없이(0500, 엄격한 umask) 있으면 `& 0o077` 이
+        #   0 이라 그대로 반환되고 결과 기록이 실패한다 → 정확히 0700 으로 맞춘다.
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(d, 0o700)
+        return d
+    except OSError:
+        return tempfile.mkdtemp(prefix="gemini_review_out_")
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    """같은 폴더의 임시 파일에 쓰고 `os.replace` 로 바꿔 끼운다.
+
+    ⛔ [26.09.14 실측] `open(path, "w")` 로 곧장 쓰면, 기록 도중 종료(신호 ·
+      예외)되었을 때 **잘린 JSON** 이 남는다(`JSONDecodeError`).
+    ⚠ 임시 파일은 `mkstemp` 라 0600 이다. 바꿔 끼운 결과 파일도 0600 이 된다
+      (코드가 인용된 결과이므로 의도다).
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".gemini_review_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
@@ -952,8 +1048,9 @@ def _is_print_timeout(text: str) -> bool:
     return "print timeout" in lowered or "turn in progress" in lowered
 
 
-# agy 안내문은 `[agy] ` 로 시작하는 **한 줄**이다(실측 문구는 위 docstring).
-_AGY_TIMEOUT_LINE = re.compile(r"^\s*\[agy\]\s+print timeout\b", re.I | re.M)
+# agy 안내문은 `[agy] print timeout after <시간> with turn in progress` 꼴의 **한 줄**이다.
+_AGY_TIMEOUT_LINE = re.compile(
+    r"^\[agy\] print timeout after \S+ with turn in progress\b", re.I)
 
 
 def _has_agy_timeout_line(text: str) -> bool:
@@ -964,8 +1061,13 @@ def _has_agy_timeout_line(text: str) -> bool:
       그대로 쓰면 **이 저장소 코드를 리뷰한 정상 결과**가 "print timeout" 이라는
       말을 인용하는 순간 리뷰를 버린다(오탐 → exit 4). 그래서 본문에서는
       `[agy] print timeout` 으로 **시작하는 줄**만 안내문으로 본다.
+    ⚠ [26.09.14 Gemini 교차리뷰 2회차 MEDIUM] 여러 줄 매칭이면 리뷰 **중간**의
+      어떤 줄이 그 문구로 시작하기만 해도 버린다. 안내문은 시간 초과 순간
+      그때까지의 출력 **뒤에** 붙으므로, 비어 있지 않은 **마지막 줄**만 보고
+      실측 문구 꼴 전체(`after <시간> with turn in progress`)를 요구한다.
     """
-    return bool(_AGY_TIMEOUT_LINE.search(text or ""))
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return bool(lines) and bool(_AGY_TIMEOUT_LINE.match(lines[-1]))
 
 
 def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,

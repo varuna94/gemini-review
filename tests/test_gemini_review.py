@@ -15,6 +15,7 @@ import importlib.util
 import inspect
 import os
 import io
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,9 +66,185 @@ _EXIT_CASES = [
 ]
 
 
+_ROOT = os.path.join(_HERE, os.pardir)
+_SKILL_MD = os.path.join(_ROOT, "plugins", "gemini-review",
+                         "skills", "gemini-review", "SKILL.md")
+_PLUGIN_JSON = os.path.join(_ROOT, "plugins", "gemini-review",
+                            ".claude-plugin", "plugin.json")
+# ⚠ `.claude-plugin/marketplace.json` 은 **일부러 읽지 않는다** — 아래 버전
+#   가드 주석 참조(마켓플레이스 메타는 플러그인 버전이 아니다).
+
+
+def _make_stdout_safe():
+    """cp949 콘솔에서 이 파일이 죽지 않게 한다.
+
+    ⛔ **cp949 보호를 검증하는 테스트가 정작 cp949 에서 죽고 있었다**
+      (26.09.14 Windows 실측). `—`·`✗`·`⛔` 는 cp949 에 매핑이 없어
+      `UnicodeEncodeError` 로 프로세스가 끝난다 — 검사 결과를 **한 줄도 못 본다.**
+      우분투(UTF-8)에서만 돌려 왔기 때문에 3주 동안 드러나지 않았다.
+    ⚠ 스킬 본체는 `util/console_safe` 계열의 보호를 이미 갖고 있다. 이 함수는
+      **테스트 자신**을 위한 것이고, 표준 라이브러리만 쓴다는 이 파일의 제약을
+      지킨다.
+    ⚠ **`stderr` 도 맞춰 둔다 — 다만 근거는 '죽는다' 가 아니다.**
+      [26.09.14 교차 리뷰 4회차 HIGH 를 실측으로 일부 기각] 지적은 traceback 이
+      stderr 로 나갈 때 `UnicodeEncodeError` 로 죽는다고 했으나 **그렇지 않다.**
+      파이썬의 stderr 는 기본 에러 핸들러가 `backslashreplace` 라 죽지 않는다:
+
+          보호 없이  →  `\\u26d4 traceback 항목`   exit 0   (실측)
+          보호 후    →  `? traceback 항목`        exit 0
+
+      그래도 맞추는 이유는 **읽기 쉬움** 하나다 — 실패를 조사하는 사람이
+      `\\u26d4` 를 해독하지 않아도 된다. 안전 요건이 아니므로 실패해도 그냥
+      넘어간다.
+    """
+    for stream in ("stdout", "stderr"):
+        try:
+            getattr(sys, stream).reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass                  # 3.6 이하·리다이렉트 등 — 보호 없이 진행한다
+
+
+def _join_shell_continuations(lines):
+    """셸 연속선(`\\`)으로 나뉜 명령을 한 줄로 잇는다.
+
+    ⚠ **[26.09.14 교차 리뷰 3회차 LOW]** 아래 경로 가드가 한 줄 안에서
+      `python` 과 `gemini_review.py` 를 함께 찾는데, 명령을 두 줄로 쪼개면
+      어느 줄도 둘을 동시에 갖지 않아 **가드를 빠져나간다.**
+    ⚠ 이어 붙인 결과만 돌려준다 — 원본 줄 번호는 이 가드가 쓰지 않는다.
+    """
+    out, buf = [], None
+    for ln in lines:
+        cur = (buf + " " + ln.strip()) if buf is not None else ln
+        if cur.rstrip().endswith("\\"):
+            buf = cur.rstrip()[:-1]
+        else:
+            out.append(cur)
+            buf = None
+    if buf is not None:
+        out.append(buf)
+    return out
+
+
+def _version_of(path, *keys):
+    """JSON 에서 버전 문자열을 꺼낸다."""
+    import json
+    with io.open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    for k in keys:
+        data = data[k]
+    return data
+
+
+def _frontmatter_version(path):
+    """SKILL.md frontmatter 의 `version:` 값. 못 읽으면 `None`.
+
+    ⚠ **본문까지 훑지 않는다** — 본문에 `version:` 으로 시작하는 줄이 생기면
+      엉뚱한 값을 읽는다. frontmatter 는 첫 `---` 와 다음 `---` 사이다.
+    ⛔ **닫는 마커가 없으면 전체를 훑지 말고 `None` 을 돌려준다**
+      [26.09.14 교차 리뷰 MEDIUM]. 종전에는 `end == -1` 일 때 `head = src` 로
+      떨어져 **위 주석이 약속한 것과 정반대로** 파일 전체를 스캔했다. 그러면
+      frontmatter 가 깨진 파일에서 본문의 임의 문자열을 버전으로 오인한다 —
+      가드가 자기 docstring 을 지키지 않는 형태다.
+    """
+    with io.open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    if not src.startswith("---"):
+        return None
+    end = src.find("\n---", 3)
+    if end < 0:
+        return None               # 닫는 마커 없음 = frontmatter 를 못 읽었다
+    for line in src[:end].splitlines():
+        if line.startswith("version:"):
+            # ⚠ **YAML 표기를 벗긴다** [26.09.14 교차 리뷰 3회차 MEDIUM].
+            #   `version: "1.3.1"` 이나 `version: 1.3.1 # 릴리즈` 는 정상 YAML
+            #   인데, 그대로 비교하면 JSON 파서가 낸 `1.3.1` 과 달라
+            #   **의미상 같은 버전인데 배포가 막힌다**(오탐).
+            val = line.split(":", 1)[1]
+            val = val.split("#", 1)[0].strip()
+            return val.strip("\"'")
+    return None
+
+
 def main():
+    _make_stdout_safe()
     gr = _load()
     fails = []
+
+    # [26.09.14] 플러그인과 함께 배포되는 두 파일의 버전이 갈리면 잡는다.
+    #   ⛔ **`marketplace.json` 은 보지 않는다.** 그 `metadata.version` 은
+    #     마켓플레이스 자체의 메타이지 플러그인 버전이 아니다 — 실측 반례가
+    #     `.gemini-review.md` 「이미 검증하고 기각한 지적」에 있다(어느 설치본은
+    #     marketplace 1.0.0 인데 plugin.json 의 1.1.0 으로 설치됐고 캐시 경로도
+    #     `…/1.1.0/` 이었다, 26.08.27). 셋을 묶으면 **플러그인만 패치해도
+    #     정당한 배포가 막힌다** — 26.09.14 교차 리뷰가 HIGH 로 짚었다.
+    #   정본은 `plugin.json` 이다(Claude Code 가 읽는다).
+    _v_plugin = _version_of(_PLUGIN_JSON, "version")
+    _v_skill = _frontmatter_version(_SKILL_MD)
+    if _v_skill is None:
+        fails.append("SKILL.md frontmatter 에서 version 을 못 읽었다")
+    elif _v_plugin != _v_skill:
+        fails.append("버전이 갈렸다 — plugin.json=%s · SKILL.md=%s "
+                     "(정본은 plugin.json)" % (_v_plugin, _v_skill))
+
+    # [26.09.14] 스킬이 안내하는 실행 경로가 홈 경로로 되돌아가면 **플러그인
+    #   설치 환경에서 그 자리에 파일이 없어 리뷰가 아예 안 돌아간다.**
+    #   ⚠ 홈 경로 자체를 금지하지는 않는다 — 손으로 배치해 쓰는 경우를 설명하는
+    #     산문이 정당하게 있다. 재는 것은 **실행 예시**, 즉 코드 펜스 안이거나
+    #     인라인 코드로 감싼 명령줄이다.
+    #   ⛔ **문장의 한국어 낱말로 예외를 가르지 않는다** [26.09.14 교차 리뷰
+    #     MEDIUM]. 종전에는 `"손으로 배치" not in ln` 처럼 특정 문구에 기댔는데,
+    #     기여자가 같은 뜻을 다르게 쓰면 정당한 편집이 회귀로 오탐된다.
+    #   ⛔ **경로의 생김새로도 가르지 않는다** [26.09.14 교차 리뷰 2회차 HIGH].
+    #     그다음 판이 `"~/.claude/skills" in ln` 으로 **홈 경로 모양**을 찾았는데,
+    #     Windows 예시(`$env:USERPROFILE\.claude\skills\…`)나 절대 경로를 적으면
+    #     그 조건이 거짓이라 **조용히 빠져나갔다.** 이 문서에는 실제로 Windows
+    #     경로가 있으므로 도달 가능한 우회로였다.
+    #   ⛔ **마크다운 펜스도 파싱하지 않는다** [같은 라운드 MEDIUM]. ``` 만 보면
+    #     `~~~` 펜스와 4칸 들여쓰기 블록을 놓친다(이 문서에 들여쓰기 블록이 있다).
+    #   → 술어를 뒤집는다: **인터프리터가 `gemini_review.py` 를 인자로 받는
+    #     명령 꼴**이면 그것이 실행 예시이고, 거기에 `${CLAUDE_PLUGIN_ROOT}` 가
+    #     없으면 회귀다. 경로 모양도 블록 형식도 보지 않으므로 셋 다 닫힌다.
+    #   ⚠ **낱말 두 개가 한 줄에 있는 것만으로는 안 된다** [4회차 MEDIUM].
+    #     "이 플러그인은 python 런타임에서 gemini_review.py 를 호출합니다" 같은
+    #     **산문이 오탐**된다. 그래서 인터프리터 **바로 뒤에 그 경로가 오는지**를
+    #     본다 — 사이에 다른 말이 끼면 명령이 아니다.
+    #   ⚠ 인터프리터 이름을 하나로 단정하지 않는다 — 우분투에는 `python` 이
+    #     없고 Windows 기본 설치에는 `python3` 가 없다(`.gemini-review.md`).
+    #   ⚠ **인터프리터 옵션을 허용한다** [5회차 HIGH]. `python -u <경로>` 처럼
+    #     사이에 옵션이 끼면 종전 패턴이 매칭에 실패해 **조용히 빠져나갔다.**
+    #     다만 아무거나 허용하면 산문이 다시 오탐되므로 `-옵션` 꼴만 받는다.
+    #   ⛔ **판정은 줄 전체가 아니라 '매칭된 명령' 안에서 한다** [5회차 HIGH].
+    #     줄 단위로 보면 명령은 옛 경로인데 **같은 줄 주석에 변수 이름만 적어도**
+    #     통과했다(`… gemini_review.py  # ${CLAUDE_PLUGIN_ROOT} 권장`).
+    #   ⛔ **[5회차 MEDIUM 기각]** *"수동 설치 안내에 복사 가능한 전체 명령을
+    #     넣으면 오탐된다"* 는 지적이 있었다. 사실이지만 **의도다** — 그런 줄이
+    #     문서에 생기면 그것은 복사되어 실행되고, 플러그인 사용자가 복사하면
+    #     파일을 못 찾는다. 지금 문서는 수동 설치를 **경로만** 인라인으로
+    #     적어(명령 꼴이 아니라) 이 가드에 걸리지 않는다. 정말 필요해지는 날
+    #     그 자리에서 예외를 설계할 것 — 아직 오지 않은 요구를 위해 가드를
+    #     미리 느슨하게 두면 **실제 회귀를 놓친다.**
+    #   ⚠ **따옴표 안에는 공백이 올 수 있다** [6회차 HIGH]. Windows 경로가
+    #     `"C:\Old Plugins\gemini_review.py"` 처럼 띄어쓰기를 품으면 종전
+    #     패턴이 공백에서 끊겨 **매칭 자체가 실패**했다 — 명백히 틀린 경로인데
+    #     조용히 통과한다. 따옴표 갈래를 따로 둔다.
+    #     ⚠ 따옴표 **없는** 갈래는 공백을 계속 막는다 — 안 그러면 산문
+    #       ("python 런타임에서 gemini_review.py")이 다시 걸린다.
+    _CMD_RE = re.compile(
+        r'(?:python3?|py)\b(?:\s+-\S+)*\s+'
+        r'(?:"[^"]*gemini_review\.py"|[^\s"]*gemini_review\.py)')
+    with io.open(_SKILL_MD, encoding="utf-8") as fh:
+        _skill_lines = fh.read().splitlines()
+    if not any("${CLAUDE_PLUGIN_ROOT}" in ln for ln in _skill_lines):
+        fails.append("SKILL.md 가 ${CLAUDE_PLUGIN_ROOT} 를 쓰지 않는다 — "
+                     "플러그인으로 설치하면 안내된 경로에 파일이 없다")
+    _bad = []
+    for ln in _join_shell_continuations(_skill_lines):
+        _m = _CMD_RE.search(ln)
+        if _m and "${CLAUDE_PLUGIN_ROOT}" not in _m.group(0):
+            _bad.append(ln.strip())
+    if _bad:
+        fails.append("실행 예시가 ${CLAUDE_PLUGIN_ROOT} 를 쓰지 않는다 (%d줄): %s"
+                     % (len(_bad), _bad[0][:70]))
 
     for path, want, why in _PATH_CASES:
         got = gr._classify_path(path)
@@ -114,7 +291,11 @@ def main():
     if "proc.returncode != 0" not in src:
         fails.append("_retry_as_text 가 agy 종료 코드를 보지 않는다")
 
-    total = len(_PATH_CASES) + len(_EXIT_CASES) + 6
+    # ⚠ 뒤의 상수는 **손으로 센** 코드 검사 수다(표 두 개가 아닌 것들).
+    #   가드를 추가하면 여기도 함께 올릴 것 — 안 올리면 개수만 조용히 어긋난다.
+    #   [26.09.14] 6 → 9: 버전 일치(plugin.json ↔ SKILL.md) ·
+    #   `${CLAUDE_PLUGIN_ROOT}` 존재 · 실행 예시 회귀.
+    total = len(_PATH_CASES) + len(_EXIT_CASES) + 9
     if fails:
         print("회귀 %d건 / 검사 %d건" % (len(fails), total))
         for f in fails:

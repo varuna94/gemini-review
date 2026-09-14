@@ -1,6 +1,6 @@
 ---
 name: gemini-review
-version: 1.0.0
+version: 1.3.1
 description: Gemini 3.x 로 변경분을 교차 리뷰한다 (Antigravity CLI). 커밋 직전 독립 리뷰어로 쓴다. 같은 모델이 짠 코드를 같은 모델이 리뷰할 때 생기는 맹점을 잡는다.
 triggers:
   - gemini review
@@ -28,12 +28,23 @@ Claude 가 작성한 변경분을 **Gemini 3.1 Pro** 에게 독립적으로 리�
 
 ## 실행
 
+⛔ **스크립트 경로는 `${CLAUDE_PLUGIN_ROOT}` 로 쓴다.** 플러그인으로 설치하면
+파일이 `~/.claude/skills/` 가 아니라 플러그인 캐시 안에 놓인다 — 홈 경로를
+그대로 적으면 **그 자리에 파일이 없어 리뷰가 아예 안 돌아간다.** 이 변수는
+Claude Code 가 스킬을 읽을 때 설치 위치로 치환한다.
+
+⛔ **인터프리터 이름은 환경에 맞춰 고른다.** 아래 예시는 `python` 으로 적었지만
+**우분투에는 `python` 이 없고 Windows 기본 설치에는 `python3` 가 없다.** 없는
+이름으로 부르면 `command not found` 로 죽는데, 그것이 *"리뷰를 돌렸는데 지적이
+없다"* 로 오독되는 것이 이 도구의 1번 실패 계열이다. 먼저 있는 것을 확인하고
+쓸 것 — 우분투·맥은 보통 `python3`, Windows 는 `python` 또는 `py` 다.
+
 ```bash
-python ~/.claude/skills/gemini-review/gemini_review.py --staged   # 커밋 직전
-python ~/.claude/skills/gemini-review/gemini_review.py            # 마지막 커밋
-python ~/.claude/skills/gemini-review/gemini_review.py --base HEAD~3
-python ~/.claude/skills/gemini-review/gemini_review.py --base main # 브랜치 전체 (PR 전)
-python ~/.claude/skills/gemini-review/gemini_review.py --model gemini-3.8-flash-high  # 빠르게
+python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --staged   # 커밋 직전
+python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py"            # 마지막 커밋
+python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base HEAD~3
+python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base main # 브랜치 전체 (PR 전)
+python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --model gemini-3.8-flash-high  # 빠르게
 ```
 
 **`--base` 는 merge-base 기준(3-dot)이다** [26.08.13]. `--base main` 은 내가
@@ -41,7 +52,13 @@ python ~/.claude/skills/gemini-review/gemini_review.py --model gemini-3.8-flash-
 커밋은 섞이지 않는다. 2-dot 이 필요하면 `--two-dot` 이지만, 브랜치 리뷰에서
 쓰면 동료 커밋이 **삭제로 뒤집혀** diff 에 들어가 유령 지적을 만든다.
 
-Windows PowerShell 에서는 `$env:USERPROFILE\.claude\skills\gemini-review\gemini_review.py`.
+⚠ **플러그인이 아니라 손으로 배치해 쓰는 경우**(`~/.claude/skills/` 아래에
+직접 둔 경우)에는 `${CLAUDE_PLUGIN_ROOT}` 가 치환되지 않는다. 그때는 실제
+경로를 쓴다 — Windows PowerShell 이면
+`$env:USERPROFILE\.claude\skills\gemini-review\gemini_review.py`.
+⛔ 다만 **두 방식을 동시에 두지 말 것.** 같은 이름의 스킬이 둘이 되어 어느
+쪽이 이기는지 정해지지 않고, 한쪽만 갱신되면 낡은 코드가 조용히 돈다 —
+이 저장소가 실제로 3주 동안 그렇게 갈라져 있었다(v1.3.0 병합 근거).
 
 표준 라이브러리만 쓰므로 **어떤 Python 3.7+ 로도** 실행된다.
 
@@ -100,6 +117,22 @@ Windows PowerShell 에서는 `$env:USERPROFILE\.claude\skills\gemini-review\gemi
 
 근거는 실측이다 — 그날 다섯 단어 프롬프트조차 2분 무응답이었고 폴백 모델도
 439초 output 0 이었다. 종전 코드는 그 구분 없이 재시도해 400~550초를 더 태웠다.
+
+⏱ ⚠ **[26.09.11 실측] "생존 OK + 빈 응답" 이 프롬프트 문제가 아닐 수도 있다.**
+한 세션에서 같은 계열의 diff 로 네 번 돌렸는데 결과가 이렇게 갈렸다.
+
+    1회차  pro-high 223초                                   → approve
+    2회차  pro-high 빈 응답 · 생존 OK · 폴백 실패 · 텍스트도 실패  → exit 4
+    3회차  flash-high 로 바꿔도 동일                          → exit 4
+    4회차  pro-high 빈 응답 → **폴백이 224초에 구조화 성공**      → approve
+
+diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다. 즉 **크기도
+스키마도 원인이 아니었다** — 시점에 따라 갈리는 무언가다.
+→ **exit 4 를 받아도 곧바로 포기하지 말고 한 번 더 돌려 볼 것.** 다만 연속
+실패가 이어지면 계층 장애와 구분이 안 되므로, 시간을 두고 재시도하거나
+**다른 리뷰 수단으로 대체**한다(읽기 전용 서브에이전트 다렌즈 리뷰가 같은 날
+실제로 그 자리를 메웠다).
+⛔ **그 사이에 "지적 없음" 으로 넘어가지 말 것.** exit 4 는 리뷰가 안 된 것이다.
 
 ⚠ 배너의 **`diff N자` 는 프롬프트 길이가 아니다** (diff 는 파일 경로로 넘어간다).
 
@@ -172,18 +205,18 @@ Windows PowerShell 에서는 `$env:USERPROFILE\.claude\skills\gemini-review\gemi
 
 ## 스킬 실행 절차 (Skill Execution Steps)
 
-사용자가 \gemini review\, \교차 리뷰\ 등을 요청하여 이 스킬이 트리거되면 다음 절차를 따르시오:
+사용자가 `gemini review`, `교차 리뷰` 등을 요청하여 이 스킬이 트리거되면 다음 절차를 따르시오:
 
-1. **상태 확인 (Check State):** \git status\ 및 \git diff\를 통해 현재 스테이징된 변경사항인지, 작업 트리 변경사항인지 파악합니다.
+1. **상태 확인 (Check State):** `git status` 및 `git diff` 를 통해 현재 스테이징된 변경사항인지, 작업 트리 변경사항인지 파악합니다.
 2. **스크립트 실행 (Execute Script):**
-   - 스테이징된 변경분 리뷰: \python ~/.claude/skills/gemini-review/gemini_review.py --staged\
-   - 마지막 커밋 리뷰: \python ~/.claude/skills/gemini-review/gemini_review.py\
+   - 스테이징된 변경분 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --staged`
+   - 마지막 커밋 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py"`
      ⚠ 인자 없는 실행은 **`--base HEAD~1`**, 즉 직전 커밋이다. **커밋되지 않은
      작업 트리 변경은 어떤 인자로도 리뷰되지 않는다** — 스테이징한 뒤
      `--staged` 를 쓸 것. 종전 이 줄은 이것을 "작업 트리 리뷰" 라고 적어,
      오늘 변경이 한 줄도 안 실린 채 어제 커밋에 `approve` 가 나오고 커밋 전
      필수 요건이 충족된 것으로 기록될 수 있었다 [26.09.10 정정].
-   - 특정 브랜치(예: main) 대상 리뷰: \python ~/.claude/skills/gemini-review/gemini_review.py --base main\
+   - 특정 브랜치(예: main) 대상 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base main`
 3. **결과 출력 (Present Results):** 스크립트 실행 후 출력되는 JSON 혹은 텍스트 형태의 지적 사항(findings)을 가공하거나 생략하지 말고 **원문 그대로(verbatim)** 사용자에게 전달하십시오. 
-4. **후속 조치 (Follow up):** 지적 사항 중 \[CRITICAL]\이나 \[HIGH]\ 심각도의 문제가 있다면, 사용자에게 해당 부분을 즉시 수정할지(Fix) 물어보고 조치하십시오.
+4. **후속 조치 (Follow up):** 지적 사항 중 `[CRITICAL]` 이나 `[HIGH]` 심각도의 문제가 있다면, 사용자에게 해당 부분을 즉시 수정할지(Fix) 물어보고 조치하십시오.
 

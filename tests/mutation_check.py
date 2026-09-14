@@ -116,6 +116,15 @@ _MUTATIONS = [
      [('            shutil.rmtree(ctx["tmpdir"], True)\n',
        '            shutil.rmtree(os.path.dirname(os.path.dirname(ctx["tmpdir"])), True)\n')],
      "상위를 지"),
+    ("구조화 호출이 도구 권한 거부를 숨김", _G,
+     [("    denied = _denied_tool_notice(err)\n    if denied:", "    denied = ''\n    if denied:")],
+     "구조화 호출이 빈 응답의 원인"),
+    ("텍스트 재시도가 도구 권한 거부를 숨김", _G,
+     [('    denied = "" if text else _denied_tool_notice(err)', '    denied = ""')],
+     "텍스트 재시도가 빈 응답의 원인"),
+    ("프롬프트가 명령 시도를 막지 않음", _G,
+     [("        _NO_COMMANDS,\n", "")],
+     "명령 시도 금지 줄이 없다"),
 ]
 
 

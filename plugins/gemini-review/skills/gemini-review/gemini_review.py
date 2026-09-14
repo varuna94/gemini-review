@@ -523,6 +523,10 @@ def _load_project_context(root: str) -> str:
     return path
 
 
+_NO_COMMANDS = ("셸 명령(테스트 · git · python 실행 등)은 시도하지 마라 — 헤드리스라 권한을 물을 수 "
+                "없어 거부되고, 그러면 응답 전체가 사라진다. 동작은 코드를 읽어 추론하라.")
+
+
 def _build_prompt(diff_path: str, files: List[str], ctx_path: str) -> str:
     """리뷰 지시. **짧게 유지한다** — 길면 agy 가 빈 응답을 낸다(위 주석 참조).
 
@@ -540,7 +544,11 @@ def _build_prompt(diff_path: str, files: List[str], ctx_path: str) -> str:
             "그 관점을 최우선으로 적용하라." % ctx_path)
     parts += [
         "변경 파일 %d개: %s" % (len(files), ", ".join(files[:15])),
-        "필요하면 저장소의 다른 파일도 읽어 맥락을 확인하라 (읽기 전용 모드다).",
+        "필요하면 저장소의 다른 파일도 읽어 맥락을 확인하라 — 지적과 관련된 파일만 (읽기 전용 모드다).",
+        # ⛔ [26.09.14 실측] 리뷰어가 테스트를 돌려 보려다 헤드리스 agy 가 명령 권한을 자동
+        #   거부했고, 그러면 **응답 전체가 빈 채로** 끝났다(exit 4 네 번 연속). 넓게 읽다가
+        #   `--timeout` 에 걸린 회차도 있었다.
+        _NO_COMMANDS,
         "",
         _GENERIC_LENSES,
         "",
@@ -1250,6 +1258,11 @@ def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
         # 동작은 그대로(1.4.0 에서 원인별 종료 코드). 원인만 화면에 남긴다.
         _safe_print("⚠ agy 가 출력 시간 초과를 알렸다(--timeout %s) — 응답이 비었거나 "
                     "잘렸을 수 있다." % args.timeout)
+    denied = _denied_tool_notice(err)
+    if denied:
+        _safe_print("⚠ 리뷰어가 권한이 필요한 도구(명령 실행 등)를 시도해 agy 가 거부했다 — "
+                    "응답이 비었을 수 있다.")
+        _safe_print("   %s" % denied)
     return raw, elapsed, None
 
 
@@ -1359,6 +1372,21 @@ def _probe_says_ok(text: str) -> bool:
     return any(w.strip(".,!?:;\"'`*").upper() == "OK" for w in body.split())
 
 
+def _denied_tool_notice(err: str) -> str:
+    """agy stderr 의 **도구 권한 자동 거부** 안내 첫 줄. 없으면 빈 문자열.
+
+    실측 문구(26.09.14): `jetski: no output produced — a tool required the "command"
+    permission that headless mode cannot prompt for, so it was auto-denied. …`
+    ⚠ 이 경우 exit 0 · `status=SUCCESS` · `response=""` 라 종료 코드로는 구분되지 않는다.
+      화면에 원인이 없으면 "계층은 살아 있는데 빈 응답" 으로만 보여 원인을 못 짚는다.
+    """
+    for line in (err or "").splitlines():
+        lowered = line.lower()
+        if "permission" in lowered and ("auto-denied" in lowered or "cannot prompt" in lowered):
+            return line.strip()[:300]
+    return ""
+
+
 def _is_print_timeout(text: str) -> bool:
     """agy 의 **출력 시간 초과 안내문**인가.
 
@@ -1463,8 +1491,10 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
                     "(부분 출력 %d자) — 잘린 리뷰라 쓰지 않는다"
                     % (model, elapsed, len(text)))
         return ""
+    denied = "" if text else _denied_tool_notice(err)
     _safe_print("   텍스트 재시도: %s · %.0f초 · %s"
-                % (model, elapsed, "응답 있음" if text else "빈 응답"))
+                % (model, elapsed, "응답 있음" if text else
+                   ("빈 응답 — 도구 권한 거부: %s" % denied if denied else "빈 응답")))
     return text
 
 

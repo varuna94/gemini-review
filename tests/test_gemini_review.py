@@ -1581,6 +1581,44 @@ def _check_version_line_is_whole(gr):
            "--version 이 판 · 경로를 한 줄로 찍지 않는다(exit %d): %r" % (proc.returncode, lines))
 
 
+def _check_empty_response_names_its_cause(gr):
+    """빈 응답이면 agy 가 stderr 로 알린 **도구 권한 거부**를 화면에 남기고, 프롬프트는 명령을 막는다.
+
+    ⛔ [26.09.14 실측] 리뷰어가 명령(테스트 실행)을 시도 → 헤드리스 agy 가 자동 거부 → exit 0 ·
+      `response=""`. 화면에는 "빈 응답" 만 남아 exit 4 가 네 번 이어지는 동안 원인을 못 짚었다.
+    """
+    notice = ('jetski: no output produced \u2014 a tool required the "command" permission that '
+              'headless mode cannot prompt for, so it was auto-denied. Add an allow-rule.')
+    empty = json.dumps({"status": "SUCCESS", "response": "", "usage": {}}).encode()
+    args = types.SimpleNamespace(timeout="10m")
+
+    def schema_out(stderr):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                _patched(gr, "subprocess", _fake_subprocess([], stdout=empty,
+                                                             stderr=stderr.encode())):
+            gr._invoke_schema("agy", "m", args, ".", "s.json", "p")
+        return buf.getvalue()
+
+    def text_out(stderr):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+                _patched(gr, "subprocess", _fake_subprocess([], stdout=b"",
+                                                             stderr=stderr.encode())):
+            gr._retry_as_text("agy", "m", args, ".", "d.diff", ["x.py"], "")
+        return buf.getvalue()
+
+    yield (None if "권한" in schema_out(notice) else
+           "구조화 호출이 빈 응답의 원인(도구 권한 거부)을 화면에 남기지 않는다")
+    yield (None if "권한" in text_out(notice) else
+           "텍스트 재시도가 빈 응답의 원인(도구 권한 거부)을 화면에 남기지 않는다")
+    yield (None if "권한" not in schema_out("") + text_out("") else
+           "대조군: stderr 가 비었는데 도구 권한 거부라고 적었다")
+    prompt = gr._build_prompt("d.diff", ["x.py"], "")
+    yield (None if gr._NO_COMMANDS in prompt.splitlines() else
+           "리뷰 프롬프트에 셸 명령 시도 금지 줄이 없다")
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -1610,6 +1648,7 @@ _BEHAVIOR_CHECKS = (
     _check_skill_launcher_block_runs,
     _check_version_line_is_whole,
     _check_skill_powershell_block_shape,
+    _check_empty_response_names_its_cause,
 )
 
 

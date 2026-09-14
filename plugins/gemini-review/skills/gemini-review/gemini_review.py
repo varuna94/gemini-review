@@ -41,14 +41,18 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -469,7 +473,120 @@ def _build_prompt(diff_path: str, files: List[str], ctx_path: str) -> str:
     return "\n".join(parts)
 
 
+class _Interrupted(BaseException):
+    """신호로 중단됐다.
+
+    ⚠ `SystemExit` 을 쓰지 않는 이유: argparse 의 `--help` · 인자 오류도
+      `SystemExit` 이라, 그것까지 "중단"으로 오기록한다(26.09.14 Eng 리뷰).
+      `BaseException` 이라 코드 곳곳의 `except Exception` 에 삼켜지지 않는다.
+    """
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+# SIGINT 는 파이썬이 이미 KeyboardInterrupt 로 올려 준다 — 따로 설치하지 않는다.
+_HANDLED_SIGNALS = ("SIGTERM", "SIGHUP")
+
+
+def _install_signal_handlers():
+    """SIGTERM · SIGHUP 을 `_Interrupted` 로 바꾼다. 반환: `(복원 함수, 이후 신호 무시 함수)`.
+
+    ⛔ [26.09.14 실측] 처리기가 없으면 SIGTERM 에 **atexit 가 돌지 않는다**
+      (exit 143). Claude Code 에서 사용자가 작업을 멈추면(TaskStop) 오는 신호가
+      SIGTERM 이었고, 그 결과 `changes.diff`(저장소 코드 전문)가 담긴 임시 폴더가
+      남고 `--out` 은 `in_progress` 로 굳었다.
+    ⚠ 예외로 올리면 `subprocess.run` 이 대기 중이던 agy 자식을 `kill()` 한다
+      (CPython `run` 의 `except:` 절). 손자 프로세스까지는 못 죽인다(범위 밖 —
+      agy 는 실측상 하위 프로세스를 띄우지 않았다).
+    ⚠ 메인 스레드가 아니면 설치하지 않는다(`signal.signal` 이 ValueError).
+      Windows 에는 SIGHUP 이 없고, 강제 종료(TerminateProcess)는 잡을 수 없다.
+    ⚠ 첫 신호 뒤 정리하는 동안 오는 신호는 무시한다 — 정리 도중 다시 끊기면
+      임시 폴더가 남는다. 정리는 `main()` 의 중단 갈래에서 **즉시** 하고(atexit 를
+      기다리지 않는다), 끝나면 **항상** 원래 처리기로 되돌린다.
+    ⛔ [26.09.14 Gemini 교차리뷰 HIGH] 종전에는 신호가 한 번 오면 복원하지 않았다.
+      `main()` 을 같은 프로세스에서 부르는 호스트(테스트 러너 등)는 그 뒤 SIGTERM 을
+      **영구히 무시**하게 된다.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return (lambda: None), (lambda: None)
+    state = {"fired": False}
+    saved = []
+
+    def handler(signum, frame):
+        if state["fired"]:
+            return
+        state["fired"] = True
+        raise _Interrupted(signum)
+
+    for name in _HANDLED_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved.append((sig, signal.signal(sig, handler)))
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+    def restore():
+        # ⚠ 테스트가 main() 을 같은 프로세스에서 여러 번 부르면 처리기가 쌓이고
+        #   테스트 러너의 처리기를 덮는다 — 끝나면 원래대로 되돌린다.
+        for sig, old in saved:
+            try:
+                signal.signal(sig, old)
+            except (OSError, ValueError, RuntimeError):
+                pass
+
+    def suppress():
+        # ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] SIGINT 는 이 처리기를 거치지 않고
+        #   KeyboardInterrupt 로 오므로 `fired` 가 켜지지 않는다. Ctrl+C 로 정리하는
+        #   도중 SIGTERM 이 오면 `_Interrupted` 가 except 블록 안에서 새로 터져
+        #   정리 · 기록이 끊겼다 → 중단 갈래에 들어오면 먼저 이것을 부른다.
+        state["fired"] = True
+
+    return restore, suppress
+
+
+def _record_interrupt(out: Optional[str], signum: int) -> int:
+    """중단을 화면과 `--out` 에 남기고 종료 코드(128+신호 번호)를 돌려준다."""
+    try:
+        # ⚠ `signal.Signals` 는 Python 3.5+ 다(공식 문서 "Added in version 3.5").
+        #   [26.09.14 교차리뷰가 "3.8+ 라 3.7 에서 AttributeError" 라고 짚었으나 사실이 아니다]
+        name = signal.Signals(signum).name
+    except ValueError:
+        name = "signal %d" % signum
+    _safe_print("")
+    _safe_print("⛔ 중단됐다(%s) — 리뷰가 수행되지 않았다. 임시 파일은 정리한다." % name)
+    _safe_print("   이 결과를 '지적 없음'으로 읽지 말 것.")
+    if out:
+        _write_out(out, {
+            "mode": "interrupted",
+            "signal": name,
+            "note": "신호로 중단됐다 — 리뷰가 수행되지 않았다. 통과가 아니다.",
+        }, quiet=True)
+    return 128 + int(signum)
+
+
 def main(argv=None) -> int:
+    """진입점. 본문(`_main`)을 신호 처리로 감싼다(26.09.14 S1)."""
+    restore, suppress = _install_signal_handlers()
+    ctx = {"out": None, "tmpdir": None}
+    try:
+        return _main(argv, ctx)
+    except (_Interrupted, KeyboardInterrupt) as exc:
+        suppress()
+        # 정리는 **지금** 한다 — 처리기를 되돌린 뒤 atexit 까지 기다리면 그 사이의
+        #   두 번째 신호가 정리를 끊는다(atexit 등록은 남겨 두어도 두 번 지워 무해).
+        if ctx["tmpdir"]:
+            shutil.rmtree(ctx["tmpdir"], True)
+        return _record_interrupt(ctx["out"],
+                                 getattr(exc, "signum", signal.SIGINT))
+    finally:
+        restore()
+
+
+def _main(argv, ctx: dict) -> int:
     # ⚠ argparse 보다 **먼저** 불러야 한다 [26.08.13 재점검]. `--help` 와
     # argparse 의 에러 메시지는 `parse_args` **안에서** 출력되므로, 그 뒤에
     # 두면 한글·em dash 가 cp949 로 나가 UnicodeEncodeError 로 죽는다
@@ -487,6 +604,7 @@ def main(argv=None) -> int:
     #   ⚠ 갈래마다 `_write_out` 을 더하는 대신 여기서 한 번 무효화한다. 종료 경로가
     #     늘어도 자동으로 덮이고, 중간에 죽어도 낡은 값이 남지 않는다.
     out_early = _peek_out(argv)
+    ctx["out"] = out_early
     if out_early and _write_out(out_early, {
             "mode": "in_progress",
             "note": "리뷰가 시작됐고 아직 끝나지 않았다. 이 파일이 이 상태로 남아 "
@@ -497,34 +615,21 @@ def main(argv=None) -> int:
         _safe_print("   리뷰를 시작하지 않는다(외부 전송 없음). 경로 · 권한을 확인할 것.")
         return 2
 
-    ap = argparse.ArgumentParser(
-        description="Gemini cross-review via Antigravity CLI (agy)")
-    ap.add_argument("--base", default="HEAD~1")
-    ap.add_argument("--head", default="HEAD")
-    ap.add_argument("--staged", action="store_true", help="스테이징된 변경 리뷰")
-    ap.add_argument("--two-dot", action="store_true",
-                    help="base..head 2-dot diff (기본은 merge-base 기준 3-dot). "
-                         "브랜치 리뷰에서는 쓰지 마라 (남의 커밋이 섞인다)")
-    # ⚠ `--effort` 는 두지 않는다. agy 는 **모델명에 effort 가 내장**돼 있고
-    # (`gemini-3.1-pro-high`/`-low`, `gemini-3.6-flash-medium` …), 모델 접미사와
-    # 다른 --effort 를 주면 즉시 status=ERROR 로 죽는다 (실측: 0초, tokens 0).
-    # ⚠ [26.09.10 리뷰] 종전 help 는 "빠르게: gemini-3.6-flash-high" 를 **리터럴**
-    #   로 권했는데, 그 값이 곧 `_DEFAULT_FALLBACK_MODEL` 이라 그대로 주면 폴백이
-    #   침묵한 채 죽었다. 두 상수의 **관계**가 어디에도 표현되지 않은 탓이다.
-    ap.add_argument("--model", default=_DEFAULT_MODEL,
-                    help="기본 %s. `agy models` 로 목록 확인. 폴백 기본값은 %s 라, "
-                         "그 값을 --model 로 주면 폴백이 자동으로 다른 모델로 "
-                         "바뀐다" % (_DEFAULT_MODEL, _DEFAULT_FALLBACK_MODEL))
-    ap.add_argument("--fallback-model", default=_DEFAULT_FALLBACK_MODEL,
-                    help="주 모델이 빈 응답을 내면 이 모델로 한 번 더 "
-                         "구조화 시도 (기본 %s)" % _DEFAULT_FALLBACK_MODEL)
-    ap.add_argument("--no-fallback", action="store_true",
-                    help="폴백 모델 재시도를 끈다")
-    ap.add_argument("--timeout", default="10m", help="agy --print-timeout")
-    ap.add_argument("--out", default=None, help="결과 JSON 저장 경로")
-    ap.add_argument("--allow-sensitive", action="store_true",
-                    help="민감 경로가 diff 에 있어도 강행 (기본: 중단)")
-    args = ap.parse_args(argv)
+    ap = _build_parser()
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as exc:
+        # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] `--help` · 인자 오류로 여기서 끝나면 방금
+        #   쓴 `in_progress`("중간에 죽었다") 가 사실과 다르게 남는다. 리뷰를 시작하지도
+        #   않았다는 것을 그대로 적는다 — 여전히 통과가 아니다.
+        if out_early:
+            _write_out(out_early, {
+                "mode": "not_run",
+                "note": "인자 해석 단계에서 끝났다(도움말 · 인자 오류) — 리뷰가 "
+                        "수행되지 않았다. 통과가 아니다.",
+                "exit_code": exc.code,
+            }, quiet=True)
+        raise
 
     def finish(payload: dict, rc: int) -> int:
         """최종 결과를 `--out` 에 남긴다. **명시한 `--out` 에 못 쓰면 exit 2.**
@@ -620,6 +725,7 @@ def main(argv=None) -> int:
     #     검사 하나뿐이었다.
     tmpdir = tempfile.mkdtemp(prefix="gemini_review_")
     atexit.register(shutil.rmtree, tmpdir, True)
+    ctx["tmpdir"] = tmpdir
     diff_path = os.path.join(tmpdir, "changes.diff")
     schema_path = os.path.join(tmpdir, "schema.json")
     with open(diff_path, "w", encoding="utf-8") as f:
@@ -842,21 +948,69 @@ def _write_out(out_path: Optional[str], payload: dict,
     return path
 
 
-def _peek_out(argv) -> Optional[str]:
-    """argparse **보다 먼저** `--out` 값만 뽑는다.
+def _build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Gemini cross-review via Antigravity CLI (agy)")
+    ap.add_argument("--base", default="HEAD~1")
+    ap.add_argument("--head", default="HEAD")
+    ap.add_argument("--staged", action="store_true", help="스테이징된 변경 리뷰")
+    ap.add_argument("--two-dot", action="store_true",
+                    help="base..head 2-dot diff (기본은 merge-base 기준 3-dot). "
+                         "브랜치 리뷰에서는 쓰지 마라 (남의 커밋이 섞인다)")
+    # ⚠ `--effort` 는 두지 않는다. agy 는 **모델명에 effort 가 내장**돼 있고
+    # (`gemini-3.1-pro-high`/`-low`, `gemini-3.6-flash-medium` …), 모델 접미사와
+    # 다른 --effort 를 주면 즉시 status=ERROR 로 죽는다 (실측: 0초, tokens 0).
+    # ⚠ [26.09.10 리뷰] 종전 help 는 "빠르게: gemini-3.6-flash-high" 를 **리터럴**
+    #   로 권했는데, 그 값이 곧 `_DEFAULT_FALLBACK_MODEL` 이라 그대로 주면 폴백이
+    #   침묵한 채 죽었다. 두 상수의 **관계**가 어디에도 표현되지 않은 탓이다.
+    ap.add_argument("--model", default=_DEFAULT_MODEL,
+                    help="기본 %s. `agy models` 로 목록 확인. 폴백 기본값은 %s 라, "
+                         "그 값을 --model 로 주면 폴백이 자동으로 다른 모델로 "
+                         "바뀐다" % (_DEFAULT_MODEL, _DEFAULT_FALLBACK_MODEL))
+    ap.add_argument("--fallback-model", default=_DEFAULT_FALLBACK_MODEL,
+                    help="주 모델이 빈 응답을 내면 이 모델로 한 번 더 "
+                         "구조화 시도 (기본 %s)" % _DEFAULT_FALLBACK_MODEL)
+    ap.add_argument("--no-fallback", action="store_true",
+                    help="폴백 모델 재시도를 끈다")
+    ap.add_argument("--timeout", default="10m", help="agy --print-timeout")
+    ap.add_argument("--out", default=None, help="결과 JSON 저장 경로")
+    ap.add_argument("--allow-sensitive", action="store_true",
+                    help="민감 경로가 diff 에 있어도 강행 (기본: 중단)")
+    return ap
 
-    ⚠ 이 파서는 `--out` 만 안다. 값이 빠진 `--out` 처럼 여기서 파싱이 실패하면
-      None 을 돌려주고, 본 파서가 같은 오류를 사용자에게 알린다.
-    ⚠ 본 파서와 같은 규칙(약어 허용 · 마지막 값 우선)이라 두 파서가 고르는
-      경로가 같다.
+
+def _peek_out(argv) -> Optional[str]:
+    """argparse 로 본 해석을 하기 **전에** `--out` 값만 알아낸다.
+
+    ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] 종전에는 `--out` 만 아는 임시 파서를 따로
+      썼다. 그 파서는 `--model` 이 값을 받는다는 것을 몰라, `--model --out --staged`
+      를 `--out=--staged` 로 읽고 **`--staged` 라는 파일을 만들었다.** 본 파서와
+      같은 정의(`_build_parser`)로 해석해 두 해석이 갈리지 않게 한다.
+    ⚠ 인자 오류로 본 파서가 해석을 못 하면(값 빠짐 등) 보수적으로 직접 훑는다:
+      `--out=값` 이거나, `--out` 바로 뒤 토큰이 `-` 로 시작하지 않을 때만 경로로 본다.
+      이 단계의 도움말 · 오류 출력은 삼킨다 — 사용자에게는 본 해석이 한 번만 알린다.
     """
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--out", default=None)
     try:
-        known, _ = pre.parse_known_args(argv)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            known, _ = _build_parser().parse_known_args(argv)
+        return known.out
     except SystemExit:
-        return None
-    return known.out
+        pass
+    tokens = list(sys.argv[1:] if argv is None else argv)
+
+    def is_out(flag):
+        # 본 파서처럼 약어(`--o` · `--ou`)도 인정한다 — `--o` 로 시작하는 옵션은 `--out` 뿐이다
+        #   [26.09.14 Gemini 교차리뷰 LOW].
+        return len(flag) >= 3 and "--out".startswith(flag)
+
+    found = None                          # argparse 처럼 **마지막** 값이 이긴다 [26.09.14 LOW]
+    for i, tok in enumerate(tokens):
+        if tok.startswith("--") and "=" in tok and is_out(tok.split("=", 1)[0]):
+            found = tok.split("=", 1)[1] or None
+        elif is_out(tok) and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            found = tokens[i + 1]
+    return found
 
 
 def _default_result_dir() -> str:

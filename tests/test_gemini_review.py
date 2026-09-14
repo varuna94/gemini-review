@@ -18,10 +18,12 @@ import os
 import io
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -673,6 +675,281 @@ def _check_default_result_dir_is_private(gr):
         _rmtree_sandbox(sandbox, sandbox)
 
 
+# 자식 프로세스에서 main() 을 돌리고, 가짜 agy 호출이 **진짜 자식 프로세스**를 띄운 채 기다리게 한다.
+# argv: 스크립트 경로 · 샌드박스 · --out 경로 · 자식 pid 기록 파일
+_CHILD_SIGNAL_RUN = r'''
+import importlib.util, json, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("gemini_review", sys.argv[1])
+gr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gr)
+sandbox, out, pidfile = sys.argv[2], sys.argv[3], sys.argv[4]
+
+def fake_invoke(agy, model, args, root_, schema_path, prompt):
+    d = os.path.dirname(schema_path)
+    sys.stdout.write("CHILD_DIFF_DIR=%s\n" % os.path.basename(d))
+    sys.stdout.flush()
+    # agy 자리에 오래 사는 자식을 띄운다 — 신호가 오면 이 자식도 정리돼야 한다.
+    subprocess.run([sys.executable, "-c",
+                    "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); "
+                    "time.sleep(60)", pidfile])
+    return json.dumps({"verdict": "approve", "summary": "t", "findings": []}), 0.0, None
+
+gr._find_agy = lambda *a, **k: "agy"
+gr._git_root = lambda start: sandbox
+gr._collect_diff = lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])
+gr._invoke_schema = fake_invoke
+sys.exit(gr.main(["--out", out]))
+'''
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _check_signal_cleans_up(gr):
+    """리뷰 도중 SIGTERM · SIGINT 를 받으면 **정리하고** 중단을 기록한다.
+
+    ⛔ [26.09.14 실측] 처리기가 없으면 SIGTERM 에 atexit 가 돌지 않았다(exit 143).
+      Claude Code 에서 작업을 멈추면(TaskStop) 오는 신호가 SIGTERM 이었고, 코드
+      전문이 담긴 임시 폴더가 남고 `--out` 은 `in_progress` 로 굳었다.
+    확인하는 것: ① 종료 코드 143 · 130 ② diff 임시 폴더 삭제 ③ `--out` 이 파싱되고
+    mode 가 `interrupted` ④ 대기 중이던 agy 자식이 죽음.
+    """
+    del gr
+    if os.name == "nt":
+        yield _Skip("Windows 는 SIGTERM 을 잡을 수 없다(TerminateProcess)")
+        return
+    for signame, want_rc in (("SIGTERM", 143), ("SIGINT", 130)):
+        sandbox = tempfile.mkdtemp(prefix="gr_test_sig_")
+        try:
+            env = dict(os.environ, TMPDIR=sandbox, TEMP=sandbox, TMP=sandbox,
+                       XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env.pop("PYTHONIOENCODING", None)
+            out = os.path.join(sandbox, "out.json")
+            pidfile = os.path.join(sandbox, "agy.pid")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _CHILD_SIGNAL_RUN, os.path.abspath(_TARGET),
+                 sandbox, out, pidfile],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            diff_dir = None
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                line = proc.stdout.readline().decode("utf-8", "replace")
+                if line.startswith("CHILD_DIFF_DIR="):
+                    diff_dir = line.strip().split("=", 1)[1]
+                    break
+                if not line and proc.poll() is not None:
+                    break
+            while diff_dir and time.time() < deadline and not os.path.exists(pidfile):
+                time.sleep(0.05)
+            agy_pid = None
+            if os.path.exists(pidfile):
+                with io.open(pidfile) as fh:
+                    agy_pid = int(fh.read().strip() or 0) or None
+            proc.send_signal(getattr(signal, signame))
+            try:
+                rest = proc.communicate(timeout=30)[0].decode("utf-8", "replace")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rest = proc.communicate()[0].decode("utf-8", "replace")
+            time.sleep(0.2)
+            problems = []
+            if not diff_dir or agy_pid is None:
+                problems.append("준비 신호를 못 받음(diff 폴더 %r · agy pid %r)" % (diff_dir, agy_pid))
+            if proc.returncode != want_rc:
+                problems.append("종료 코드 %s (기대 %d)" % (proc.returncode, want_rc))
+            if diff_dir and os.path.exists(os.path.join(sandbox, diff_dir)):
+                problems.append("diff 임시 폴더가 남음")
+            try:
+                mode = _read_json(out).get("mode")
+            except (OSError, ValueError) as exc:
+                mode = "파싱 실패: %r" % exc
+            if mode != "interrupted":
+                problems.append("--out mode %r" % mode)
+            if agy_pid and _pid_alive(agy_pid):
+                problems.append("agy 자식(pid %d)이 살아 있음" % agy_pid)
+                try:
+                    os.kill(agy_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            yield (None if not problems else
+                   "%s 중단 처리 실패: %s · 출력 끝: %s"
+                   % (signame, " · ".join(problems), rest.strip()[-160:]))
+        finally:
+            _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_signal_handlers_restored(gr):
+    """`main()` 이 끝나면 — **중단됐을 때도** — 신호 처리기가 원래대로 돌아온다.
+
+    ⛔ [26.09.14 Gemini 교차리뷰 HIGH] 신호가 한 번 오면 복원하지 않던 판에서는,
+      같은 프로세스에서 `main()` 을 부른 호스트가 그 뒤 SIGTERM 을 영구히 무시했다.
+    중단 갈래는 atexit 를 기다리지 않고 **그 자리에서** 임시 폴더를 지운다.
+    """
+    if os.name == "nt":
+        yield _Skip("Windows 신호 처리기 비교 생략")
+        return
+    before = signal.getsignal(signal.SIGTERM)
+    sandbox = tempfile.mkdtemp(prefix="gr_test_sigrestore_")
+    try:
+        _main_inprocess(gr, ["--out", os.path.join(sandbox, "o.json")], sandbox)
+        after = signal.getsignal(signal.SIGTERM)
+        yield (None if after is before else
+               "main() 뒤 SIGTERM 처리기가 바뀐 채 남았다: %r" % (after,))
+
+        seen = []
+
+        def interrupted_invoke(agy, model, args, root, schema_path, prompt):
+            seen.append(os.path.dirname(schema_path))
+            # 예외를 직접 던지지 않고 **진짜 신호**를 보낸다 — 설치된 처리기가 실제로
+            #   불려야 "신호가 온 뒤 복원" 경로를 검사한다.
+            os.kill(os.getpid(), signal.SIGTERM)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                time.sleep(0.01)
+            return json.dumps({"verdict": "approve", "summary": "t", "findings": []}), 0.0, None
+
+        out = os.path.join(sandbox, "o2.json")
+        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        with _quiet(), _patched(os, "environ", env), \
+                _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                _patched(gr, "_git_root", lambda start: sandbox), \
+                _patched(gr, "_collect_diff",
+                         lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])), \
+                _patched(gr, "_invoke_schema", interrupted_invoke):
+            rc = gr.main(["--out", out])
+        after = signal.getsignal(signal.SIGTERM)
+        problems = []
+        if rc != 143:
+            problems.append("exit %s" % rc)
+        if after is not before:
+            problems.append("처리기 미복원")
+        if not seen or os.path.exists(seen[0]):
+            problems.append("임시 폴더를 즉시 지우지 않음")
+        if _read_json(out).get("mode") != "interrupted":
+            problems.append("--out mode")
+        yield (None if not problems else
+               "중단된 main() 뒤 정리 · 복원 실패: %s" % " · ".join(problems))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_sigterm_during_sigint_cleanup(gr):
+    """Ctrl+C 로 정리하는 **도중** SIGTERM 이 와도 정리 · 기록이 끝까지 간다.
+
+    ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] SIGINT 는 설치한 처리기를 거치지 않아
+      "이미 신호 받음" 표시가 켜지지 않았고, 정리 중 SIGTERM 이 `_Interrupted` 를
+      except 블록 안에서 새로 던져 기록이 끊겼다.
+    """
+    if os.name == "nt":
+        yield _Skip("Windows 신호 흉내 생략")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_sigmix_")
+    real_rmtree = shutil.rmtree
+
+    sent = []
+
+    def rmtree_with_sigterm(path, *a, **k):
+        # ⚠ **한 번만** 보낸다. main() 이 이 가짜 함수를 atexit 에 등록하므로, 여러 번
+        #   보내면 테스트 프로세스가 끝날 때 기본 처리기로 SIGTERM 을 맞아 143 으로 죽는다.
+        if not sent:
+            sent.append(path)
+            os.kill(os.getpid(), signal.SIGTERM)      # 정리 도중 두 번째 신호
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                time.sleep(0.01)
+        return real_rmtree(path, *a, **k)
+
+    def ctrl_c(*a, **k):
+        raise KeyboardInterrupt
+
+    try:
+        out = os.path.join(sandbox, "o.json")
+        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        rc = None
+        try:
+            with _quiet(), _patched(os, "environ", env), \
+                    _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                    _patched(gr, "_git_root", lambda start: sandbox), \
+                    _patched(gr, "_collect_diff",
+                             lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])), \
+                    _patched(gr, "_invoke_schema", ctrl_c), \
+                    _patched(gr.shutil, "rmtree", rmtree_with_sigterm):
+                rc = gr.main(["--out", out])
+        except BaseException as exc:
+            yield "정리 중 SIGTERM 에 main() 이 예외로 끝났다: %r" % (exc,)
+            return
+        mode = _read_json(out).get("mode")
+        yield (None if rc == 130 and mode == "interrupted" else
+               "Ctrl+C 정리 중 SIGTERM 뒤 exit %s · mode %r (기대 130 · interrupted)" % (rc, mode))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_argparse_exit_is_not_interrupted(gr):
+    """`--help` · 인자 오류는 **중단(interrupted)으로 기록하지 않는다.**
+
+    ⚠ [26.09.14 Eng 리뷰] 신호를 `SystemExit` 으로 올리면, 그것을 잡아 기록하는
+      코드가 argparse 의 `SystemExit` 까지 중단으로 오기록한다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_argexit_")
+    try:
+        # [26.09.14 Gemini 교차리뷰 HIGH] 인자 해석에서 끝나면 `in_progress`("중간에
+        #   죽음") 가 아니라 `not_run`(리뷰 시작 안 함) — `--help` 는 exit 0 이라 특히.
+        for argv, want_rc in ((["--no-such-flag"], 2), (["--help"], 0)):
+            out = os.path.join(sandbox, "o.json")
+            rc, _ = _main_inprocess(gr, ["--out", out] + argv, sandbox)
+            mode = _read_json(out).get("mode")
+            yield (None if rc == want_rc and mode == "not_run" else
+                   "%s 가 exit %s · mode %r 로 기록됐다(기대: %d · not_run)"
+                   % (argv[0], rc, mode, want_rc))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_out_peek_matches_main_parser(gr):
+    """`--out` 사전 해석이 본 파서와 **같은 규칙**으로 읽는다.
+
+    ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] `--out` 만 아는 임시 파서는
+      `--model --out --staged` 를 `--out=--staged` 로 읽어 `--staged` 라는 파일을
+      만들었다(본 파서는 `--out` 을 `--model` 의 값으로 본다).
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_peek_")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(sandbox)
+        with _quiet():
+            got = gr._peek_out(["--model", "--out", "--staged"])
+        yield (None if got is None and not os.path.exists(os.path.join(sandbox, "--staged")) else
+               "다른 플래그의 값인 --out 을 경로로 읽었다: %r" % (got,))
+        target = os.path.join(sandbox, "o.json")
+        with _quiet():
+            abbrev = gr._peek_out(["--ou", target, "--staged"])
+            eq = gr._peek_out(["--out=" + target, "--no-such-flag"])
+        yield (None if abbrev == target and eq == target else
+               "본 파서가 받아들이는 꼴(약어 · = · 모르는 플래그 섞임)을 못 읽었다: %r · %r"
+               % (abbrev, eq))
+        # 본 파서가 인자 오류로 해석을 못 할 때(값 빠진 --model)도 약어 --ou 를 읽는다
+        with _quiet():
+            fallback = gr._peek_out(["--ou", target, "--model"])
+            fallback_eq = gr._peek_out(["--ou=" + target, "--model"])
+        yield (None if fallback == target and fallback_eq == target else
+               "인자 오류 때 대체 해석이 --out 약어를 못 읽었다: %r · %r"
+               % (fallback, fallback_eq))
+        other = os.path.join(sandbox, "first.json")
+        with _quiet():
+            last = gr._peek_out(["--out", other, "--out", target, "--model"])
+        yield (None if last == target else
+               "인자 오류 때 대체 해석이 마지막 --out 이 아니라 %r 을 골랐다" % (last,))
+    finally:
+        os.chdir(old_cwd)
+        _rmtree_sandbox(sandbox, sandbox)
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -682,6 +959,11 @@ _BEHAVIOR_CHECKS = (
     _check_write_out_is_atomic,
     _check_verdict_model_is_recorded_by_code,
     _check_default_result_dir_is_private,
+    _check_signal_cleans_up,
+    _check_signal_handlers_restored,
+    _check_sigterm_during_sigint_cleanup,
+    _check_argparse_exit_is_not_interrupted,
+    _check_out_peek_matches_main_parser,
 )
 
 

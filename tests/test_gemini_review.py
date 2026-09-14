@@ -11,12 +11,16 @@
 #
 # 종료 코드: 0 전부 통과 / 1 회귀 발생
 
+import contextlib
 import importlib.util
-import inspect
 import os
 import io
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TARGET = os.path.join(_HERE, os.pardir, "plugins", "gemini-review",
@@ -165,6 +169,256 @@ def _frontmatter_version(path):
     return None
 
 
+# ── 동작 검사 ────────────────────────────────────────────────────────────────
+#
+# ⛔ [26.09.14] **소스에서 문자열을 찾는 가드를 쓰지 않는다.** 종전 가드
+#   `"proc.returncode != 0" in src` 는 **파일 전체**를 뒤졌고, 같은 문자열이
+#   `_invoke_schema` 에 있어서 v1.3.0 병합이 `_retry_as_text` 의 검사를 지운
+#   뒤에도 v1.3.0·v1.3.1 두 판 동안 초록이었다. `atexit.register` · `--mode`
+#   검사도 같은 모양이었다 — 주석이나 다른 함수에 그 낱말만 있으면 통과한다.
+#   → 여기 검사는 전부 **그 함수를 실제로 돌려** 결과를 본다.
+#
+# 각 검사는 제너레이터다. 하위 검사마다 통과면 `None`, 실패면 문구를 낸다.
+# 검사 수는 낸 개수로 센다 — 손으로 센 상수가 조용히 어긋나지 않게.
+
+
+@contextlib.contextmanager
+def _patched(obj, name, value):
+    """`obj.name` 을 잠시 바꾼다. 검사가 예외로 끝나도 되돌린다."""
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        setattr(obj, name, old)
+
+
+@contextlib.contextmanager
+def _quiet():
+    """스킬이 찍는 진행 문구를 삼킨다 — 검사 결과만 화면에 남긴다."""
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
+def _fake_subprocess(calls, returncode=0, stdout=b"", stderr=b""):
+    """`gr.subprocess` 자리에 넣을 가짜 모듈. `run` 만 바꾼다.
+
+    ⚠ 진짜 `subprocess.run` 을 덮어쓰지 않는다 — 그러면 같은 프로세스의
+      다른 검사(자식 프로세스를 띄우는 검사)까지 가짜를 탄다.
+      예외 클래스·`DEVNULL` 은 진짜를 그대로 쓴다.
+    """
+    def run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return types.SimpleNamespace(returncode=returncode,
+                                     stdout=stdout, stderr=stderr)
+    attrs = {k: getattr(subprocess, k) for k in dir(subprocess)
+             if not k.startswith("_")}
+    attrs["run"] = run
+    return types.SimpleNamespace(**attrs)
+
+
+def _check_retry_as_text_rejects_failed_agy(gr):
+    """텍스트 재시도가 **리뷰가 아닌 출력**을 리뷰로 반환하지 않는다.
+
+    [26.08.27] 교차리뷰가 짚어 고쳤던 결함이 v1.3.0 병합에서 되살아났다.
+    실측(26.09.14): agy 가 exit 1 과 함께 stdout 에 `Error: authentication
+    required…` 를 내면 `_retry_as_text` 가 그 문구를 반환했고, `main()` 은
+    그것을 `mode: text_fallback` 의 원문으로 저장해 **exit 6** 을 냈다.
+    리뷰가 안 됐는데 "리뷰는 받았다(형식만 실패)" 로 읽힌다.
+    """
+    args = types.SimpleNamespace(timeout="10m")
+
+    def call(**proc):
+        with _quiet(), _patched(gr, "subprocess", _fake_subprocess([], **proc)):
+            return gr._retry_as_text("agy", "m", args, ".", "changes.diff",
+                                     ["a.py"], "")
+
+    got = call(returncode=1, stdout=b"Error: authentication required.")
+    yield (None if got == "" else
+           "_retry_as_text 가 agy 종료코드 1 의 출력을 리뷰로 반환한다: %r"
+           % got[:60])
+
+    # ⚠ [26.09.14 실측] agy 는 `--print-timeout` 에 걸려도 **exit 0** 이고,
+    #   안내문은 stderr 로, 그때까지의 부분 출력은 stdout 으로 낸다. 종료 코드만
+    #   보면 **잘린 리뷰**가 온전한 리뷰로 저장된다 — 판정 줄까지만 오고 지적이
+    #   잘리면 통과로 읽힌다.
+    got = call(returncode=0, stdout="판정: approve".encode("utf-8"),
+               stderr=b"[agy] print timeout after 10m0s with turn in progress; "
+                      b"returning partial output")
+    yield (None if got == "" else
+           "_retry_as_text 가 출력 시간 초과로 잘린 부분 출력을 리뷰로 반환한다: %r"
+           % got[:60])
+
+    # [26.09.14 Gemini 교차리뷰] stderr 가 stdout 에 섞이는 환경 — 안내 줄이 본문에 온다.
+    got = call(returncode=0,
+               stdout=("판정: approve\n[agy] print timeout after 10m0s with turn "
+                       "in progress; returning partial output").encode("utf-8"))
+    yield (None if got == "" else
+           "_retry_as_text 가 본문에 섞인 시간 초과 안내 줄을 리뷰로 반환한다: %r"
+           % got[:60])
+
+    # 대조군 — 없으면 '언제나 빈 문자열' 로 고쳐도 위 검사들이 통과한다.
+    review = "판정: request_changes\n요약: 대조군"
+    got = call(returncode=0, stdout=review.encode("utf-8"))
+    yield (None if got == review else
+           "대조군: _retry_as_text 가 정상 응답(exit 0)을 버린다: %r" % got[:60])
+
+    # 대조군 2 — 이 저장소를 리뷰한 정상 결과는 "print timeout" 을 **인용**한다.
+    #   본문 전체에서 문구를 찾으면 그런 리뷰를 버린다(오탐 → exit 4).
+    quoted = ("판정: request_changes\n  내용: `_is_print_timeout` 은 \"print timeout\" "
+              "과 \"turn in progress\" 를 찾는다")
+    got = call(returncode=0, stdout=quoted.encode("utf-8"))
+    yield (None if got == quoted else
+           "대조군: 'print timeout' 을 인용한 정상 리뷰를 버린다: %r" % got[:60])
+
+
+def _check_agy_calls_are_plan_mode(gr):
+    """agy 를 부르는 **모든 자리**가 `--mode plan` 을 정확히 한 번 넘긴다.
+
+    ⚠ 종전 가드는 파일 어딘가에 `--mode` 와 `"plan"` 이 있는지만 봤다 — 세 자리
+      중 하나에서 빠져도 통과한다. 풀리면 Gemini 가 저장소 파일을 수정할 수 있다.
+    ⚠ agy 를 부르는 함수를 새로 만들면 **여기에 추가할 것.** 이 목록 밖의
+      호출은 이 검사가 보지 못한다.
+    """
+    args = types.SimpleNamespace(timeout="10m")
+    sites = (
+        ("_invoke_schema", lambda: gr._invoke_schema(
+            "agy", "m", args, ".", "schema.json", "prompt")),
+        ("_probe_alive", lambda: gr._probe_alive("agy", "m", ".")),
+        ("_retry_as_text", lambda: gr._retry_as_text(
+            "agy", "m", args, ".", "changes.diff", ["a.py"], "")),
+    )
+    for name, invoke in sites:
+        calls = []
+        with _quiet(), _patched(gr, "subprocess",
+                                _fake_subprocess(calls, stdout=b"OK")):
+            invoke()
+        if len(calls) != 1:
+            yield "%s 가 agy 를 %d번 불렀다 (기대 1번)" % (name, len(calls))
+            continue
+        cmd = calls[0]
+        # `--mode plan` 과 `--mode=plan` 을 같은 것으로 본다 [26.09.14 Gemini 교차리뷰].
+        values = []
+        for i, a in enumerate(cmd):
+            if a == "--mode":
+                values.append(cmd[i + 1] if i + 1 < len(cmd) else None)
+            elif a.startswith("--mode="):
+                values.append(a.split("=", 1)[1])
+        ok = values == ["plan"]
+        yield (None if ok else
+               "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다 — "
+               "Gemini 가 파일을 수정할 수 있게 된다: %s" % (name, cmd[:6]))
+
+
+def _check_find_agy_skips_relative_candidates(gr):
+    """작업 디렉터리에 심은 `agy` 를 실행하지 않는다.
+
+    리눅스·맥에는 `LOCALAPPDATA` 가 없어 첫 후보가 `agy/bin/agy.exe` 라는
+    **상대 경로**가 된다. 리뷰는 대상 저장소 안에서 돌므로, 그 경로를 품은
+    저장소를 clone 해 리뷰하면 저장소가 심은 파일이 agy 대신 실행된다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_agy_")
+    planted = os.path.join(sandbox, "agy", "bin", "agy.exe")
+    # `_AGY_CANDIDATES` 가 import 시점에 `LOCALAPPDATA=""` 로 만드는 값과 같다.
+    relative = os.path.join("agy", "bin", "agy.exe")
+    old_cwd = os.getcwd()
+    try:
+        os.makedirs(os.path.dirname(planted))
+        open(planted, "w").close()
+        # 실행 권한을 준다 — `_find_agy` 가 실행 가능 여부를 보도록 바뀌어도
+        # 대조군이 거짓 빨강이 되지 않게 [26.09.14 Gemini 교차리뷰].
+        os.chmod(planted, 0o755)
+        os.chdir(sandbox)
+        with _patched(gr, "_AGY_CANDIDATES", [relative]):
+            got = gr._find_agy()
+        yield (None if got is None else
+               "_find_agy 가 상대 경로 %r 를 골랐다 — 저장소가 심은 파일이 "
+               "agy 대신 실행된다" % got)
+        # 대조군 — 없으면 '언제나 None' 으로 고쳐도 위 검사가 통과한다.
+        with _patched(gr, "_AGY_CANDIDATES", [planted]):
+            got = gr._find_agy()
+        yield (None if got == planted else
+               "대조군: _find_agy 가 절대 경로 후보를 찾지 못한다: %r" % got)
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(sandbox, True)
+
+
+# 자식 프로세스에서 `main()` 을 가짜 agy 로 끝까지 돌린다.
+# argv: 스크립트 경로 · 가짜 저장소 루트 · --out 경로
+_CHILD_RUN = r'''
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("gemini_review", sys.argv[1])
+gr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gr)
+root, out = sys.argv[2], sys.argv[3]
+seen = []
+
+def fake_invoke(agy, model, args, root_, schema_path, prompt):
+    d = os.path.dirname(schema_path)
+    if os.path.isfile(os.path.join(d, "changes.diff")):
+        seen.append(os.path.basename(d))
+    return (json.dumps({"verdict": "approve", "summary": "t", "findings": []}),
+            0.0, None)
+
+gr._find_agy = lambda: "agy"
+gr._git_root = lambda start: root
+gr._collect_diff = lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])
+gr._invoke_schema = fake_invoke
+rc = gr.main(["--out", out])
+sys.stdout.write("\nCHILD_DIFF_DIRS=%s\n" % "|".join(seen))
+sys.exit(rc)
+'''
+
+
+def _check_tmpdir_removed_after_real_run(gr):
+    """리뷰 프로세스가 끝나면 **diff 를 담은 임시 디렉터리가 남지 않는다.**
+
+    이 정리는 두 번 사라졌다 — 처음엔 `/tmp` 에 50개 1.5MB, 두 번째는 3,116개
+    (26.09.11). 담기는 것이 `changes.diff`(저장소 코드 전문)라 용량보다 내용이
+    문제다.
+    ⚠ **자식 프로세스로 돌린다.** `atexit` 는 프로세스가 끝날 때 돌므로 같은
+      프로세스 안에서는 "지워진다" 를 확인할 수 없다. 등록 여부만 보면 엉뚱한
+      경로를 등록해도 통과한다 — 여기서는 **그 diff 가 있던 디렉터리**가 실제로
+      사라졌는지 본다.
+    ⚠ 자식의 임시 디렉터리를 샌드박스로 돌린다(`TMPDIR`·`TEMP`·`TMP`). 정리가
+      깨져 있어도 이 검사 자체가 `/tmp` 에 흔적을 남기지 않는다.
+    """
+    del gr  # 자식이 스크립트를 따로 불러온다
+    sandbox = tempfile.mkdtemp(prefix="gr_test_tmp_")
+    try:
+        env = dict(os.environ, TMPDIR=sandbox, TEMP=sandbox, TMP=sandbox)
+        env.pop("PYTHONIOENCODING", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD_RUN, os.path.abspath(_TARGET),
+             sandbox, os.path.join(sandbox, "out.json")],
+            env=env, capture_output=True, timeout=120, check=False)
+        out = proc.stdout.decode("utf-8", "replace")
+        m = re.search(r"CHILD_DIFF_DIRS=(\S*)", out)
+        dirs = [d for d in (m.group(1).split("|") if m else []) if d]
+        if proc.returncode != 0 or len(dirs) != 1:
+            tail = (out + proc.stderr.decode("utf-8", "replace")).strip()[-300:]
+            yield ("임시 디렉터리 검사를 수행하지 못했다 (자식 exit %d · diff "
+                   "디렉터리 %d개 · 기대 exit 0 · 1개): %s"
+                   % (proc.returncode, len(dirs), tail))
+            return
+        left = os.path.join(sandbox, dirs[0])
+        yield (None if not os.path.exists(left) else
+               "프로세스가 끝났는데 diff 를 담은 임시 디렉터리 %s 가 남았다 — "
+               "저장소 코드가 평문으로 쌓인다" % dirs[0])
+    finally:
+        shutil.rmtree(sandbox, True)
+
+
+_BEHAVIOR_CHECKS = (
+    _check_retry_as_text_rejects_failed_agy,
+    _check_agy_calls_are_plan_mode,
+    _check_find_agy_skips_relative_candidates,
+    _check_tmpdir_removed_after_real_run,
+)
+
+
 def main():
     _make_stdout_safe()
     gr = _load()
@@ -259,13 +513,19 @@ def main():
     # 코드로만 확인할 수 있는 가드들
     if gr.EXIT_REQUEST_CHANGES != 5 or gr.EXIT_UNSTRUCTURED != 6:
         fails.append("종료코드 상수가 바뀌었다 (5·6 이어야 한다)")
-    if "not os.path.isabs(cand)" not in inspect.getsource(gr._find_agy):
-        fails.append("_find_agy 의 상대경로 스킵이 사라졌다 — 저장소가 심은 agy 가 실행될 수 있다")
-    src = open(_TARGET, encoding="utf-8").read()
-    if "atexit.register" not in src:
-        fails.append("tmpdir 정리가 사라졌다 — /tmp 에 diff 평문이 쌓인다")
-    if "--mode" not in src or '"plan"' not in src:
-        fails.append("--mode plan 고정이 사라졌다 — Gemini 가 파일을 수정할 수 있게 된다")
+
+    # [26.09.14] 문자열 검사 넷(상대경로 스킵 · tmpdir 정리 · --mode plan ·
+    #   텍스트 재시도 종료코드)을 동작 검사로 바꿨다 — 위 「동작 검사」 주석 참조.
+    behavior_total = 0
+    for check in _BEHAVIOR_CHECKS:
+        try:
+            for failure in check(gr):
+                behavior_total += 1
+                if failure:
+                    fails.append(failure)
+        except Exception as exc:          # 검사 자체가 죽어도 조용히 넘기지 않는다
+            behavior_total += 1
+            fails.append("%s 가 예외로 끝났다: %r" % (check.__name__, exc))
 
     # [26.08.27] _safe_print 폴백이 utf-8 이면 치환이 일어나지 않아 두 번째
     # UnicodeEncodeError 로 죽는다 — 리뷰 결과를 한 줄도 못 남긴다.
@@ -286,16 +546,12 @@ def main():
     if _crashed:
         fails.append("_safe_print 폴백이 두 번째 UnicodeEncodeError 로 죽는다")
 
-    # [26.08.27] agy 가 비정상 종료했는데 stdout 을 리뷰 원문으로 삼으면,
-    # 에러 문구가 exit 6(구조화 실패)의 '리뷰 결과'로 저장된다.
-    if "proc.returncode != 0" not in src:
-        fails.append("_retry_as_text 가 agy 종료 코드를 보지 않는다")
-
-    # ⚠ 뒤의 상수는 **손으로 센** 코드 검사 수다(표 두 개가 아닌 것들).
+    # ⚠ 뒤의 상수는 **손으로 센** 코드 검사 수다(표 두 개와 동작 검사가 아닌 것들).
     #   가드를 추가하면 여기도 함께 올릴 것 — 안 올리면 개수만 조용히 어긋난다.
     #   [26.09.14] 6 → 9: 버전 일치(plugin.json ↔ SKILL.md) ·
     #   `${CLAUDE_PLUGIN_ROOT}` 존재 · 실행 예시 회귀.
-    total = len(_PATH_CASES) + len(_EXIT_CASES) + 9
+    #   [26.09.14] 9 → 5: 문자열 검사 넷을 동작 검사로 옮겼다(`behavior_total`).
+    total = len(_PATH_CASES) + len(_EXIT_CASES) + 5 + behavior_total
     if fails:
         print("회귀 %d건 / 검사 %d건" % (len(fails), total))
         for f in fails:

@@ -595,10 +595,12 @@ def main(argv=None) -> int:
     #     무관하게 증폭된다.
     #   ⚠ 담기는 것이 `changes.diff`(저장소 코드 전문)라 **용량보다 내용이
     #     문제**다. 비공개 저장소의 diff 가 평문으로 남는다.
-    # → 가드: `tests/test_gemini_review_guards.py::
-    #   test_the_temp_dir_is_registered_for_cleanup` (배선) ·
-    #   `test_a_real_run_leaves_no_temp_dir_behind` (프로세스를 실제로 돌려
-    #   종료 후 남는지 본다 — `atexit` 는 프로세스가 끝나야 돌기 때문이다).
+    # → 가드: `tests/test_gemini_review.py::_check_tmpdir_removed_after_real_run`
+    #   — 자식 프로세스로 `main()` 을 끝까지 돌리고, 종료 후 **그 diff 가 있던
+    #   디렉터리**가 사라졌는지 본다(`atexit` 는 프로세스가 끝나야 돈다).
+    #   ⚠ [26.09.14] 종전 주석은 이 저장소에 없는 `test_gemini_review_guards.py`
+    #     를 가리켰고, 저장소 안의 가드는 `"atexit.register" in src` 문자열
+    #     검사 하나뿐이었다.
     tmpdir = tempfile.mkdtemp(prefix="gemini_review_")
     atexit.register(shutil.rmtree, tmpdir, True)
     diff_path = os.path.join(tmpdir, "changes.diff")
@@ -925,14 +927,45 @@ def _probe_says_ok(text: str) -> bool:
       `[agy] print timeout after 2m0s with turn in progress; returning partial
       output` 이다. 그것을 생존으로 세면 계층 장애일 때 재시도로 넘어가고,
       이 확인이 막으려던 낭비가 그대로 재발한다(그날 400~550초 × 4회).
+    ⚠ [26.09.14 실측 · 리눅스] 그 안내문은 **stderr** 로 나가고 exit 0 이었다.
+      이 함수는 stdout 만 받으므로 그때는 위의 빈 출력 갈래에서 걸린다. 안내문
+      검사는 부분 출력과 안내문이 stdout 에 섞이는 환경을 위해 남긴다.
     """
     body = (text or "").strip()
     if not body:
         return False
-    lowered = body.lower()
-    if "print timeout" in lowered or "turn in progress" in lowered:
+    if _is_print_timeout(body):
         return False
     return any(w.strip(".,!?:;\"'`*").upper() == "OK" for w in body.split())
+
+
+def _is_print_timeout(text: str) -> bool:
+    """agy 의 **출력 시간 초과 안내문**인가.
+
+    실측 문구: `[agy] print timeout after 1s with turn in progress; returning
+    partial output`.
+    ⚠ [26.09.14 실측] 이때 agy 의 **종료 코드는 0** 이고, 안내문은 **stderr**
+      로 나간다(stdout 에는 그때까지의 부분 출력만 남는다). 종료 코드만 보는
+      판정은 이 경우를 성공으로 읽는다.
+    """
+    lowered = (text or "").lower()
+    return "print timeout" in lowered or "turn in progress" in lowered
+
+
+# agy 안내문은 `[agy] ` 로 시작하는 **한 줄**이다(실측 문구는 위 docstring).
+_AGY_TIMEOUT_LINE = re.compile(r"^\s*\[agy\]\s+print timeout\b", re.I | re.M)
+
+
+def _has_agy_timeout_line(text: str) -> bool:
+    """본문(stdout) 안에 agy 의 시간 초과 **안내 줄**이 섞였는가.
+
+    ⚠ [26.09.14 Gemini 교차리뷰 지적 — 절반만 반영] stderr 가 stdout 에 섞이는
+      환경이면 안내문이 본문으로 들어온다. 그런데 본문에 `_is_print_timeout` 을
+      그대로 쓰면 **이 저장소 코드를 리뷰한 정상 결과**가 "print timeout" 이라는
+      말을 인용하는 순간 리뷰를 버린다(오탐 → exit 4). 그래서 본문에서는
+      `[agy] print timeout` 으로 **시작하는 줄**만 안내문으로 본다.
+    """
+    return bool(_AGY_TIMEOUT_LINE.search(text or ""))
 
 
 def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
@@ -942,6 +975,10 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
     `--json-schema` 강제가 빈 응답을 유발하는 경우가 실제로 있다(진단 확인).
     구조화 파싱은 포기하되 지적 자체는 받아야 하므로, 텍스트 형식을 명시적으로
     지시해 사람이 읽을 수 있게 받는다.
+
+    반환: 리뷰 원문. **리뷰를 받지 못했으면 빈 문자열**이다 — 호출부가 그것을
+    보고 exit 4(리뷰 안 됨)로 끝낸다. agy 가 무언가 출력했다는 것만으로는
+    리뷰를 받은 것이 아니다(아래 두 갈래).
     """
     prompt = _build_prompt(diff_path, files, project_ctx).replace(
         "지정된 JSON 스키마로만 출력하라.",
@@ -972,10 +1009,36 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
         return ""
     except (OSError, subprocess.SubprocessError):
         return ""
+    elapsed = time.time() - started
     text = proc.stdout.decode("utf-8", "replace").strip()
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    # ⚠ [26.08.27 교차리뷰 지적] 종료 코드를 보지 않으면, agy 가 타임아웃·인증
+    #   오류로 죽으며 남긴 **에러 문구를 리뷰 원문으로 저장**한다. 그러면 exit 6
+    #   (구조화 실패)이 되어 "리뷰는 받았다" 로 읽힌다. 실패는 실패로 돌린다.
+    # ⛔ [26.09.14] **이 검사는 v1.3.0 병합에서 한 번 사라졌다.** 테스트가 파일
+    #   전체에서 `proc.returncode != 0` 문자열을 찾았는데 `_invoke_schema` 에 같은
+    #   문자열이 있어 두 판 동안 초록이었다. 실측: exit 1 + stdout `Error:
+    #   authentication required…` 가 그대로 exit 6 의 리뷰 원문이 됐다.
+    #   → 가드: `tests/test_gemini_review.py::_check_retry_as_text_rejects_failed_agy`
+    #     (문자열이 아니라 이 함수를 가짜 agy 로 직접 돌린다).
+    if proc.returncode != 0:
+        _safe_print("   텍스트 재시도: %s · %.0f초 · agy 종료코드 %d — 리뷰로 쓰지 않는다"
+                    % (model, elapsed, proc.returncode))
+        if err or text:
+            _safe_print("     %s" % (err or text)[:800])
+        return ""
+    # ⛔ [26.09.14 실측] **출력 시간 초과는 exit 0 이다** (`_is_print_timeout`).
+    #   stdout 에는 그때까지의 부분 출력이 남으므로 종료 코드만 보면 **잘린
+    #   리뷰**가 온전한 리뷰로 저장된다 — 판정 줄까지만 오고 지적이 잘리면
+    #   사람이 읽어도 통과로 읽힌다. 부분이라도 건질지 고민했으나, 어디서
+    #   잘렸는지 알 수 없는 원문은 '지적 없음' 과 구분되지 않아 버린다.
+    if _is_print_timeout(err) or _has_agy_timeout_line(text):
+        _safe_print("   텍스트 재시도: %s · %.0f초 · agy 출력 시간 초과 "
+                    "(부분 출력 %d자) — 잘린 리뷰라 쓰지 않는다"
+                    % (model, elapsed, len(text)))
+        return ""
     _safe_print("   텍스트 재시도: %s · %.0f초 · %s"
-                % (model, time.time() - started,
-                   "응답 있음" if text else "빈 응답"))
+                % (model, elapsed, "응답 있음" if text else "빈 응답"))
     return text
 
 

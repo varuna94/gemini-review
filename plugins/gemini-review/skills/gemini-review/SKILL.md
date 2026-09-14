@@ -172,9 +172,10 @@ diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다.
     **3,116개**(26.09.11 실측). 사람이 리뷰를 돌린 횟수와 무관하다: 회귀
     테스트가 진입점을 반복 호출하므로 스위트 1회당 수십 개씩 늘어난다.
     용량보다 **내용**이 문제다 — 비공개 저장소의 소스가 평문으로 남는다.
-    가드는 `tests/test_gemini_review_guards.py::
-    test_the_temp_dir_is_registered_for_cleanup` 이고, 등록 **여부**만이 아니라
-    등록된 경로가 **그 diff 를 담은 디렉터리인지**까지 본다.
+    가드는 `tests/test_gemini_review.py` 의
+    `_check_tmpdir_removed_after_real_run` 이다. 자식 프로세스로 리뷰를 끝까지
+    돌리고, 종료 후 **그 diff 를 담았던 디렉터리가 실제로 사라졌는지** 본다
+    (`atexit` 는 프로세스가 끝나야 돈다).
 
 ⚠ **이 가드는 diff 만 검사한다.** Gemini 는 저장소 전체를 읽을 수 있고
 프롬프트가 "다른 파일도 읽어 맥락을 확인하라"고 지시하므로, **gitignore 된

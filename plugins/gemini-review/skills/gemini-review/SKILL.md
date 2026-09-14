@@ -1,6 +1,6 @@
 ---
 name: gemini-review
-version: 1.3.1
+version: 1.3.2
 description: Gemini 3.x 로 변경분을 교차 리뷰한다 (Antigravity CLI). 커밋 직전 독립 리뷰어로 쓴다. 같은 모델이 짠 코드를 같은 모델이 리뷰할 때 생기는 맹점을 잡는다.
 triggers:
   - gemini review
@@ -28,45 +28,109 @@ Claude 가 작성한 변경분을 **Gemini 3.1 Pro** 에게 독립적으로 리�
 
 ## 실행
 
-⛔ **스크립트 경로는 `${CLAUDE_PLUGIN_ROOT}` 로 쓴다.** 플러그인으로 설치하면
-파일이 `~/.claude/skills/` 가 아니라 플러그인 캐시 안에 놓인다 — 홈 경로를
-그대로 적으면 **그 자리에 파일이 없어 리뷰가 아예 안 돌아간다.** 이 변수는
-Claude Code 가 스킬을 읽을 때 설치 위치로 치환한다.
-
-⛔ **인터프리터 이름은 환경에 맞춰 고른다.** 아래 예시는 `python` 으로 적었지만
-**우분투에는 `python` 이 없고 Windows 기본 설치에는 `python3` 가 없다.** 없는
-이름으로 부르면 `command not found` 로 죽는데, 그것이 *"리뷰를 돌렸는데 지적이
-없다"* 로 오독되는 것이 이 도구의 1번 실패 계열이다. 먼저 있는 것을 확인하고
-쓸 것 — 우분투·맥은 보통 `python3`, Windows 는 `python` 또는 `py` 다.
+리눅스 · 맥 · Git Bash — **아래 블록을 그대로 쓰고, 범위는 `--staged` 자리의 인자만 바꾼다.**
 
 ```bash
-python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --staged   # 커밋 직전
-python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py"            # 마지막 커밋
-python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base HEAD~3
-python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base main # 브랜치 전체 (PR 전)
-python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --model gemini-3.8-flash-high  # 빠르게
+# 스크립트와 파이썬 3 을 스스로 찾는다. 못 찾으면 리뷰를 돌리지 않고 exit 2 로 끝난다.
+GR="${CLAUDE_SKILL_DIR}/gemini_review.py"
+PY=""
+for c in python3 python py; do
+  if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+    PY="$c"; break
+  fi
+done
+[ -f "$GR" ] && [ -n "$PY" ] || { echo "!! gemini_review.py 또는 파이썬 3 을 찾지 못했다 — 리뷰가 수행되지 않았다"; exit 2; }
+"$PY" "$GR" --staged
 ```
+
+| 목적 | `--staged` 자리의 인자 |
+|---|---|
+| 커밋 직전 (스테이징된 변경) | `--staged` |
+| 마지막 커밋 | (없음) |
+| 최근 3개 커밋 | `--base HEAD~3` |
+| 브랜치 전체 (PR 전) | `--base main` |
+
+Windows PowerShell — 인자는 `& $PY $GR` 줄에서만 바꾸고, **마지막 줄 `exit $LASTEXITCODE` 는
+그대로 둔다:**
+
+```powershell
+$GR = "${CLAUDE_SKILL_DIR}\gemini_review.py"
+$PY = $null
+foreach ($c in 'py', 'python', 'python3') {
+  if (Get-Command $c -ErrorAction SilentlyContinue) {
+    & $c -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' 2>$null
+    if ($LASTEXITCODE -eq 0) { $PY = $c; break }
+  }
+}
+if (-not (Test-Path $GR) -or -not $PY) { Write-Output "!! gemini_review.py 또는 파이썬 3 을 찾지 못했다 — 리뷰가 수행되지 않았다"; exit 2 }
+& $PY $GR --staged
+exit $LASTEXITCODE   # ⚠ 없으면 exit 5(지적 있음)가 0 으로 삼켜진다
+```
+
+⛔ **경로는 `${CLAUDE_SKILL_DIR}` 다** [26.09.14]. Claude Code 가 스킬을 읽을 때 이
+스킬 폴더로 치환하며, 플러그인 · 개인(`~/.claude/skills`) · 프로젝트 스킬 모두에서
+같다. 홈 경로를 적으면 플러그인 설치본에서는 그 자리에 파일이 없어 리뷰가 안 돈다.
+
+⛔ **인터프리터를 손으로 고르지 말 것.** 우분투에는 `python` 이 없고 Windows 기본
+설치에는 `python3` 가 없거나 Microsoft Store 안내 스텁이다. 없는 이름으로 부르면
+`command not found` 로 죽는데, 그것이 *"리뷰를 돌렸는데 지적이 없다"* 로 오독되는
+것이 이 도구의 1번 실패 계열이다. 위 블록은 후보마다 **실제로 실행해** 파이썬 3
+인지 확인한다(스텁은 실행하면 실패한다).
+
+⚠ **아래 배너가 보이지 않으면 리뷰는 수행되지 않은 것이다.** 종료 코드만 보고
+판단하지 말 것 — 이 스킬의 조용한 실패는 전부 여기서 걸러진다.
+
+```
+범위: staged / 변경 파일 N개 / diff N자
+```
+
+⏱ **Bash 도구의 백그라운드 실행으로 돌리고 완료 알림을 기다린다** [26.09.14].
+리뷰는 보통 1~6분 걸린다. 앞에서 돌리면 도구 상한(기본 120초)을 넘겨 백그라운드로
+옮겨지는데, 그것을 실패로 오해하고 다시 돌리거나 멈추지 말 것. 멈추면(중단 신호)
+스크립트는 임시 파일을 정리하고 exit 130 · 143 으로 끝난다 — 리뷰는 안 된 것이다.
+
+⚠ **여러 명령을 한 블록에 이어 붙이지 말고, 파이프(`| tail` 등)로 잇지도 말 것.**
+`set -e` 가 없으므로 앞 명령이 exit 5 로 죽어도 뒤 명령이 계속 돌고, 파이프는
+마지막 명령의 종료 코드만 남긴다 — **지적이 조용히 사라진다.** 한 번에 하나만 돌린다.
 
 **`--base` 는 merge-base 기준(3-dot)이다** [26.08.13]. `--base main` 은 내가
 브랜치를 딴 지점 이후의 **내 변경만** 본다 — 그 사이 main 에 들어온 남의
 커밋은 섞이지 않는다. 2-dot 이 필요하면 `--two-dot` 이지만, 브랜치 리뷰에서
 쓰면 동료 커밋이 **삭제로 뒤집혀** diff 에 들어가 유령 지적을 만든다.
 
-⚠ **플러그인이 아니라 손으로 배치해 쓰는 경우**(`~/.claude/skills/` 아래에
-직접 둔 경우)에는 `${CLAUDE_PLUGIN_ROOT}` 가 치환되지 않는다. 그때는 실제
-경로를 쓴다 — Windows PowerShell 이면
-`$env:USERPROFILE\.claude\skills\gemini-review\gemini_review.py`.
-⛔ 다만 **두 방식을 동시에 두지 말 것.** 같은 이름의 스킬이 둘이 되어 어느
+⛔ 플러그인 설치와 손으로 배치(`~/.claude/skills/`)를 **동시에 두지 말 것.** 같은 이름의 스킬이 둘이 되어 어느
 쪽이 이기는지 정해지지 않고, 한쪽만 갱신되면 낡은 코드가 조용히 돈다 —
 이 저장소가 실제로 3주 동안 그렇게 갈라져 있었다(v1.3.0 병합 근거).
 
 표준 라이브러리만 쓰므로 **어떤 Python 3.7+ 로도** 실행된다.
 
+## 모델 — `gemini-3.1-pro-high` 고정
+
+**flash 계열로 바꾸지 말 것** (사용자 지시, 2026-08-20 · 08-21 재확인). 정답을
+아는 diff 로 잰 실측에서 `gemini-3.7-flash-high` 는 **7회 중 5회가 빈 응답**이고
+나머지는 검출 0 이었다. 품질 이전에 게이트로 쓸 수가 없다. 통과를 쉽게 내주는
+리뷰어는 "리뷰를 받았다" 는 기분만 남기고 실제 방어를 없앤다 — 리뷰가 없는 것보다
+나쁘다. pro 등급의 새 버전이 나오면 같은 방식으로 재서 교체한다.
+
+`claude-*` 계열도 쓰지 않는다 — 리뷰를 요청하는 쪽이 Claude 라 교차 리뷰의
+전제가 무너진다.
+
+⚠ pro-high 가 빈 응답으로 실패하면 **모델을 낮추지 말고 재시도**한다. 느리다고
+낮추지도 않는다.
+
+⛔ **[1.3.2 현재] 자동 폴백은 아직 판정을 낼 수 있다.** 주 모델이 빈 응답을 내면
+스크립트가 폴백 모델(`gemini-3.6-flash-high`)로 구조화 재시도를 하고, 성공하면
+그 판정을 그대로 쓴다(1.4.0 에서 "판정은 주 모델만" 으로 바뀐다). 그래서 **통과를
+믿기 전에 화면을 볼 것:**
+- `응답: gemini-3.1-pro-high · N초` 뒤에 곧바로 판정이 나오면 주 모델의 판정이다.
+- `폴백 성공: gemini-3.6-flash-high` 줄이 있으면 **flash 의 판정**이다 → 통과로
+  치지 말고, 시간을 두고 주 모델로 다시 돌린다(`--no-fallback`).
+
 ## 전제
 
-- `agy`(Antigravity CLI)가 설치·인증돼 있어야 한다.
-  설치: `irm https://antigravity.google/cli/install.ps1 | iex`
-  인증: `agy` 를 한 번 실행해 Google 계정(AI Pro/Ultra 구독)으로 로그인.
+- `agy`(Antigravity CLI)가 설치·인증돼 있어야 한다. **Google AI Pro/Ultra 구독이 필요하다.**
+  설치: https://antigravity.google/cli (Windows: `irm https://antigravity.google/cli/install.ps1 | iex`)
+  인증: `agy` 를 한 번 실행해 Google 계정으로 로그인.
 - **Gemini API 키가 아니라 구독으로 인증된다.** 저장소에서 Gemini API 를 별도로
   쓰고 있다면 그 quota 를 잠식하지 않는다.
 
@@ -92,14 +156,30 @@ python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --model gem
 각 지적에는 `failure_scenario`(구체적 입력 → 잘못된 결과)가 붙는다 — 이것이
 없는 지적은 프롬프트가 걸러내게 돼 있다.
 
-**종료 코드**
+**종료 코드** [26.08.25 에 5·6 신설 · 26.09.14 에 130·143 명시]:
 
-    0  통과 (approve · approve_with_comments)
-    5  request_changes — 고치고 다시 돌릴 것          [26.08.25 신설]
-    6  구조화 실패(텍스트 폴백) — 사람이 원문을 읽어야 한다  [26.08.25 신설]
-    1 파싱 실패 / 2 실행 실패 / 3 민감 경로 감지 / 4 빈 응답
+| 코드 | 뜻 |
+|---|---|
+| 0 | 통과 — `approve` 또는 `approve_with_comments` |
+| 1 | JSON 파싱 실패 (리뷰 JSON 이 없거나 둘 이상이라 판단하지 않음) |
+| 2 | 실행 실패 — git · agy 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` 에 못 씀 |
+| 3 | 민감 경로 감지 — 전송 중단 |
+| 4 | 빈 응답 — **리뷰가 안 된 것이다** |
+| 5 | `request_changes` — 지적이 있다 |
+| 6 | 구조화 실패, 텍스트 모드로 받음 — 사람이 원문을 읽어야 한다 |
+| 130 · 143 | 중단(Ctrl+C · 종료 신호) — 리뷰가 안 된 것이다 |
+
+⛔ **이 표에 없는 코드는 통과가 아니다.**
 
 ⚠ **exit 4(빈 응답)를 '지적 없음'으로 읽지 말 것.** 리뷰가 안 된 것이다.
+재시도는 **2회까지**, 사이에 몇 분을 둔다. 그래도 실패하면 "리뷰가 수행되지
+않았다" 고 그대로 보고하고, 가능하면 **다른 계열**(codex 등)의 리뷰로 대체한다.
+
+⚠ **exit 0 도 무조건 통과는 아니다.** 스테이징이 비어 "변경분이 없다" 로 끝나도
+0 이다. 판정을 믿기 전에 배너의 `범위:` · `변경 파일 N개` 를 먼저 볼 것.
+
+⚠ **모르는 판정값은 통과로 치지 않는다**(fail-closed). 모델이 스키마 밖 문자열을
+내면 5 로 끝난다 — '판정 불가' 를 '정상' 으로 읽는 계열을 막는다.
 
 ⏱ **[26.09.10] 빈 응답의 원인은 두 갈래다.** 호출 소요가 화면에 찍히고
 (`응답: <모델> · N초`), 빈 응답이면 **한 줄 프롬프트로 계층 생존을 먼저
@@ -130,8 +210,9 @@ diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다.
 스키마도 원인이 아니었다** — 시점에 따라 갈리는 무언가다.
 → **exit 4 를 받아도 곧바로 포기하지 말고 한 번 더 돌려 볼 것.** 다만 연속
 실패가 이어지면 계층 장애와 구분이 안 되므로, 시간을 두고 재시도하거나
-**다른 리뷰 수단으로 대체**한다(읽기 전용 서브에이전트 다렌즈 리뷰가 같은 날
-실제로 그 자리를 메웠다).
+**다른 리뷰 수단으로 대체**한다. 가능하면 **다른 계열**(codex 등)을 쓴다 — 같은
+날 읽기 전용 서브에이전트 리뷰가 그 자리를 메웠지만, 그것은 Claude 라 교차 리뷰의
+전제를 잃는다.
 ⛔ **그 사이에 "지적 없음" 으로 넘어가지 말 것.** exit 4 는 리뷰가 안 된 것이다.
 
 ⚠ 배너의 **`diff N자` 는 프롬프트 길이가 아니다** (diff 는 파일 경로로 넘어간다).
@@ -143,8 +224,10 @@ diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다.
 장치가 걸려 있고, 그쪽 상한은 **짧게 고정**이다 — 계층이 죽었는지 보는
 확인에 몇 분을 태우면 그 확인이 존재하는 이유가 사라진다.
 
-📄 **`--out` 은 시작 시점에 무효화된다.** 어떤 경로로 끝나든 **직전 실행의
-낡은 JSON 이 남지 않는다**(리뷰 중에는 `mode: in_progress`).
+📄 **`--out` 은 시작 시점(인자 해석 전)에 무효화된다.** 어떤 경로로 끝나든 **직전
+실행의 낡은 JSON 이 남지 않는다**(리뷰 중에는 `mode: in_progress`, 중단되면
+`mode: interrupted`, 도움말 · 인자 오류로 끝나면 `mode: not_run`). `--out` 에 쓸 수 없으면 리뷰를 시작하지 않고 exit 2, 최종
+기록에 실패해도 exit 2 다. 기록은 원자적이라 잘린 JSON 이 남지 않는다 [26.09.14].
 ⛔ 자동화가 이 파일을 읽는다면 그 계약에 기대도 된다 — 종전에는 파싱 실패·
 실행 실패·민감 경로·**변경분 없음**이 파일을 손대지 않아, `--staged` 인데
 스테이징을 빠뜨리면 종료코드도 0 이고 파일도 어제의 `approve` 라 **양쪽에서
@@ -155,7 +238,15 @@ diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다.
 - **`--mode plan` 고정** — read-only. Gemini 가 저장소 파일을 수정할 수 없다.
   이 플래그는 절대 풀지 않는다.
 - 민감 경로(`.env`·`secrets/`·`credentials/`·`*.pem`/`*.key`·`id_rsa`·`.npmrc`
-  등)가 diff 에 있으면 **전송을 중단**한다. 의도한 것이면 `--allow-sensitive`.
+  등)가 diff 에 있으면 **전송을 중단**한다(exit 3).
+  ⛔ **`--allow-sensitive` 는 사용자에게 목록을 보여 주고 명시적 승인을 받은 뒤에만
+  쓴다. Claude 가 스스로 붙여 다시 돌리지 말 것** — 가드를 에이전트가 끄는 경로다.
+- **이름 변경으로 가드를 비껴가지 못한다** [26.09.14 실측]. git 기본값은 이름 변경을
+  감지해 `.env` → `env.txt` 이동을 새 이름 하나로만 보여 줬고, 한 줄을 고친 비밀 값이
+  판정을 통과했다. diff 는 사용자 git 설정과 무관하게 `diff.renames=false` 등으로
+  고정해 옛 경로도 목록에 나온다.
+- **agy 는 절대 경로로만 실행한다.** 현재 폴더 · 상대 경로 · 리뷰 대상 저장소 안의
+  PATH 항목에 있는 agy 는 고르지 않는다(저장소가 심은 파일 실행 방지).
 - 판정은 **경로 세그먼트·확장자·단어경계** 단위다 [26.08.13]. 종전 부분문자열
   매칭은 `design-tokens.ts`·`TokenService.php` 같은 평범한 파일을 상시 차단했고,
   그 오탐이 `--allow-sensitive` 를 습관으로 만들어 **가드를 영구히 끄는**
@@ -198,26 +289,29 @@ diff 는 32,226 → 43,774자로 오히려 커졌는데 4회차가 성공했다.
 - **`--effort` 를 따로 주지 마라.** agy 는 effort 가 모델명에 내장돼 있다
   (`-high`/`-low`/`-medium`). 모델 접미사와 다른 값을 주면 즉시 `status=ERROR`
   로 죽는다(실측: 0초, tokens 0).
-- 리뷰 1회에 **1~2분** 걸린다. 급하면 `--model gemini-3.8-flash-high`.
-  ⚠ 폴백 기본값(`gemini-3.6-flash-high`)과 **같은 값을 주지 말 것** — 그러면
-  폴백 재시도가 건너뛰어진다(스크립트가 자동으로 갈아타되 화면에 남긴다).
-- 결과 JSON 은 기본적으로 임시 디렉토리에 저장된다. 저장소 안에 남기려면
-  `--out` 을 쓰되 **그 경로를 gitignore 하라** (리뷰 대상 코드가 담긴다).
+- 리뷰 1회에 **1~6분** 걸린다. 느리다고 모델을 낮추지 않는다(위 「모델」 절).
+- 결과 JSON 은 기본적으로 **사용자 전용 폴더**에 0600 으로 저장된다 —
+  `$XDG_STATE_HOME/gemini-review/`(보통 `~/.local/state/gemini-review/`),
+  Windows 는 `%LOCALAPPDATA%\gemini-review\` [26.09.14, 종전엔 공유 `/tmp`].
+  저장소 안에 남기려면 `--out` 을 쓰되 **그 경로를 gitignore 하라** (리뷰 대상 코드가 담긴다).
 
 ## 스킬 실행 절차 (Skill Execution Steps)
 
 사용자가 `gemini review`, `교차 리뷰` 등을 요청하여 이 스킬이 트리거되면 다음 절차를 따르시오:
 
 1. **상태 확인 (Check State):** `git status` 및 `git diff` 를 통해 현재 스테이징된 변경사항인지, 작업 트리 변경사항인지 파악합니다.
-2. **스크립트 실행 (Execute Script):**
-   - 스테이징된 변경분 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --staged`
-   - 마지막 커밋 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py"`
+2. **스크립트 실행 (Execute Script):** Bash 도구의 **백그라운드 실행**으로 한 번에 하나만, 파이프 없이 돌리고 완료 알림을 기다린다.
+   「실행」 절의 블록을 그대로 쓰고 `--staged` 자리의 인자만 바꾼다(PowerShell 의 마지막 줄
+   `exit $LASTEXITCODE` 는 건드리지 않는다).
+   - 스테이징된 변경분 리뷰: 인자 `--staged`
+   - 마지막 커밋 리뷰: 인자 없음
      ⚠ 인자 없는 실행은 **`--base HEAD~1`**, 즉 직전 커밋이다. **커밋되지 않은
      작업 트리 변경은 어떤 인자로도 리뷰되지 않는다** — 스테이징한 뒤
      `--staged` 를 쓸 것. 종전 이 줄은 이것을 "작업 트리 리뷰" 라고 적어,
      오늘 변경이 한 줄도 안 실린 채 어제 커밋에 `approve` 가 나오고 커밋 전
      필수 요건이 충족된 것으로 기록될 수 있었다 [26.09.10 정정].
-   - 특정 브랜치(예: main) 대상 리뷰: `python "${CLAUDE_PLUGIN_ROOT}/skills/gemini-review/gemini_review.py" --base main`
-3. **결과 출력 (Present Results):** 스크립트 실행 후 출력되는 JSON 혹은 텍스트 형태의 지적 사항(findings)을 가공하거나 생략하지 말고 **원문 그대로(verbatim)** 사용자에게 전달하십시오. 
-4. **후속 조치 (Follow up):** 지적 사항 중 `[CRITICAL]` 이나 `[HIGH]` 심각도의 문제가 있다면, 사용자에게 해당 부분을 즉시 수정할지(Fix) 물어보고 조치하십시오.
+   - 특정 브랜치(예: main) 대상 리뷰: 인자 `--base main`
+3. **결과 확인 (Check Result):** 블록이 exit 2 와 `!! … 찾지 못했다` 를 냈으면 리뷰가 안 된 것이다. 배너가 있는지, 종료 코드가 위 표의 어느 것인지, 판정 모델이 주 모델인지(「모델」 절의 화면 확인)를 먼저 본다. exit 4 · 130 · 143 · 표에 없는 코드는 **리뷰가 안 된 것**으로 보고한다. exit 3 이면 차단 목록을 사용자에게 보여 주고, 사용자가 명시적으로 승인할 때만 `--allow-sensitive` 로 다시 돌린다.
+4. **결과 출력 (Present Results):** 지적 사항(findings)을 가공하거나 생략하지 말고 **원문 그대로(verbatim)** 사용자에게 전달하십시오. 다만 반영하기 전에는 「지적을 다루는 원칙」대로 사실인지 실측으로 확인합니다.
+5. **후속 조치 (Follow up):** 지적 사항 중 `[CRITICAL]` 이나 `[HIGH]` 심각도의 문제가 있다면, 사용자에게 해당 부분을 즉시 수정할지(Fix) 물어보고 조치하십시오.
 

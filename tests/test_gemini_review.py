@@ -198,6 +198,11 @@ def _patched(obj, name, value):
         setattr(obj, name, old)
 
 
+# 테스트가 `shutil.rmtree` 를 가짜로 바꾸는 동안에도 샌드박스 정리는 **진짜**로 한다
+#   (가짜가 `_rmtree_sandbox` 를 부르면 재귀가 된다).
+_REAL_RMTREE = shutil.rmtree
+
+
 def _rmtree_sandbox(path, sandbox):
     """`sandbox` **안**의 경로만 지운다. 밖이면 지우지 않고 예외를 낸다.
 
@@ -216,7 +221,53 @@ def _rmtree_sandbox(path, sandbox):
         raise RuntimeError("샌드박스가 아닌 폴더 삭제 거부: %s" % sandbox)
     if real != root and not real.startswith(root + os.sep):
         raise RuntimeError("샌드박스 밖 삭제 거부: %s (샌드박스 %s)" % (path, sandbox))
-    shutil.rmtree(real, True)
+    _REAL_RMTREE(real, True)
+
+
+def _nested_tmp(sandbox, depth=3):
+    """샌드박스 안 `depth` 겹 아래에 임시 폴더를 만들고 각 층에 카나리를 둔다.
+
+    반환 `(임시 폴더, 사라진 카나리 목록을 돌려주는 함수)`.
+    ⛔ [26.09.14 사고 2] 중단 갈래의 정리 경로를 **부모의 부모**로 바꾼 변이 아래에서, 이 검사가
+      `$TMPDIR` 의 부모를 지웠다(격리 실행이라 작업 폴더에서 멈췄다). 평소 실행이면
+      `/tmp/gemini_review_x` 의 조부모, 즉 `/` 였다. 자식 프로세스로 도는 진짜 코드의 삭제는
+      테스트가 가로챌 수 없다 — 그래서 **깊이로 가두고 카나리로 드러낸다.** 부모 방향으로
+      `depth` 층까지는 샌드박스 안에서 멈춘다.
+    """
+    levels = [sandbox]
+    for i in range(depth):
+        levels.append(os.path.join(levels[-1], "t%d" % i))
+    os.makedirs(levels[-1], exist_ok=True)
+    canaries = [os.path.join(d, "CANARY") for d in levels[:-1]]
+    for c in canaries:
+        open(c, "w").close()
+    return levels[-1], lambda: [c for c in canaries if not os.path.exists(c)]
+
+
+@contextlib.contextmanager
+def _contained(gr, sandbox):
+    """같은 프로세스에서 도는 `main()` 의 임시 폴더 · 삭제를 샌드박스 안에 가둔다.
+
+    `tempfile.mkdtemp` 는 `_nested_tmp` 폴더로, `shutil.rmtree` 는 `_rmtree_sandbox` 로
+    돌린다(밖이면 예외). 끝나고 카나리가 사라졌으면 예외를 낸다 — 검사가 빨개진다.
+    ⚠ 두 모듈 속성을 바꾸므로 **이 블록 안의 테스트 코드도** 같은 가둠을 받는다.
+    """
+    tmp, missing = _nested_tmp(sandbox)
+    real_mkdtemp = tempfile.mkdtemp
+
+    def mkdtemp_here(suffix=None, prefix=None, dir=None):
+        return real_mkdtemp(suffix=suffix, prefix=prefix, dir=tmp if dir is None else dir)
+
+    def rmtree_here(path, *a, **k):
+        return _rmtree_sandbox(path, sandbox)
+
+    with _patched(gr.tempfile, "mkdtemp", mkdtemp_here), \
+            _patched(gr.shutil, "rmtree", rmtree_here):
+        yield tmp
+    gone = missing()
+    if gone:
+        raise RuntimeError("검사 대상 코드가 임시 폴더의 상위를 지웠다(카나리 사라짐: %s)"
+                           % ", ".join(gone))
 
 
 @contextlib.contextmanager
@@ -431,13 +482,15 @@ def _check_tmpdir_removed_after_real_run(gr):
       프로세스 안에서는 "지워진다" 를 확인할 수 없다. 등록 여부만 보면 엉뚱한
       경로를 등록해도 통과한다 — 여기서는 **그 diff 가 있던 디렉터리**가 실제로
       사라졌는지 본다.
-    ⚠ 자식의 임시 디렉터리를 샌드박스로 돌린다(`TMPDIR`·`TEMP`·`TMP`). 정리가
-      깨져 있어도 이 검사 자체가 `/tmp` 에 흔적을 남기지 않는다.
+    ⚠ 자식의 임시 디렉터리를 샌드박스 **세 겹 아래**로 돌린다(`TMPDIR`·`TEMP`·`TMP`).
+      정리가 깨져 있어도 이 검사 자체가 `/tmp` 에 흔적을 남기지 않고, 정리가 폴더
+      **위**를 지우면 카나리로 드러난다(`_nested_tmp`).
     """
     del gr  # 자식이 스크립트를 따로 불러온다
     sandbox = tempfile.mkdtemp(prefix="gr_test_tmp_")
     try:
-        env = dict(os.environ, TMPDIR=sandbox, TEMP=sandbox, TMP=sandbox)
+        tmp, escaped = _nested_tmp(sandbox)
+        env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp)
         env.pop("PYTHONIOENCODING", None)
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD_RUN, os.path.abspath(_TARGET),
@@ -452,10 +505,13 @@ def _check_tmpdir_removed_after_real_run(gr):
                    "디렉터리 %d개 · 기대 exit 0 · 1개): %s"
                    % (proc.returncode, len(dirs), tail))
             return
-        left = os.path.join(sandbox, dirs[0])
+        left = os.path.join(tmp, dirs[0])
         yield (None if not os.path.exists(left) else
                "프로세스가 끝났는데 diff 를 담은 임시 디렉터리 %s 가 남았다 — "
                "저장소 코드가 평문으로 쌓인다" % dirs[0])
+        gone = escaped()
+        yield (None if not gone else
+               "정리가 diff 임시 디렉터리의 상위를 지웠다(카나리 사라짐: %s)" % ", ".join(gone))
     finally:
         _rmtree_sandbox(sandbox, sandbox)
 
@@ -487,7 +543,7 @@ def _main_inprocess(gr, argv, sandbox, payload=None):
         return json.dumps(body), 0.0, None
 
     env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
-    with _quiet(), \
+    with _contained(gr, sandbox), _quiet(), \
             _patched(os, "environ", env), \
             _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
             _patched(gr, "_git_root", lambda start: sandbox), \
@@ -741,7 +797,8 @@ def _check_signal_cleans_up(gr):
     for signame, want_rc in (("SIGTERM", 143), ("SIGINT", 130)):
         sandbox = tempfile.mkdtemp(prefix="gr_test_sig_")
         try:
-            env = dict(os.environ, TMPDIR=sandbox, TEMP=sandbox, TMP=sandbox,
+            tmp, escaped = _nested_tmp(sandbox)
+            env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp,
                        XDG_STATE_HOME=os.path.join(sandbox, "state"))
             env.pop("PYTHONIOENCODING", None)
             out = os.path.join(sandbox, "out.json")
@@ -777,8 +834,11 @@ def _check_signal_cleans_up(gr):
                 problems.append("준비 신호를 못 받음(diff 폴더 %r · agy pid %r)" % (diff_dir, agy_pid))
             if proc.returncode != want_rc:
                 problems.append("종료 코드 %s (기대 %d)" % (proc.returncode, want_rc))
-            if diff_dir and os.path.exists(os.path.join(sandbox, diff_dir)):
+            if diff_dir and os.path.exists(os.path.join(tmp, diff_dir)):
                 problems.append("diff 임시 폴더가 남음")
+            gone = escaped()
+            if gone:
+                problems.append("정리가 임시 폴더의 상위를 지움(카나리 사라짐: %s)" % ", ".join(gone))
             try:
                 mode = _read_json(out).get("mode")
             except (OSError, ValueError) as exc:
@@ -830,7 +890,7 @@ def _check_signal_handlers_restored(gr):
 
         out = os.path.join(sandbox, "o2.json")
         env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
-        with _quiet(), _patched(os, "environ", env), \
+        with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                 _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
                 _patched(gr, "_git_root", lambda start: sandbox), \
                 _patched(gr, "_collect_diff",
@@ -864,9 +924,11 @@ def _check_sigterm_during_sigint_cleanup(gr):
         yield _Skip("Windows 신호 흉내 생략")
         return
     sandbox = tempfile.mkdtemp(prefix="gr_test_sigmix_")
-    real_rmtree = shutil.rmtree
-
+    real_mkdtemp = tempfile.mkdtemp
     sent = []
+
+    def mkdtemp_in_sandbox(suffix=None, prefix=None, dir=None):
+        return real_mkdtemp(suffix=suffix, prefix=prefix, dir=sandbox)
 
     def rmtree_with_sigterm(path, *a, **k):
         # ⚠ **한 번만** 보낸다. main() 이 이 가짜 함수를 atexit 에 등록하므로, 여러 번
@@ -877,7 +939,10 @@ def _check_sigterm_during_sigint_cleanup(gr):
             deadline = time.time() + 2
             while time.time() < deadline:
                 time.sleep(0.01)
-        return real_rmtree(path, *a, **k)
+        # ⛔ [26.09.14 Gemini 교차리뷰 HIGH] 코드가 넘긴 경로를 그대로 지우지 않는다 —
+        #   검사 대상이 틀리면 그 경로는 어디든 될 수 있다(오늘 /tmp 를 지운 사고 계열).
+        #   임시 폴더를 샌드박스 안에 만들게 했으니, 밖이면 지우지 않고 예외를 낸다.
+        return _rmtree_sandbox(path, sandbox)
 
     def ctrl_c(*a, **k):
         raise KeyboardInterrupt
@@ -893,6 +958,7 @@ def _check_sigterm_during_sigint_cleanup(gr):
                     _patched(gr, "_collect_diff",
                              lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])), \
                     _patched(gr, "_invoke_schema", ctrl_c), \
+                    _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox), \
                     _patched(gr.shutil, "rmtree", rmtree_with_sigterm):
                 rc = gr.main(["--out", out])
         except BaseException as exc:
@@ -1055,7 +1121,7 @@ def _check_agy_error_is_not_empty_response(gr):
             calls = []
             out = os.path.join(sandbox, "o.json")
             env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
-            with _quiet(), _patched(os, "environ", env), \
+            with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                     _patched(gr, "subprocess", _fake_subprocess(calls, **proc)), \
                     _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
                     _patched(gr, "_git_root", lambda start: sandbox), \
@@ -1105,6 +1171,13 @@ def _check_extract_json_is_strict(gr):
                      "response": "```json\n%s\n```" % json.dumps(real)})
     got = gr._extract_json(w3)
     yield (None if got == real else "대조군: 코드 펜스 속 리뷰 JSON 하나를 못 뽑았다: %r" % (got,))
+
+    # [26.09.14 교차리뷰 "break 누락" 지적은 사실이 아니었다 — 첫 키 안의 모든 갈래가 return 이다]
+    #   그 동작을 고정한다: 첫 응답 키가 리뷰가 아니면 **다른 응답 키로 넘어가지 않는다.**
+    w4 = json.dumps({"status": "SUCCESS", "response": "리뷰가 아닌 문장",
+                     "result": json.dumps(planted)})
+    got = gr._extract_json(w4)
+    yield (None if got is None else "첫 응답 키가 리뷰가 아닌데 다음 키의 JSON 을 골랐다: %r" % (got,))
 
     schema_fragment = json.dumps({"type": "object", "properties": {"findings": {"type": "array"}}})
     got = gr._extract_json(schema_fragment)
@@ -1210,6 +1283,254 @@ def _check_subprocess_use_is_contained(gr):
            "허용 목록 밖에서 프로세스를 띄울 수 있다: %s" % ", ".join(sorted(set(bad))))
 
 
+_README = os.path.join(_ROOT, "README.md")
+_FLASH_MODEL_ARG = re.compile(r"--model[ =]+\S*flash", re.I)
+_EXIT_ROW = re.compile(r"^\|\s*`?(\d+)`?(?:\s*·\s*`?(\d+)`?)?\s*\|", re.M)
+
+
+def _read_text(path):
+    with io.open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _check_docs_pin_the_model(gr):
+    """문서 · 도움말이 **flash 모델을 권하지 않고**, SKILL.md 에 모델 고정 절이 있다.
+
+    ⛔ [26.09.14] v1.3.0 병합에서 SKILL.md 가 한쪽 판으로 덮여 "모델 고정" 절이 사라지고
+      `--model gemini-3.8-flash-high  # 빠르게` 가 실행 예시에 들어갔다. 사용자 지시는
+      "flash 계열로 바꾸지 말 것"(실측 7회 중 5회 빈 응답)이다.
+    ⚠ 문장의 낱말이 아니라 **`--model <flash 모델>` 이라는 인자 꼴**을 찾는다 — 실측
+      기록(예: "flash-high 로 바꿔도 동일")은 막지 않는다.
+    """
+    sources = {
+        "SKILL.md": _read_text(_SKILL_MD),
+        "README.md": _read_text(_README),
+        "docstring": gr.__doc__ or "",
+        "--help": gr._build_parser().format_help(),
+    }
+    hits = ["%s: %s" % (name, m.group(0)) for name, text in sources.items()
+            for m in _FLASH_MODEL_ARG.finditer(text)]
+    yield (None if not hits else "flash 모델을 --model 로 권한다: %s" % "; ".join(hits))
+
+    headings = [ln for ln in sources["SKILL.md"].splitlines()
+                if ln.startswith("## ") and gr._DEFAULT_MODEL in ln]
+    yield (None if headings else
+           "SKILL.md 에 기본 모델(%s)을 고정하는 절 제목이 없다" % gr._DEFAULT_MODEL)
+
+
+def _check_exit_code_tables_agree(gr):
+    """README · SKILL.md 표와 스크립트 docstring 이 **같은 종료 코드 집합**을 말한다.
+
+    ⚠ [26.09.14] 종료 코드 사본이 여러 곳(README · SKILL.md · docstring)이라 한쪽만 고치면
+      드리프트가 생긴다 — 이번 사고의 원인과 같은 계열. docstring 은 표가 아니라 문단이라
+      "종료 코드:" 문단의 숫자를 모은다 [26.09.14 교차리뷰 LOW: docstring 이 빠져 있었다].
+    """
+    def codes(path):
+        found = set()
+        for m in _EXIT_ROW.finditer(_read_text(path)):
+            found.update(int(g) for g in m.groups() if g)
+        return found
+
+    readme, skill = codes(_README), codes(_SKILL_MD)
+    doc = gr.__doc__ or ""
+    start = doc.find("종료 코드:")
+    para = doc[start:doc.find("\n\n", start)] if start >= 0 else ""
+    docstring = set(int(n) for n in re.findall(r"(?<![\d.])(\d{1,3})(?![\d.])", para))
+    yield (None if docstring == skill else
+           "스크립트 docstring 의 종료 코드(%s) 와 SKILL.md 표(%s) 가 다르다"
+           % (sorted(docstring), sorted(skill)))
+    required = {0, 1, 2, 3, 4, 5, 6, 130, 143,
+                gr.EXIT_REQUEST_CHANGES, gr.EXIT_UNSTRUCTURED}
+    yield (None if readme == skill else
+           "README(%s) 와 SKILL.md(%s) 의 종료 코드 표가 다르다"
+           % (sorted(readme), sorted(skill)))
+    missing = required - skill
+    yield (None if not missing else
+           "SKILL.md 종료 코드 표에 코드가 내는 값이 빠졌다: %s" % sorted(missing))
+
+
+def _check_sensitive_block_does_not_invite_bypass(gr):
+    """exit 3 문구가 에이전트에게 **스스로 우회하라고 지시하지 않는다.**
+
+    ⛔ [26.09.14 DX 교차리뷰] 종전 문구 "의도한 것이면 --allow-sensitive 로 다시
+      실행하라" 는 에이전트가 지시로 읽고 가드를 끌 수 있었다. `--allow-sensitive` 를
+      언급하는 줄은 사용자 **승인**을 조건으로 달아야 한다.
+    ⚠ 이 문구는 이 저장소가 소유하는 계약이다 — 표현을 바꾸면 이 검사도 함께 바꾼다
+      (빨개지는 쪽으로 틀린다, 조용히 통과하지 않는다).
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_sens_")
+    buf = io.StringIO()
+    try:
+        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        with _contained(gr, sandbox), contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()), \
+                _patched(os, "environ", env), \
+                _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                _patched(gr, "_git_root", lambda start: sandbox), \
+                _patched(gr, "_collect_diff",
+                         lambda *a, **k: ("diff --git a/.env b/.env\n+K=v\n", [".env"])), \
+                _patched(gr, "_invoke_schema",
+                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("전송 시도"))):
+            rc = gr.main(["--out", os.path.join(sandbox, "o.json")])
+        text = buf.getvalue()
+        lines = [ln for ln in text.splitlines() if "--allow-sensitive" in ln]
+        # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] 출력 **전체**에서 "승인" 을 찾으면 "승인되지 않은
+        #   접근입니다. --allow-sensitive 로 다시 실행하라" 같은 문구도 통과한다. 계약 문구
+        #   ("명시적으로 승인한 경우에만")가 `--allow-sensitive` 를 담은 **그 줄 안에** 있어야 한다.
+        ok = (rc == 3 and bool(lines)
+              and all("명시적으로 승인한 경우에만" in ln for ln in lines))
+        yield (None if ok else
+               "exit 3 안내가 승인 조건 없이 --allow-sensitive 재실행을 권한다(exit %s): %r"
+               % (rc, lines))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_early_exits_record_final_mode(gr):
+    """조기 종료 갈래도 `--out` 에 **최종 상태**를 남긴다(종료 코드는 그대로).
+
+    ⚠ [26.09.14 Gemini 교차리뷰 HIGH] 변경분 없음 · 민감 경로 · git 실패 · 파싱 실패가
+      시작 시점의 `in_progress`("중간에 죽었다") 를 그대로 남겼다.
+    """
+    cases = (
+        ("변경분 없음", ("", []), None, 0, "no_changes"),
+        ("민감 경로", ("diff --git a/.env b/.env\n+K=v\n", [".env"]), None, 3, "sensitive_blocked"),
+        ("git 실패", RuntimeError("git 실패(흉내)"), None, 2, "tool_error"),
+        ("파싱 실패", ("diff --git a/x.py b/x.py\n+x\n", ["x.py"]), "not json", 1, "parse_failed"),
+    )
+    for label, diff, raw, want_rc, want_mode in cases:
+        sandbox = tempfile.mkdtemp(prefix="gr_test_early_")
+        try:
+            out = os.path.join(sandbox, "o.json")
+            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+
+            def collect(*a, **k):
+                if isinstance(diff, Exception):
+                    raise diff
+                return diff
+
+            with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                    _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                    _patched(gr, "_git_root", lambda start: sandbox), \
+                    _patched(gr, "_collect_diff", collect), \
+                    _patched(gr, "_invoke_schema", lambda *a, **k: (raw or "", 0.0, None)):
+                rc = gr.main(["--out", out])
+            mode = _read_json(out).get("mode")
+            yield (None if rc == want_rc and mode == want_mode else
+                   "%s: exit %s · mode %r (기대 %d · %s)" % (label, rc, mode, want_rc, want_mode))
+        finally:
+            _rmtree_sandbox(sandbox, sandbox)
+
+
+def _skill_bash_block():
+    """SKILL.md 에서 `${CLAUDE_SKILL_DIR}` 를 쓰는 bash 코드 블록 본문."""
+    text = _read_text(_SKILL_MD)
+    for m in re.finditer(r"```bash\n(.*?)```", text, re.S):
+        if "${CLAUDE_SKILL_DIR}" in m.group(1):
+            return m.group(1)
+    return None
+
+
+def _check_skill_launcher_block_runs(gr):
+    """SKILL.md 의 실행 블록을 **실제로 돌려** 인터프리터 탐지와 실패 시 exit 2 를 확인한다.
+
+    ⛔ [26.09.14 Gemini 교차리뷰 CRITICAL] 종전 실행 예시는 `python …` 하드코딩이라 우분투
+      (이 PC)에서 command not found 로 죽었다.
+    ⚠ 한계: `${CLAUDE_SKILL_DIR}` 치환은 Claude Code 가 하는 일이라 여기서는 **테스트가
+      흉내 낸다.** PowerShell 블록은 **실행하지 않는다** — 모양만 본다
+      (`_check_skill_powershell_block_shape`).
+    """
+    del gr
+    bash = shutil.which("bash")
+    block = _skill_bash_block()
+    if block is None:
+        yield "SKILL.md 에 ${CLAUDE_SKILL_DIR} 를 쓰는 bash 실행 블록이 없다"
+        return
+    if bash is None or os.name == "nt":
+        yield _Skip("bash 로 실행 블록을 돌릴 수 없는 환경")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_launch_")
+    try:
+        skill_dir = os.path.join(sandbox, "skill")
+        os.makedirs(skill_dir)
+        with io.open(os.path.join(skill_dir, "gemini_review.py"), "w") as fh:
+            fh.write("import sys\nprint('ARGS=' + ' '.join(sys.argv[1:]))\nsys.exit(5)\n")
+        script = block.replace("${CLAUDE_SKILL_DIR}", skill_dir)
+
+        def bindir(name, entries):
+            d = os.path.join(sandbox, name)
+            os.makedirs(d)
+            for exe, body in entries:
+                p = os.path.join(d, exe)
+                if body is None:
+                    os.symlink(sys.executable, p)
+                else:
+                    with io.open(p, "w") as fh:
+                        fh.write(body)
+                    os.chmod(p, 0o755)
+            return d
+
+        def run(path_dirs):
+            env = {"PATH": os.pathsep.join(path_dirs), "HOME": sandbox}
+            p = subprocess.run([bash, "-c", script], env=env, capture_output=True, timeout=60)
+            return p.returncode, p.stdout.decode("utf-8", "replace")
+
+        good = bindir("good", [("python3", None)])
+        rc, out = run([good])
+        yield (None if rc == 5 and "ARGS=--staged" in out else
+               "python3 만 있는 환경에서 블록이 스크립트를 못 돌렸다(exit %s): %r" % (rc, out[-120:]))
+
+        stub = bindir("stub", [("python3", "#!/bin/sh\necho 'Python was not found; run without arguments to install from the Microsoft Store'\nexit 49\n"),
+                               ("python", None)])
+        rc, out = run([stub])
+        yield (None if rc == 5 and "ARGS=--staged" in out else
+               "Store 스텁 python3 를 건너뛰고 python 을 쓰지 못했다(exit %s): %r" % (rc, out[-120:]))
+
+        empty = bindir("empty", [])
+        rc, out = run([empty])
+        yield (None if rc == 2 and "찾지 못했다" in out else
+               "파이썬이 없는데 exit 2 · 안내가 아니다(exit %s): %r" % (rc, out[-120:]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _skill_powershell_block():
+    """SKILL.md 에서 `${CLAUDE_SKILL_DIR}` 를 쓰는 PowerShell 코드 블록 본문."""
+    text = _read_text(_SKILL_MD)
+    for m in re.finditer(r"```powershell\n(.*?)```", text, re.S):
+        if "${CLAUDE_SKILL_DIR}" in m.group(1):
+            return m.group(1)
+    return None
+
+
+def _check_skill_powershell_block_shape(gr):
+    """SKILL.md 의 PowerShell 실행 블록 **모양**을 본다. 실행은 하지 않고 건너뜀으로 알린다.
+
+    ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] 실행 검사의 docstring 이 "pwsh 가 있으면 PowerShell
+      블록도 확인한다" 고 적었지만 그런 코드가 없었다. 이 PC 에는 pwsh 가 없어 실행 검사를
+      넣어도 검증할 수 없다 — 대신 깨지면 **조용히 통과로 읽히는** 두 가지를 고정한다:
+      ① 마지막 줄이 `exit $LASTEXITCODE` — 없으면 exit 5(지적 있음)가 0 으로 삼켜진다.
+      ② 인자 자리 `--staged` 는 스크립트를 부르는 줄 **하나에만** 있다. 안내가 "마지막 줄의
+         인자를 바꾼다" 였던 판에서는 그 줄이 PowerShell 에서 `exit` 줄이었다.
+    """
+    del gr
+    block = _skill_powershell_block()
+    if block is None:
+        yield "SKILL.md 에 ${CLAUDE_SKILL_DIR} 를 쓰는 PowerShell 실행 블록이 없다"
+        return
+    lines = [ln.strip() for ln in block.splitlines()
+             if ln.strip() and not ln.strip().startswith("#")]
+    last = lines[-1].split("#", 1)[0].strip() if lines else ""
+    yield (None if last == "exit $LASTEXITCODE" else
+           "PowerShell 블록의 마지막 줄이 `exit $LASTEXITCODE` 가 아니다(%r) — exit 5 가 0 으로 "
+           "삼켜진다" % last)
+    staged = [ln for ln in lines if "--staged" in ln]
+    yield (None if len(staged) == 1 and staged[0].startswith("& $PY $GR ") else
+           "PowerShell 블록의 `--staged` 가 스크립트 호출 줄 하나에만 있지 않다: %r" % staged)
+    yield (None if "마지막 줄의 인자" not in _read_text(_SKILL_MD) else
+           "SKILL.md 가 '마지막 줄의 인자' 를 바꾸라고 한다 — PowerShell 블록의 마지막 줄은 exit 다")
+    yield _Skip("PowerShell 실행 블록은 돌리지 않았다(모양만 확인) — Windows 실측은 TODOS")
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -1232,6 +1553,12 @@ _BEHAVIOR_CHECKS = (
     _check_git_failures_are_exit_2,
     _check_diff_is_independent_of_user_git_config,
     _check_subprocess_use_is_contained,
+    _check_docs_pin_the_model,
+    _check_exit_code_tables_agree,
+    _check_sensitive_block_does_not_invite_bypass,
+    _check_early_exits_record_final_mode,
+    _check_skill_launcher_block_runs,
+    _check_skill_powershell_block_shape,
 )
 
 
@@ -1304,16 +1631,19 @@ def main():
         r'(?:"[^"]*gemini_review\.py"|[^\s"]*gemini_review\.py)')
     with io.open(_SKILL_MD, encoding="utf-8") as fh:
         _skill_lines = fh.read().splitlines()
-    if not any("${CLAUDE_PLUGIN_ROOT}" in ln for ln in _skill_lines):
-        fails.append("SKILL.md 가 ${CLAUDE_PLUGIN_ROOT} 를 쓰지 않는다 — "
+    # [26.09.14] `${CLAUDE_SKILL_DIR}` 도 인정한다 — 플러그인 · 개인 · 프로젝트 스킬 모두에서
+    #   치환된다(공식 문서). 1.3.2 부터 실행 블록은 이것을 쓴다.
+    _PATH_VARS = ("${CLAUDE_SKILL_DIR}", "${CLAUDE_PLUGIN_ROOT}")
+    if not any(v in ln for ln in _skill_lines for v in _PATH_VARS):
+        fails.append("SKILL.md 가 ${CLAUDE_SKILL_DIR} · ${CLAUDE_PLUGIN_ROOT} 를 쓰지 않는다 — "
                      "플러그인으로 설치하면 안내된 경로에 파일이 없다")
     _bad = []
     for ln in _join_shell_continuations(_skill_lines):
         _m = _CMD_RE.search(ln)
-        if _m and "${CLAUDE_PLUGIN_ROOT}" not in _m.group(0):
+        if _m and not any(v in _m.group(0) for v in _PATH_VARS):
             _bad.append(ln.strip())
     if _bad:
-        fails.append("실행 예시가 ${CLAUDE_PLUGIN_ROOT} 를 쓰지 않는다 (%d줄): %s"
+        fails.append("실행 예시가 경로 변수를 쓰지 않는다 (%d줄): %s"
                      % (len(_bad), _bad[0][:70]))
 
     for path, want, why in _PATH_CASES:

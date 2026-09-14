@@ -15,6 +15,7 @@
 - **`--mode plan` 고정** — read-only. Gemini 가 저장소 파일을 수정할 수 없다.
 - diff 는 임시 파일로 넘긴다 (Windows 명령줄 길이 제한 ~8191자 회피).
 - 민감 경로(.env·secrets·credentials·*.pem/key 등)가 diff 에 있으면 **중단**한다.
+  `--allow-sensitive` 는 사용자의 명시 승인 뒤에만 쓴다.
 
 ## 프로젝트별 리뷰 관점 주입
 
@@ -26,10 +27,12 @@
     python gemini_review.py                    # 마지막 커밋
     python gemini_review.py --base HEAD~3      # 최근 3커밋
     python gemini_review.py --staged           # 스테이징된 변경 (커밋 직전)
-    python gemini_review.py --model gemini-3.8-flash-high   # 빠르게
+
+⚠ 모델은 `gemini-3.1-pro-high` 고정이다 — 느리다고 flash 로 낮추지 않는다(SKILL.md).
 
 종료 코드: 0 통과(approve·approve_with_comments) / 1 파싱 실패 / 2 실행 실패 /
-          3 민감 경로 / 4 빈 응답 / **5 request_changes** / **6 구조화 실패**
+          3 민감 경로 / 4 빈 응답 / **5 request_changes** / **6 구조화 실패** /
+          130 · 143 중단(신호). 이 목록에 없는 코드는 통과가 아니다.
 
 ⚠ [26.08.25] 5·6 은 **신설**이다. 종전엔 판정과 무관하게 0 이었다 — 실측
   리뷰 236건 중 `request_changes` 가 **141건(68%)** 이고 critical 지적이 111건인데
@@ -725,7 +728,7 @@ def _main(argv, ctx: dict) -> int:
         if not args.staged and args.base == "HEAD~1":
             _safe_print("  첫 커밋만 있는 저장소라면 비교할 이전 커밋이 없다 — "
                         "`--staged` 또는 `--base <ref>` 로 범위를 지정할 것.")
-        return 2
+        return finish({"mode": "tool_error", "note": str(exc)}, 2)
 
     # ⚠ [26.09.14] 저장소 루트를 안 뒤에 찾는다 — PATH 에서 저장소 안 항목을 빼려면
     #   루트가 필요하다(`_which_agy`).
@@ -736,10 +739,16 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("  설치: https://antigravity.google/cli "
                     "(Windows: irm https://antigravity.google/cli/install.ps1 | iex)")
         _safe_print("  설치 뒤 `agy` 를 한 번 실행해 Google 계정으로 로그인할 것.")
-        return 2
+        return finish({"mode": "tool_error",
+                       "note": "agy 를 찾지 못했다 — 리뷰가 수행되지 않았다."}, 2)
+    # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] 아래 조기 종료 갈래들도 **최종 상태**를 남긴다.
+    #   종전에는 `in_progress`("중간에 죽었다") 가 그대로 남아 사실과 달랐다.
+    #   종료 코드는 바꾸지 않는다(1.3.2 는 동작 계약 불변).
     if not diff.strip():
-        _safe_print("변경분이 없다.")
-        return 0
+        _safe_print("변경분이 없다. 리뷰는 수행되지 않았다"
+                    "%s." % (" — 스테이징한 변경이 없다면 `git add` 후 다시" if args.staged else ""))
+        return finish({"mode": "no_changes",
+                       "note": "리뷰할 변경분이 없었다 — 리뷰가 수행되지 않았다."}, 0)
 
     classified = [(f, _classify_path(f)) for f in files]
     blocked = [f for f, c in classified if c == "block"]
@@ -748,8 +757,12 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("⛔ 민감 경로가 diff 에 포함돼 있다 — 외부 전송을 중단한다:")
         for f in blocked:
             _safe_print("   %s" % f)
-        _safe_print("   의도한 것이면 --allow-sensitive 로 다시 실행하라.")
-        return 3
+        # ⛔ [26.09.14 DX 교차리뷰] 종전 문구 "의도한 것이면 --allow-sensitive 로 다시
+        #   실행하라" 는 에이전트가 **지시로 읽고** 스스로 가드를 끌 수 있었다.
+        _safe_print("   리뷰는 수행되지 않았다. 목록을 사용자에게 보여 주고, 사용자가")
+        _safe_print("   전송을 명시적으로 승인한 경우에만 --allow-sensitive 로 다시 실행할 것.")
+        return finish({"mode": "sensitive_blocked", "blocked": blocked,
+                       "note": "민감 경로가 있어 전송을 중단했다 — 리뷰가 수행되지 않았다."}, 3)
 
     project_ctx = _load_project_context(root)
     if args.staged:
@@ -819,7 +832,8 @@ def _main(argv, ctx: dict) -> int:
     raw, elapsed, fatal = _invoke_schema(agy, used_model, args, root,
                                          schema_path, prompt)
     if fatal is not None:
-        return fatal
+        return finish({"mode": "tool_error", "model": used_model,
+                       "note": "agy 실행이 실패했다 — 리뷰가 수행되지 않았다."}, fatal)
     _safe_print("응답: %s · %.0f초" % (used_model, elapsed))
 
     # agy 래퍼를 먼저 본다 — 모델이 **빈 응답**을 낸 경우를 '파싱 실패'로
@@ -981,7 +995,8 @@ def _main(argv, ctx: dict) -> int:
     if payload is None:
         _safe_print("JSON 파싱 실패 — 원문을 그대로 출력한다:")
         _safe_print(raw[:4000])
-        return 1
+        return finish({"mode": "parse_failed", "model": used_model,
+                       "note": "응답에서 리뷰 JSON 을 하나로 특정하지 못했다 — 통과가 아니다."}, 1)
 
     # ⚠ [26.09.10 리뷰] **어느 모델이 이 판정을 냈는지** 기록한다. 폴백으로
     #   되찾은 경우 화면의 "폴백 성공" 한 줄은 스크롤백에만 남고, 며칠 뒤
@@ -1478,6 +1493,11 @@ def _extract_json(raw: str):
     if _looks_like_review(wrapper):
         return wrapper
     if isinstance(wrapper, dict):
+        # ⚠ 처음으로 **존재하는** 응답 키 하나만 본다 — 거기서 못 찾아도 다음 키로 넘어가지
+        #   않는다. 넘어가면 다른 필드에 심은 리뷰 JSON 을 고르는 경로가 다시 열린다.
+        #   [26.09.14 교차리뷰 "첫 키에서 못 찾으면 다음 키도 보라"(HIGH) 는 이 이유로 기각.
+        #    실측 agy 래퍼 키는 conversation_id · status · response · duration_seconds ·
+        #    num_turns · usage · error 뿐이다. 나머지 키는 래퍼 모양이 바뀔 때를 위한 것.]
         for key in _WRAPPER_KEYS:
             if key in wrapper:
                 inner = wrapper[key]

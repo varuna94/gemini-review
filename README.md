@@ -20,14 +20,15 @@
 | 무엇 | 확인 | 없으면 |
 |---|---|---|
 | `agy` (Antigravity CLI) | `agy --version` | [antigravity.google/cli](https://antigravity.google/cli) 에서 설치하고 Google 계정으로 인증한다 |
+| Google AI Pro/Ultra 구독 | — | **필수.** agy 인증에 쓰인다. 무료 계정으로는 리뷰가 돌지 않는다 |
 | Python 3 | `python3 --version` (Windows 는 `py --version`) | 대부분 이미 있다 |
 
 `agy` 는 **Google AI Pro/Ultra 구독**으로 인증되므로, 저장소가 `GEMINI_API_KEY`
 (무료 tier)를 따로 쓰고 있어도 그 quota 를 잠식하지 않는다.
 
-OS 별로 따로 할 일은 없다. 스킬이 파이썬 이름(`python3` / `py` / `python`)과
-`agy` 위치를 스스로 찾고, **못 찾으면 종료 코드 2 로 죽는다** — 리뷰를 돌리지
-않은 채 "지적 없음"으로 지나가지 않는다.
+파이썬 이름은 환경마다 다르다(우분투·맥 `python3`, Windows `py` · `python`). 스킬이
+있는 쪽을 골라 실행하도록 안내한다. **`agy` 를 못 찾으면 종료 코드 2 로 끝난다** —
+리뷰를 돌리지 않은 채 "지적 없음"으로 지나가지 않는다.
 
 ## 쓰는 법
 
@@ -43,8 +44,10 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 `--base` 는 **merge-base 기준(3-dot)** 이다. `--base main` 은 브랜치를 딴 지점
 이후의 내 변경만 본다 — 그 사이 main 에 들어온 남의 커밋은 섞이지 않는다.
 
-그 밖의 인자: `--model`(기본 `gemini-3.1-pro-high`), `--timeout`(기본 `10m`),
-`--out`(결과 JSON 저장 경로), `--allow-sensitive`.
+그 밖의 인자: `--model`(기본 `gemini-3.1-pro-high` — **flash 로 낮추지 말 것**),
+`--timeout`(기본 `10m`), `--out`(결과 JSON 저장 경로. 생략하면
+`~/.local/state/gemini-review/`, Windows 는 `%LOCALAPPDATA%\gemini-review\`),
+`--allow-sensitive`(사용자가 전송을 명시적으로 승인했을 때만).
 
 ## 결과를 읽는 법
 
@@ -59,11 +62,15 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 |---|---|
 | `0` | 통과 (`approve` · `approve_with_comments`) |
 | `1` | 파싱 실패 |
-| `2` | 실행 실패 — `agy` 나 파이썬을 찾지 못했다 |
+| `2` | 실행 실패 — git · `agy` 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` 에 못 씀 |
 | `3` | 민감 경로가 diff 에 있어 중단 |
 | `4` | **빈 응답 — 리뷰가 안 된 것이다.** '지적 없음'으로 읽지 말고 다시 돌린다 |
 | `5` | `request_changes` |
 | `6` | 구조화 실패 (텍스트 모드로 리뷰는 받았다) |
+| `130` · `143` | 중단(Ctrl+C · 종료 신호) — 리뷰가 안 된 것이다 |
+
+**이 표에 없는 코드는 통과가 아니다.** exit 4 는 몇 분 두고 2회까지 다시 돌리고,
+그래도 안 되면 "리뷰가 수행되지 않았다" 고 보고한다(가능하면 다른 계열 리뷰로 대체).
 
 **`0` 도 무조건 통과가 아니다.** 스테이징이 비면 "변경분이 없다"로 끝나며 0 이다.
 화면의 `범위:`·`변경 파일 N개` 를 먼저 확인하라.

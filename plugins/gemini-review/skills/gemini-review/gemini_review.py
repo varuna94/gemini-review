@@ -61,7 +61,7 @@ from typing import List, Optional, Tuple
 _AGY_CANDIDATES = [
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe"),
     os.path.expanduser("~/.local/bin/agy"),
-    "agy",
+    # ⚠ bare "agy" 는 두지 않는다 — PATH 는 `_which_agy` 가 **절대 경로**로 해석한다.
 ]
 
 # diff 에 이것이 섞이면 외부로 나가면 안 되는 것이 있을 수 있다 → 중단.
@@ -299,29 +299,83 @@ def _safe_print(text: str) -> None:
         print(text.encode(enc, errors="replace").decode(enc, errors="replace"))
 
 
-def _find_agy() -> Optional[str]:
-    for cand in _AGY_CANDIDATES:
-        if not cand:
+def _agy_names() -> List[str]:
+    if os.name == "nt":
+        return ["agy.exe", "agy.cmd", "agy.bat"]
+    return ["agy"]
+
+
+def _is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:                    # Windows 에서 드라이브가 다르면
+        return False
+
+
+def _which_agy(root: Optional[str]) -> Optional[str]:
+    """PATH 항목을 **직접** 돌며 agy 의 절대 경로를 찾는다.
+
+    ⛔ [26.09.14 Eng 교차리뷰] 종전에는 bare `"agy"` 를 그대로 실행했다. Windows 의
+      CreateProcess 는 PATH 보다 **현재 폴더**를 먼저 찾으므로, 리뷰 대상 저장소
+      루트에 `agy.exe` 가 있으면 그것이 실행된다 — 상대 경로 후보를 건너뛰어 막은
+      공격이 옆문으로 들어온다. `shutil.which` 도 기본값에서는 현재 폴더를 먼저 본다.
+    → 빈 항목 · 상대 경로 항목(= 현재 폴더 기준)은 건너뛰고, 현재 폴더 자체와
+      **리뷰 대상 저장소 안**의 항목(`node_modules/.bin` 등)도 건너뛴다.
+    """
+    cwd = os.path.realpath(os.getcwd())
+    root_real = os.path.realpath(root) if root else None
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        entry = entry.strip().strip('"')
+        if not entry or not os.path.isabs(entry):
             continue
+        real = os.path.realpath(entry)
+        if real == cwd or (root_real and _is_within(real, root_real)):
+            continue
+        for name in _agy_names():
+            cand = os.path.join(entry, name)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return os.path.abspath(cand)
+    return None
+
+
+def _find_agy(root: Optional[str] = None) -> Optional[str]:
+    """agy 의 **절대 경로**. 알려진 설치 경로 → PATH 순. 못 찾으면 None.
+
+    ⚠ 실행해 보지 않는다(종전 `agy --help`). 경로를 절대 경로로 확정하는 것이
+      안전의 핵심이고, 실행 확인은 실제 호출이 한다.
+    """
+    for cand in _AGY_CANDIDATES:
         # ⚠ 상대 경로는 건너뛴다. 리눅스·맥에는 LOCALAPPDATA 가 없어 첫 후보가
         #   `agy/bin/agy.exe` 라는 **작업 디렉토리 기준 상대 경로**로 평가된다
         #   (실측). 리뷰는 대상 저장소 안에서 도므로, 그 경로를 품은 저장소를
         #   clone 해 리뷰하면 저장소가 심은 파일이 agy 대신 실행된다.
-        if cand != "agy" and not os.path.isabs(cand):
+        if not cand or not os.path.isabs(cand):
             continue
-        if os.path.isfile(cand):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
             return cand
-        if cand == "agy":
-            try:
-                subprocess.run([cand, "--help"], capture_output=True,
-                               timeout=30, check=False)
-                return cand
-            except (OSError, subprocess.SubprocessError):
-                continue
-    return None
+    return _which_agy(root)
 
 
-def _git(args: List[str], cwd: str) -> str:
+# [26.09.14] diff 를 **사용자 git 설정과 무관하게** 같은 모양으로 만든다.
+#   `-c` 설정은 오래된 git 도 모르는 키를 무시하므로, 새 옵션 대신 설정으로 고정한다.
+# ⛔ `diff.renames=false` 는 **보안 설정**이다 [26.09.14 실측]. git 기본값은 이름
+#   변경을 감지해 `--name-only` 에 **새 이름만** 내보낸다. `.env` 를 `env.txt` 로
+#   옮기고 한 줄을 고치자 목록이 `env.txt` 하나뿐이라 민감 경로 판정을 통과했고,
+#   바뀐 줄(`API_KEY=sk_live_…`)이 담긴 diff 가 전송될 뻔했다. 끄면 옛 경로 `.env`
+#   가 목록에 나와 차단된다.
+_DIFF_CONFIG = [
+    "-c", "diff.renames=false",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.relative=false",
+    "-c", "diff.algorithm=myers",
+    "-c", "diff.context=3",
+    "-c", "color.diff=false",
+]
+_DIFF_ARGS = ["--no-ext-diff", "--no-textconv", "--no-color"]
+
+
+def _git(args: List[str], cwd: str, config: Optional[List[str]] = None) -> str:
     """⚠ `core.quotePath=false` 는 **보안 옵션**이다 [26.08.13].
 
     기본값(true)이면 git 이 비ASCII 경로를 `"\\354\\232\\264\\354\\230\\201.env"`
@@ -331,9 +385,21 @@ def _git(args: List[str], cwd: str) -> str:
     오탐과 달리 fail-open 이라 사후에도 드러나지 않는다. 한국어 파일명만의
     문제가 아니다 — 경로 어디든 비ASCII 바이트 하나면 발동한다.
     """
-    out = subprocess.run(["git", "-c", "core.quotePath=false"] + args,
-                         cwd=cwd, capture_output=True,
-                         timeout=60, check=False)
+    try:
+        out = subprocess.run(["git", "-c", "core.quotePath=false"]
+                             + (config or []) + args,
+                             cwd=cwd, capture_output=True,
+                             timeout=60, check=False)
+    except FileNotFoundError:
+        # ⛔ [26.09.14 실측] 종전에는 traceback · exit 1 이었다. exit 1 은 문서상
+        #   "파싱 실패" 라 원인을 오해한다.
+        raise RuntimeError("git 을 실행할 수 없다(PATH 에 git 이 있는지 확인). "
+                           "리뷰는 수행되지 않았다.")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("git %s 이 60초 안에 끝나지 않았다. 리뷰는 수행되지 않았다."
+                           % " ".join(args))
+    except OSError as exc:
+        raise RuntimeError("git 실행 실패: %s. 리뷰는 수행되지 않았다." % exc)
     if out.returncode != 0:
         raise RuntimeError("git %s 실패: %s"
                            % (" ".join(args),
@@ -349,8 +415,9 @@ def _git_root(start: str) -> str:
 def _collect_diff(root: str, base: str, head: str, staged: bool,
                   two_dot: bool = False) -> Tuple[str, List[str]]:
     if staged:
-        diff = _git(["diff", "--cached"], root)
-        files = [f for f in _git(["diff", "--cached", "--name-only"], root).splitlines() if f]
+        diff = _git(["diff", "--cached"] + _DIFF_ARGS, root, _DIFF_CONFIG)
+        files = [f for f in _git(["diff", "--cached", "--name-only"] + _DIFF_ARGS,
+                                 root, _DIFF_CONFIG).splitlines() if f]
     else:
         # ⚠ [26.08.13] 기본을 **3-dot(merge-base 기준)** 으로 바꿨다.
         # 2-dot 은 base 가 head 의 조상이 아닐 때 — 즉 브랜치 리뷰
@@ -362,8 +429,9 @@ def _collect_diff(root: str, base: str, head: str, staged: bool,
         # 결과가 2-dot 과 **동일** 하다 — 기존 사용법은 바뀌지 않는다.
         # 원 저장소가 main 단일 브랜치라 이 결함이 드러난 적이 없었다.
         rng = "%s%s%s" % (base, ".." if two_dot else "...", head)
-        diff = _git(["diff", rng], root)
-        files = [f for f in _git(["diff", rng, "--name-only"], root).splitlines() if f]
+        diff = _git(["diff", rng] + _DIFF_ARGS, root, _DIFF_CONFIG)
+        files = [f for f in _git(["diff", rng, "--name-only"] + _DIFF_ARGS,
+                                 root, _DIFF_CONFIG).splitlines() if f]
     return diff, files
 
 
@@ -533,9 +601,14 @@ def _install_signal_handlers():
         # ⚠ 테스트가 main() 을 같은 프로세스에서 여러 번 부르면 처리기가 쌓이고
         #   테스트 러너의 처리기를 덮는다 — 끝나면 원래대로 되돌린다.
         for sig, old in saved:
+            # ⚠ [26.09.14 Gemini 교차리뷰 MEDIUM] 이전 처리기가 파이썬 밖(C 확장 등)에서
+            #   설치됐으면 `signal.signal` 이 None 을 돌려준다. None 으로 복원하면
+            #   TypeError 라 원래 종료 코드를 잃고 traceback 으로 죽는다 → 건너뛴다.
+            if old is None:
+                continue
             try:
                 signal.signal(sig, old)
-            except (OSError, ValueError, RuntimeError):
+            except (OSError, ValueError, RuntimeError, TypeError):
                 pass
 
     def suppress():
@@ -643,18 +716,26 @@ def _main(argv, ctx: dict) -> int:
             return 2
         return rc
 
-    agy = _find_agy()
-    if not agy:
-        _safe_print("agy(Antigravity CLI)를 찾지 못했다.")
-        _safe_print("  설치: irm https://antigravity.google/cli/install.ps1 | iex")
-        return 2
-
     try:
         root = _git_root(os.getcwd())
         diff, files = _collect_diff(root, args.base, args.head, args.staged,
                                     args.two_dot)
     except RuntimeError as exc:
         _safe_print(str(exc))
+        if not args.staged and args.base == "HEAD~1":
+            _safe_print("  첫 커밋만 있는 저장소라면 비교할 이전 커밋이 없다 — "
+                        "`--staged` 또는 `--base <ref>` 로 범위를 지정할 것.")
+        return 2
+
+    # ⚠ [26.09.14] 저장소 루트를 안 뒤에 찾는다 — PATH 에서 저장소 안 항목을 빼려면
+    #   루트가 필요하다(`_which_agy`).
+    agy = _find_agy(root)
+    if not agy:
+        _safe_print("agy(Antigravity CLI)를 찾지 못했다 — 리뷰가 수행되지 않았다.")
+        _safe_print("  확인한 곳: 알려진 설치 경로 · PATH(현재 폴더와 저장소 안은 제외)")
+        _safe_print("  설치: https://antigravity.google/cli "
+                    "(Windows: irm https://antigravity.google/cli/install.ps1 | iex)")
+        _safe_print("  설치 뒤 `agy` 를 한 번 실행해 Google 계정으로 로그인할 것.")
         return 2
     if not diff.strip():
         _safe_print("변경분이 없다.")
@@ -1110,11 +1191,55 @@ def _invoke_schema(agy: str, model: str, args, root: str, schema_path: str,
         return "", time.time() - started, 2
     elapsed = time.time() - started
     raw = proc.stdout.decode("utf-8", "replace").strip()
-    if proc.returncode != 0 and not raw:
-        _safe_print("agy 종료코드 %d (%.0f초)" % (proc.returncode, elapsed))
-        _safe_print(proc.stderr.decode("utf-8", "replace")[:800])
+    err = proc.stderr.decode("utf-8", "replace").strip()
+    # ⛔ [26.09.14 실측] 종전 조건은 `returncode != 0 and not raw` 였다.
+    #   · 없는 모델명 → agy exit 1 + stdout 에 `{"status":"ERROR","response":"",
+    #     "error":"invalid model selection …"}` → 빈 응답으로 읽혀 생존 확인 ·
+    #     **폴백 모델 판정**으로 이어졌다(주 모델이 없어도 flash 의 approve 가 exit 0).
+    #   · 인증 오류처럼 stdout 에 평문이 오면 "JSON 파싱 실패" exit 1 로 끝났다.
+    #   → agy 가 실패를 알리면(종료 코드 · 래퍼 status) stdout 과 무관하게 실패다.
+    if proc.returncode != 0 or _wrapper_status(raw) == "ERROR":
+        detail = _agy_error_detail(raw, err)
+        _safe_print("⛔ agy 가 실패했다(종료코드 %d · %.0f초) — 리뷰가 수행되지 않았다."
+                    % (proc.returncode, elapsed))
+        if detail:
+            _safe_print("   %s" % detail.splitlines()[0][:300])
+        if _looks_like_model_error(detail):
+            _safe_print("   모델명을 확인할 것: `agy models` 로 목록을 보고 --model 로 지정.")
         return raw, elapsed, 2
+    if _is_print_timeout(err):
+        # 동작은 그대로(1.4.0 에서 원인별 종료 코드). 원인만 화면에 남긴다.
+        _safe_print("⚠ agy 가 출력 시간 초과를 알렸다(--timeout %s) — 응답이 비었거나 "
+                    "잘렸을 수 있다." % args.timeout)
     return raw, elapsed, None
+
+
+def _wrapper_status(raw: str) -> str:
+    """agy JSON 래퍼의 `status`(대문자). 래퍼가 아니면 빈 문자열."""
+    try:
+        wrapper = json.loads(raw)
+    except ValueError:
+        return ""
+    if isinstance(wrapper, dict):
+        return str(wrapper.get("status") or "").upper()
+    return ""
+
+
+def _agy_error_detail(raw: str, err: str) -> str:
+    """agy 가 실패를 알린 문구. 래퍼 JSON 의 `error` 를 우선한다."""
+    try:
+        wrapper = json.loads(raw)
+    except ValueError:
+        wrapper = None
+    if isinstance(wrapper, dict) and wrapper.get("error"):
+        return str(wrapper["error"]).strip()
+    return (err or raw or "").strip()
+
+
+def _looks_like_model_error(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return ("invalid model selection" in lowered
+            or "not recognized as a known model" in lowered)
 
 
 def _empty_info(raw: str) -> Optional[dict]:
@@ -1166,7 +1291,13 @@ def _probe_alive(agy: str, model: str, root: str) -> Tuple[bool, float]:
     except (OSError, subprocess.SubprocessError):
         return False, time.time() - started
     elapsed = time.time() - started
-    return _probe_says_ok(proc.stdout.decode("utf-8", "replace")), elapsed
+    # ⛔ [26.09.14 Eng 교차리뷰] 종전에는 stdout 만 봤다 — `_retry_as_text` ·
+    #   `_invoke_schema` 에서 고친 "종료 코드를 안 본다" 계열의 세 번째 자리다.
+    #   에러 문구에 OK 라는 낱말이 섞이면 살아 있다고 판정해 긴 재시도로 넘어간다.
+    alive = (proc.returncode == 0
+             and not _is_print_timeout(proc.stderr.decode("utf-8", "replace"))
+             and _probe_says_ok(proc.stdout.decode("utf-8", "replace")))
+    return alive, elapsed
 
 
 def _probe_says_ok(text: str) -> bool:
@@ -1323,28 +1454,53 @@ def _looks_like_review(d) -> bool:
     return all(isinstance(x, dict) for x in findings)
 
 
-def _extract_json(raw: str):
-    """agy 출력에서 리뷰 JSON 을 뽑는다 (래핑 형태가 바뀌어도 견디게).
+_WRAPPER_KEYS = ("response", "result", "output", "content")
 
-    ⚠ **첫 매칭에서 반환하지 않는다.** `_json_candidates` 는 문서 왼쪽부터
-    훑으므로, LLM 이 사고 과정에서 만든 예시 JSON 이 앞에 있고 최종 답이 뒤에
-    오면 앞의 것을 집어 진짜 리뷰를 버리게 된다. 끝까지 훑어 **마지막**을 쓴다.
+
+def _extract_json(raw: str):
+    """agy 출력에서 리뷰 JSON 을 **하나만** 뽑는다. 애매하면 None(→ exit 1).
+
+    ⛔ [26.09.14 Eng 교차리뷰] 종전에는 래퍼 **전체**를 훑어 **마지막** 리뷰 모양
+      후보를 채택했다. diff 에 `{"verdict": "approve", …}` 를 심어 두면 그 문자열이
+      래퍼 뒤쪽 필드나 응답 꼬리에 실릴 때 진짜 판정을 제칠 수 있다. 판정은 이
+      도구의 게이트라, 애매하면 **판단하지 않는다.**
+    → 래퍼가 있으면 응답 필드 **하나만** 본다. 필드 전체가 리뷰 JSON 이면 그것,
+      아니면 본문에서 리뷰 모양 후보를 모아 **서로 다른 것이 정확히 하나**일 때만.
+    ⚠ 종전 docstring 의 "LLM 이 사고 과정에서 만든 예시 JSON 이 앞에 오면 마지막을
+      쓴다" 는 규칙은 버렸다. 스키마 강제 출력(`--json-schema`)에서는 응답 필드 전체가
+      리뷰 JSON 이라 첫 갈래에서 끝나고, 예시와 진짜가 섞인 애매한 경우는 판정을
+      지어내기보다 exit 1 이 옳다.
     """
-    best = None
-    for candidate in _json_candidates(raw):
-        if _looks_like_review(candidate):
-            best = candidate
-            continue
-        if isinstance(candidate, dict):
-            for key in ("result", "response", "output", "content"):
-                inner = candidate.get(key)
+    try:
+        wrapper = json.loads(raw)
+    except ValueError:
+        wrapper = None
+    if _looks_like_review(wrapper):
+        return wrapper
+    if isinstance(wrapper, dict):
+        for key in _WRAPPER_KEYS:
+            if key in wrapper:
+                inner = wrapper[key]
                 if _looks_like_review(inner):
-                    best = inner
-                elif isinstance(inner, str):
-                    for c2 in _json_candidates(inner):
-                        if _looks_like_review(c2):
-                            best = c2
-    return best
+                    return inner
+                return _single_review(inner) if isinstance(inner, str) else None
+        return None
+    return _single_review(raw)
+
+
+def _single_review(text: str):
+    """본문에 리뷰 JSON 이 **정확히 하나**면 그것, 아니면 None."""
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        whole = None
+    if _looks_like_review(whole):
+        return whole
+    found = []
+    for cand in _json_candidates(text):
+        if _looks_like_review(cand) and cand not in found:
+            found.append(cand)
+    return found[0] if len(found) == 1 else None
 
 
 def _json_candidates(raw: str):

@@ -104,10 +104,23 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 3. 집계 쿼리가 서로 다른 기간 필터를 씀
 ```
 
+## 고칠 때
+
+```
+python3 tests/test_gemini_review.py   # 동작 검사 (수 초)
+python3 tests/mutation_check.py       # 가드를 되돌리면 실제로 빨개지는지 (2분 안팎)
+```
+
+Windows 는 `python3` 대신 `py` 로 부른다.
+
+가드나 문서의 규칙을 건드렸다면 두 번째도 돌린다. 테스트가 초록이라는 것만으로는
+가드가 살아 있다는 증거가 아니다 — 이 저장소에서 두 번 그랬다.
+
 ## 업데이트
 
 ```
 /plugin update gemini-review@gemini-review
 ```
 
-마찬가지로 **세션을 새로 열어야** 새 판이 로드된다.
+마찬가지로 **세션을 새로 열어야** 새 판이 로드된다. 리뷰 배너 첫 줄(`Gemini 교차 리뷰 v1.3.2 …`)
+과 `스크립트:` 줄로 실제로 돈 판과 경로를 확인할 수 있다.

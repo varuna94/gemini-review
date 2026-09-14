@@ -216,6 +216,11 @@ def _classify_path(path: str) -> str:
             return verdict
     return ""
 
+# ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
+#   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
+#   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
+__version__ = "1.3.2"
+
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 _DEFAULT_FALLBACK_MODEL = "gemini-3.6-flash-high"
 _CONTEXT_FILE = ".gemini-review.md"
@@ -701,7 +706,7 @@ def _main(argv, ctx: dict) -> int:
         if out_early:
             _write_out(out_early, {
                 "mode": "not_run",
-                "note": "인자 해석 단계에서 끝났다(도움말 · 인자 오류) — 리뷰가 "
+                "note": "인자 해석 단계에서 끝났다(도움말 · 판 확인 · 인자 오류) — 리뷰가 "
                         "수행되지 않았다. 통과가 아니다.",
                 "exit_code": exc.code,
             }, quiet=True)
@@ -776,7 +781,8 @@ def _main(argv, ctx: dict) -> int:
     else:
         sensitive_label = "없음"
     _safe_print("=" * 74)
-    _safe_print("Gemini 교차 리뷰 (Antigravity CLI · %s)" % args.model)
+    _safe_print("Gemini 교차 리뷰 v%s (Antigravity CLI · %s)" % (__version__, args.model))
+    _safe_print("스크립트: %s" % os.path.abspath(__file__))
     _safe_print("저장소: %s" % root)
     # ⚠ [26.09.10] `diff N자` 를 **프롬프트 길이로 읽지 말 것.** diff 는 임시
     #   파일 경로로 넘어가므로 프롬프트에는 실리지 않는다(`_build_prompt`).
@@ -1044,9 +1050,27 @@ def _write_out(out_path: Optional[str], payload: dict,
     return path
 
 
+class _PrintVersion(argparse.Action):
+    """`--version` — 판과 스크립트 경로를 **한 줄로** 찍고 끝낸다.
+
+    ⚠ argparse 기본 `version` 동작은 터미널 폭에 맞춰 줄을 접어 경로가 `gemini-` /
+      `review` 로 끊겼다(26.09.14 실측). 이 줄은 "어느 설치본이 돌았나" 를 확인하는
+      용도라 끊긴 경로는 쓸 수 없다.
+    """
+    def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS,
+                 help="판 · 스크립트 경로를 찍고 끝낸다"):
+        super().__init__(option_strings=option_strings, dest=dest, default=default,
+                         nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _safe_print("gemini-review %s (%s)" % (__version__, os.path.abspath(__file__)))
+        parser.exit()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="Gemini cross-review via Antigravity CLI (agy)")
+    ap.add_argument("--version", action=_PrintVersion)
     ap.add_argument("--base", default="HEAD~1")
     ap.add_argument("--head", default="HEAD")
     ap.add_argument("--staged", action="store_true", help="스테이징된 변경 리뷰")

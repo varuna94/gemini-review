@@ -749,7 +749,11 @@ def _check_default_result_dir_is_private(gr):
 # 자식 프로세스에서 main() 을 돌리고, 가짜 agy 호출이 **진짜 자식 프로세스**를 띄운 채 기다리게 한다.
 # argv: 스크립트 경로 · 샌드박스 · --out 경로 · 자식 pid 기록 파일
 _CHILD_SIGNAL_RUN = r'''
-import importlib.util, json, os, subprocess, sys
+import importlib.util, json, os, signal, subprocess, sys
+# ⚠ [26.09.14 실측] 비대화형 셸의 `( … & )` 로 띄운 파이썬은 SIGINT 가 **무시(SIG_IGN)** 된 채
+#   시작하고 자식에게도 그대로 물려준다. 그러면 이 검사의 SIGINT 가 닿지 않아 30초 뒤
+#   kill -9(종료 코드 -9)로 끝나, 코드 회귀처럼 보였다. Ctrl+C 가 오는 환경을 재현한다.
+signal.signal(signal.SIGINT, signal.default_int_handler)
 spec = importlib.util.spec_from_file_location("gemini_review", sys.argv[1])
 gr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gr)
@@ -858,6 +862,24 @@ def _check_signal_cleans_up(gr):
             _rmtree_sandbox(sandbox, sandbox)
 
 
+def _sigterm_self(before):
+    """같은 프로세스에 진짜 SIGTERM 을 보낸다 — `main()` 이 **자기 처리기를 설치했을 때만**. 보냈으면 True.
+
+    ⛔ [26.09.14 변이 검사] 처리기 설치를 지운 변이에서 검사가 신호를 그대로 보내 **테스트 러너가**
+      기본 동작으로 죽었다(exit -15). 요약과 뒤 검사 결과가 모두 사라져 무엇이 깨졌는지 알 수
+      없었다. → 설치된 처리기가 없으면 보내지 않고, 부른 검사가 실패로 적는다.
+    """
+    if os.name == "nt":
+        # Windows 의 `os.kill(SIGTERM)` 은 처리기를 거치지 않고 프로세스를 끝낸다. 부르는 검사는
+        #   Windows 에서 건너뛰지만, 이 함수 자체도 러너를 죽이지 않게 막아 둔다.
+        return False
+    current = signal.getsignal(signal.SIGTERM)
+    if current is before or not callable(current):
+        return False
+    os.kill(os.getpid(), signal.SIGTERM)
+    return True
+
+
 def _check_signal_handlers_restored(gr):
     """`main()` 이 끝나면 — **중단됐을 때도** — 신호 처리기가 원래대로 돌아온다.
 
@@ -877,12 +899,15 @@ def _check_signal_handlers_restored(gr):
                "main() 뒤 SIGTERM 처리기가 바뀐 채 남았다: %r" % (after,))
 
         seen = []
+        unsent = []
 
         def interrupted_invoke(agy, model, args, root, schema_path, prompt):
             seen.append(os.path.dirname(schema_path))
             # 예외를 직접 던지지 않고 **진짜 신호**를 보낸다 — 설치된 처리기가 실제로
             #   불려야 "신호가 온 뒤 복원" 경로를 검사한다.
-            os.kill(os.getpid(), signal.SIGTERM)
+            if not _sigterm_self(before):
+                unsent.append(True)
+                return json.dumps({"verdict": "approve", "summary": "t", "findings": []}), 0.0, None
             deadline = time.time() + 5
             while time.time() < deadline:
                 time.sleep(0.01)
@@ -899,6 +924,8 @@ def _check_signal_handlers_restored(gr):
             rc = gr.main(["--out", out])
         after = signal.getsignal(signal.SIGTERM)
         problems = []
+        if unsent:
+            problems.append("main() 이 SIGTERM 처리기를 설치하지 않았다(신호를 보내지 않음)")
         if rc != 143:
             problems.append("exit %s" % rc)
         if after is not before:
@@ -925,7 +952,9 @@ def _check_sigterm_during_sigint_cleanup(gr):
         return
     sandbox = tempfile.mkdtemp(prefix="gr_test_sigmix_")
     real_mkdtemp = tempfile.mkdtemp
+    before = signal.getsignal(signal.SIGTERM)
     sent = []
+    unsent = []
 
     def mkdtemp_in_sandbox(suffix=None, prefix=None, dir=None):
         return real_mkdtemp(suffix=suffix, prefix=prefix, dir=sandbox)
@@ -935,10 +964,12 @@ def _check_sigterm_during_sigint_cleanup(gr):
         #   보내면 테스트 프로세스가 끝날 때 기본 처리기로 SIGTERM 을 맞아 143 으로 죽는다.
         if not sent:
             sent.append(path)
-            os.kill(os.getpid(), signal.SIGTERM)      # 정리 도중 두 번째 신호
-            deadline = time.time() + 2
-            while time.time() < deadline:
-                time.sleep(0.01)
+            if _sigterm_self(before):                 # 정리 도중 두 번째 신호
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    time.sleep(0.01)
+            else:
+                unsent.append(path)
         # ⛔ [26.09.14 Gemini 교차리뷰 HIGH] 코드가 넘긴 경로를 그대로 지우지 않는다 —
         #   검사 대상이 틀리면 그 경로는 어디든 될 수 있다(오늘 /tmp 를 지운 사고 계열).
         #   임시 폴더를 샌드박스 안에 만들게 했으니, 밖이면 지우지 않고 예외를 낸다.
@@ -965,6 +996,8 @@ def _check_sigterm_during_sigint_cleanup(gr):
             yield "정리 중 SIGTERM 에 main() 이 예외로 끝났다: %r" % (exc,)
             return
         mode = _read_json(out).get("mode")
+        yield (None if not unsent else
+               "main() 이 SIGTERM 처리기를 설치하지 않아 정리 중 신호를 보내지 못했다")
         yield (None if rc == 130 and mode == "interrupted" else
                "Ctrl+C 정리 중 SIGTERM 뒤 exit %s · mode %r (기대 130 · interrupted)" % (rc, mode))
     finally:
@@ -1531,6 +1564,23 @@ def _check_skill_powershell_block_shape(gr):
     yield _Skip("PowerShell 실행 블록은 돌리지 않았다(모양만 확인) — Windows 실측은 TODOS")
 
 
+def _check_version_line_is_whole(gr):
+    """`--version` 은 판과 스크립트 경로를 **한 줄로** 찍는다 — 좁은 터미널에서도.
+
+    ⚠ [26.09.14] argparse 기본 `version` 동작은 줄을 접어 경로를 끊었다. 배너의
+      `스크립트:` 줄과 함께 "어느 설치본이 돌았나" 를 확인하는 유일한 길이다.
+    """
+    env = dict(os.environ, COLUMNS="30")
+    env.pop("PYTHONIOENCODING", None)
+    target = os.path.abspath(_TARGET)
+    proc = subprocess.run([sys.executable, target, "--version"],
+                          env=env, capture_output=True, timeout=60, check=False)
+    lines = proc.stdout.decode("utf-8", "replace").splitlines()
+    want = "gemini-review %s (%s)" % (getattr(gr, "__version__", None), target)
+    yield (None if proc.returncode == 0 and want in lines else
+           "--version 이 판 · 경로를 한 줄로 찍지 않는다(exit %d): %r" % (proc.returncode, lines))
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -1558,6 +1608,7 @@ _BEHAVIOR_CHECKS = (
     _check_sensitive_block_does_not_invite_bypass,
     _check_early_exits_record_final_mode,
     _check_skill_launcher_block_runs,
+    _check_version_line_is_whole,
     _check_skill_powershell_block_shape,
 )
 
@@ -1582,6 +1633,11 @@ def main():
     elif _v_plugin != _v_skill:
         fails.append("버전이 갈렸다 — plugin.json=%s · SKILL.md=%s "
                      "(정본은 plugin.json)" % (_v_plugin, _v_skill))
+    # [26.09.14] 스크립트가 배너 · --version 으로 알리는 판도 같아야 한다(스킬 폴더만
+    #   복사해 쓰는 경우에도 판을 알 수 있게 상수로 둔다).
+    if getattr(gr, "__version__", None) != _v_plugin:
+        fails.append("스크립트 __version__=%r 가 plugin.json=%s 와 다르다"
+                     % (getattr(gr, "__version__", None), _v_plugin))
 
     # [26.09.14] 스킬이 안내하는 실행 경로가 홈 경로로 되돌아가면 **플러그인
     #   설치 환경에서 그 자리에 파일이 없어 리뷰가 아예 안 돌아간다.**
@@ -1701,7 +1757,8 @@ def main():
     #   [26.09.14] 6 → 9: 버전 일치(plugin.json ↔ SKILL.md) ·
     #   `${CLAUDE_PLUGIN_ROOT}` 존재 · 실행 예시 회귀.
     #   [26.09.14] 9 → 5: 문자열 검사 넷을 동작 검사로 옮겼다(`behavior_total`).
-    total = len(_PATH_CASES) + len(_EXIT_CASES) + 5 + behavior_total
+    #   [26.09.14] 5 → 6: 스크립트 __version__ 일치.
+    total = len(_PATH_CASES) + len(_EXIT_CASES) + 6 + behavior_total
     # 건너뛴 검사는 조용히 넘기지 않는다 — 결과 앞에 이유와 함께 남긴다.
     for sk in skipped:
         print("  - 건너뜀: %s" % sk)

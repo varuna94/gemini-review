@@ -644,8 +644,11 @@ def _install_signal_handlers():
     return restore, suppress
 
 
-def _record_interrupt(out: Optional[str], signum: int) -> int:
-    """중단을 화면과 `--out` 에 남기고 종료 코드(128+신호 번호)를 돌려준다."""
+def _record_interrupt(out: Optional[str], signum: int, model: Optional[str] = None) -> int:
+    """중단을 화면과 `--out` 에 남기고 종료 코드(128+신호 번호)를 돌려준다.
+
+    `model` 은 인자 해석을 마쳤을 때만 안다 — 알면 다른 최종 결과처럼 최상위 · `_meta` 에 남긴다.
+    """
     try:
         # ⚠ `signal.Signals` 는 Python 3.5+ 다(공식 문서 "Added in version 3.5").
         #   [26.09.14 교차리뷰가 "3.8+ 라 3.7 에서 AttributeError" 라고 짚었으나 사실이 아니다]
@@ -657,17 +660,18 @@ def _record_interrupt(out: Optional[str], signum: int) -> int:
     _safe_print("⛔ 중단됐다(%s) — 리뷰가 수행되지 않았다. 임시 파일은 정리한다." % name)
     _safe_print("   이 결과를 '지적 없음'으로 읽지 말 것.")
     if out:
-        _write_out(out, _result("interrupted", {
-            "signal": name,
-            "note": "신호로 중단됐다 — 리뷰가 수행되지 않았다. 통과가 아니다.",
-        }, rc, signal=name), quiet=True)
+        body = {"signal": name,
+                "note": "신호로 중단됐다 — 리뷰가 수행되지 않았다. 통과가 아니다."}
+        if model:
+            body["model"] = model
+        _write_out(out, _result("interrupted", body, rc, signal=name, model=model), quiet=True)
     return rc
 
 
 def main(argv=None) -> int:
     """진입점. 본문(`_main`)을 신호 처리 · 내부 오류 기록으로 감싼다(26.09.14 S1 · 1.4.0)."""
     restore, suppress = _install_signal_handlers()
-    ctx = {"out": None, "tmpdir": None}
+    ctx = {"out": None, "tmpdir": None, "model": None}
     try:
         return _main(argv, ctx)
     except (_Interrupted, KeyboardInterrupt) as exc:
@@ -677,7 +681,7 @@ def main(argv=None) -> int:
         if ctx["tmpdir"]:
             shutil.rmtree(ctx["tmpdir"], True)
         return _record_interrupt(ctx["out"],
-                                 getattr(exc, "signum", signal.SIGINT))
+                                 getattr(exc, "signum", signal.SIGINT), ctx["model"])
     except Exception as exc:
         # ⛔ [26.09.14 Eng 교차리뷰 → 1.4.0] 예기치 못한 예외는 traceback · exit 1 로 끝났고,
         #   `--out` 은 `in_progress` 로 남았다. exit 1 은 "파싱 실패" 와 겹쳐 원인을 가린다 →
@@ -691,10 +695,12 @@ def main(argv=None) -> int:
         # `--out` 이 없으면 다른 종료 경로처럼 기본 결과 폴더에 남긴다. 기록 자체가 또 실패해도
         #   원 예외의 종료 코드를 지킨다.
         try:
-            _write_out(ctx["out"], _result("internal_error", {
-                "error": "%s: %s" % (exc.__class__.__name__, str(exc)[:300]),
-                "note": "스크립트 내부 오류로 끝났다 — 리뷰가 수행되지 않았다. 통과가 아니다.",
-            }, EXIT_PARSE_FAILED), quiet=bool(ctx["out"]))
+            body = {"error": "%s: %s" % (exc.__class__.__name__, str(exc)[:300]),
+                    "note": "스크립트 내부 오류로 끝났다 — 리뷰가 수행되지 않았다. 통과가 아니다."}
+            if ctx["model"]:
+                body["model"] = ctx["model"]
+            _write_out(ctx["out"], _result("internal_error", body, EXIT_PARSE_FAILED,
+                                           model=ctx["model"]), quiet=bool(ctx["out"]))
         except Exception:
             pass
         return EXIT_PARSE_FAILED
@@ -745,6 +751,8 @@ def _main(argv, ctx: dict) -> int:
             }, exc.code), quiet=True)
         raise
     _apply_deprecated_flags(args)
+    # 중단 · 내부 오류 기록(`main`)도 판정 모델을 남기게 한다 — 인자 해석을 마친 뒤의 모든 결과에 있다.
+    ctx["model"] = args.model
 
     calls: List[dict] = []                # agy 호출마다 원인 기록 → `_meta.calls`
     state = {"scope": None}
@@ -760,6 +768,12 @@ def _main(argv, ctx: dict) -> int:
         if rc is None:
             rc = _MODE_EXIT[mode]
         meta.setdefault("model", args.model)
+        # 호환(1.4.x): 1.3.x 결과 파일은 agy 단계의 성공 · 실패 경로 모두 최상위 `model` 을 담았다.
+        #   ⛔ [1.4.0 --base main 교차리뷰 CRITICAL — 실측 확인] 처음엔 `reviewed` 경로에만 넣어,
+        #   timeout · quota · text_fallback 등에서 빠졌다 → 여기서 대입한다. `finish` 를 거치지 않는
+        #   중단 · 내부 오류는 `main` 이 `ctx["model"]` 로 같은 값을 남긴다(후속 교차리뷰 HIGH).
+        body = dict(body)
+        body["model"] = meta["model"]
         meta["scope"] = state["scope"]
         meta["calls"] = calls
         meta["elapsed_seconds"] = round(time.time() - started, 1)
@@ -930,10 +944,7 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("")
         _safe_print("   (종료코드 %d — 지적을 실측 검증한 뒤 반영하고 다시 돌릴 것)"
                     % rc)
-    body = dict(review)
-    # 호환(1.4.x): 1.3.x 결과 파일은 최상위 `model` 을 담았다. 값은 코드가 대입한다.
-    body["model"] = model
-    return finish("reviewed", body, rc, dropped_llm_keys=dropped or None)
+    return finish("reviewed", review, rc, dropped_llm_keys=dropped or None)
 
 
 # 이 원인이면 곧바로 끝낸다(재시도 없음). 빈 응답(`empty` · `tool_denied`)만 복구를 시도한다.

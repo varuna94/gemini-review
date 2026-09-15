@@ -40,8 +40,12 @@
 ### 호환
 
 - 0 · 1 · 2 · 3 · 5 · 6 · 130 · 143 의 뜻은 그대로다. **4 의 원인이 여럿으로 갈렸고**, 8 이 새로 생겼다.
-- 결과 JSON 최상위 `mode` · `model` 은 1.4.x 동안 `_meta` 와 같은 값으로 함께 쓴다(2.0 에서 뺀다).
-  최상위 `elapsed_seconds` 는 `_meta.elapsed_seconds`(전체 소요)와 `_meta.calls[].seconds` 로 옮겼다.
+- 결과 JSON 최상위 `mode` 는 모든 결과에, `model` 은 **인자 해석을 마친 뒤의 모든 결과**(중단 ·
+  내부 오류 포함)에 1.4.x 동안 `_meta` 와 같은 값으로 함께 쓴다(2.0 에서 뺀다). `model` 은 언제나 주 모델이다 — 1.3.x 의 `text_fallback` 은 진단 · 폴백
+  모델을 적을 수 있었다.
+- 1.3.x 의 다른 최상위 진단 키는 옮겼다: `elapsed_seconds` → `_meta.elapsed_seconds`(전체 소요),
+  `probe_seconds` · `fallback_probe_seconds` · `text_model` → `_meta.calls[]`(호출마다 단계 · 모델 ·
+  소요), `probed_models` 는 그대로다.
 - 최악 소요(`--timeout 10m`)는 약 27분이다(구조화 720 + 생존 확인 180 + 텍스트 720초).
   1.3.x 는 폴백 구조화 720초가 더 붙었다.
 
@@ -50,7 +54,7 @@
 - agy 호출이 `_run_agy` 한 곳으로 모였다(`--mode plan` · 하드 상한 · stdin 차단).
 - 원인 판정이 `_classify_run` 한 곳으로 모였다(구조화 · 생존 확인 · 텍스트 재시도가 같은 규칙).
 - 테스트: 결과 계약표의 모든 행을 가짜 agy 로 도는 매트릭스, 실측 출력으로 원인 분류,
-  cp949 도움말, 해석된 SHA, `--check`. 변이 검사 38개가 전부 기대한 이유로 빨개지는지 판마다 본다.
+  cp949 도움말, 해석된 SHA, `--check`. 변이 검사 41개가 전부 기대한 이유로 빨개지는지 판마다 본다.
 - CI(GitHub Actions): ubuntu · windows 에서 스위트, ubuntu 에서 변이 검사.
 
 ## 1.3.2 — 병합에서 사라진 가드 복구 (2026-09-14)

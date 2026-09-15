@@ -1076,8 +1076,13 @@ def _check_signal_handlers_restored(gr):
             problems.append("처리기 미복원")
         if not seen or os.path.exists(seen[0]):
             problems.append("임시 폴더를 즉시 지우지 않음")
-        if _read_json(out).get("mode") != "interrupted":
+        body = _read_json(out)
+        if body.get("mode") != "interrupted":
             problems.append("--out mode")
+        # 중단 기록도 인자 해석 뒤라 판정 모델을 남긴다(최상위 · _meta)
+        if body.get("model") != gr._DEFAULT_MODEL or (body.get("_meta") or {}).get("model") != gr._DEFAULT_MODEL:
+            problems.append("중단 기록의 model %r · _meta.model %r"
+                            % (body.get("model"), (body.get("_meta") or {}).get("model")))
         yield (None if not problems else
                "중단된 main() 뒤 정리 · 복원 실패: %s" % " · ".join(problems))
     finally:
@@ -1901,6 +1906,11 @@ def _check_result_contract_matrix(gr):
                 problems.append("_meta.exit_code %r" % meta.get("exit_code"))
             if meta.get("passed") is not (want_mode == "reviewed" and want_rc == 0):
                 problems.append("_meta.passed %r" % meta.get("passed"))
+            # 호환(1.4.x): 인자 해석을 마친 뒤의 **모든 최종 결과**에 최상위 `model` 이 있다 — 내부 오류도.
+            #   ⚠ [교차리뷰 MEDIUM] 처음엔 내부 오류 행을 이 검사에서 뺐다(finish 밖이라) — 빼지 않는다.
+            if body.get("model") != P or meta.get("model") != P:
+                problems.append("최상위 model %r · _meta.model %r (기대 %s)"
+                                % (body.get("model"), meta.get("model"), P))
             if log != want_calls:
                 problems.append("agy 호출 %r (기대 %r)" % (log, want_calls))
             judged = [m for st, m in log if st != "probe" and m != P]

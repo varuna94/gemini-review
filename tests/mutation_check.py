@@ -158,9 +158,14 @@ _MUTATIONS = [
      [("    review = dict((k, payload[k]) for k in _REVIEW_KEYS if k in payload)",
        "    review = dict(payload)")],
      "심은 결과 계약 키"),
-    ("판정 모델을 LLM 값으로", _G,
-     [('    body["model"] = model\n', '    body["model"] = payload.get("model", model)\n')],
+    ("판정 모델 기록이 LLM 값을 따름", _G,
+     [("    review = dict((k, payload[k]) for k in _REVIEW_KEYS if k in payload)",
+       "    review = dict(payload)"),
+      ('        body["model"] = meta["model"]', '        body.setdefault("model", meta["model"])')],
      "실제 판정 모델"),
+    ("실패 경로 최상위 model 누락(1.3.x 호환)", _G,
+     [('        body = dict(body)\n        body["model"] = meta["model"]', '        body = dict(body)')],
+     "최상위 model"),
     ("passed 가 종료 코드만 봄", _G,
      [('    return mode == "reviewed" and exit_code == EXIT_PASSED',
        "    return exit_code == EXIT_PASSED")],
@@ -197,6 +202,9 @@ _MUTATIONS = [
     ("변이 검사가 cp949 보호를 잃음", os.path.join("tests", "mutation_check.py"),
      [("    _make_stdout_safe()\n    base = tempfile.mkdtemp", "    base = tempfile.mkdtemp")],
      "cp949 에서 결과를 끝까지"),
+    ("중단 · 내부 오류 기록이 model 을 잃음", _G,
+     [('    ctx["model"] = args.model\n', "    pass\n")],
+     "중단 기록의 model"),
 ]
 
 

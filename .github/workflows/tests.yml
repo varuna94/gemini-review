@@ -1,0 +1,47 @@
+# [1.4.0 결정 7] 가드가 조용히 죽는 것을 사람이 스위트를 돌리는 데 기대지 않는다.
+#   - 스위트: ubuntu · windows (Windows 는 신호 · POSIX 권한 · bash 블록 검사를 건너뜀으로 알린다)
+#   - 변이 검사: ubuntu 만 — 몇몇 변이의 기대 문구가 POSIX 전용 검사에서 나온다.
+# ⚠ 실제 agy 는 부르지 않는다(인증이 없다). 테스트의 가짜 subprocess 가 진짜 프로세스를 막는다.
+# ⚠ Windows 러너는 한국어 로캘(cp949)이 아니다 — 실제 cp949 콘솔 확인은 TODOS.md 에 남아 있다.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: git identity (테스트가 임시 저장소에 커밋한다)
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+      - name: 동작 검사
+        run: python tests/test_gemini_review.py
+
+  mutation:
+    runs-on: ubuntu-latest
+    needs: suite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: git identity
+        run: |
+          git config --global user.email ci@example.com
+          git config --global user.name ci
+      - name: 변이 검사 (가드를 되돌리면 기대한 이유로 빨개지는가)
+        run: python tests/mutation_check.py

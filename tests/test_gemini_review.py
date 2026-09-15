@@ -2094,6 +2094,68 @@ def _check_check_mode(gr):
             _rmtree_sandbox(sandbox, sandbox)
 
 
+def _check_changelog_covers_version(gr):
+    """CHANGELOG.md 에 **지금 판**의 절이 있다 — 판을 올리면 달라진 점도 함께 적는다(1.4.0 DX-5).
+
+    ⚠ 1.4.0 은 종료 코드 · 결과 JSON · 플래그의 뜻을 바꾼다. 업그레이드한 사람이 무엇이 바뀌었는지
+      찾을 곳이 없으면 옛 해석(exit 0 = 통과 · 폴백 판정)으로 계속 읽는다.
+    """
+    path = os.path.join(_ROOT, "CHANGELOG.md")
+    if not os.path.isfile(path):
+        yield "CHANGELOG.md 가 없다"
+        return
+    heads = [ln for ln in _read_text(path).splitlines() if ln.startswith("## ")]
+    want = "## %s" % gr.__version__
+    yield (None if any(h == want or h.startswith(want + " ") for h in heads) else
+           "CHANGELOG.md 에 지금 판(%s) 절이 없다: %r" % (gr.__version__, heads[:3]))
+
+
+_MUTATION_PROBE = r'''
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mutation_check", sys.argv[1])
+mc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mc)
+mc._run_suite = lambda root, iso: (0, "")          # 스위트는 돌리지 않는다 — 출력 경로만 본다
+mc._MUTATIONS = [("없는 원문", mc._G, [("이 문자열은 대상 파일에 없다", "x")], None),
+                 ("지금 판 CHANGELOG 절", "CHANGELOG.md", mc._current_version_heading, None)]
+sys.exit(mc.main())
+'''
+
+
+def _check_mutation_check_is_robust(gr):
+    """변이 검사 스크립트가 **cp949 콘솔에서도 결과를 끝까지 찍고**, CHANGELOG 변이가 지금 판을 겨눈다.
+
+    ⛔ [1.4.0 교차리뷰 HIGH 둘 — 재현] ① 보호 없는 `print` 의 em dash 로 `PYTHONIOENCODING=cp949`
+      에서 적용 실패 첫 줄에서 죽었다. ② CHANGELOG 변이가 `## 1.4.0` 을 박아 두어 다음 판에서 거짓
+      실패가 날 자리였다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_mutprobe_")
+    try:
+        env = dict(os.environ, TMPDIR=sandbox, TEMP=sandbox, TMP=sandbox, PYTHONIOENCODING="cp949")
+        proc = subprocess.run([sys.executable, "-c", _MUTATION_PROBE,
+                               os.path.join(_HERE, "mutation_check.py")],
+                              env=env, capture_output=True, timeout=120, check=False)
+        text = proc.stdout.decode("cp949", "replace") + proc.stderr.decode("cp949", "replace")
+        # 끝까지 찍었다 = 요약("실패 2건")까지 나왔다. 적용 실패는 일부러 넣은 첫 변이 하나뿐이어야
+        #   한다 — 둘째(지금 판 CHANGELOG 절)가 적용 실패면 동적 원문이 틀린 것이다.
+        yield (None if "UnicodeEncodeError" not in text and "실패 2건" in text
+               and text.count("적용 실패") == 1 and "정확히 한 번 나오지 않는다" in text else
+               "변이 검사가 cp949 에서 결과를 끝까지 찍지 못했다(exit %s): %r" % (proc.returncode, text[-300:]))
+        pairs = _load_module(os.path.join(_HERE, "mutation_check.py"))._current_version_heading()
+        yield (None if pairs and pairs[0][0].startswith("## %s" % gr.__version__)
+               and "못 찾음" not in pairs[0][0] else
+               "CHANGELOG 변이가 지금 판(%s) 절을 겨누지 않는다: %r" % (gr.__version__, pairs))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _load_module(path):
+    spec = importlib.util.spec_from_file_location(os.path.splitext(os.path.basename(path))[0], path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -2132,6 +2194,8 @@ _BEHAVIOR_CHECKS = (
     _check_help_survives_cp949,
     _check_scope_records_resolved_shas,
     _check_check_mode,
+    _check_changelog_covers_version,
+    _check_mutation_check_is_robust,
 )
 
 

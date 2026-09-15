@@ -24,6 +24,7 @@
 import hashlib
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -188,7 +189,42 @@ _MUTATIONS = [
     ("점검이 래퍼 변화를 모델 무응답으로", _G,
      [("    if missing:\n        mark(\"모델 응답\", None,", "    if False:\n        mark(\"모델 응답\", None,")],
      "--check [래퍼 필드가 바뀜]"),
+    # ⚠ [1.4.0 교차리뷰 HIGH] 원문을 `## 1.4.0 …` 로 박아 두면 다음 판 절이 추가된 뒤에는 옛 절만
+    #   바꿔 **거짓 실패**가 난다 — 지금 판을 스크립트에서 읽어 그 절을 바꾼다(`_current_version_heading`).
+    ("CHANGELOG 에 지금 판이 없음", "CHANGELOG.md",
+     lambda: _current_version_heading(),
+     "CHANGELOG.md 에 지금 판"),
+    ("변이 검사가 cp949 보호를 잃음", os.path.join("tests", "mutation_check.py"),
+     [("    _make_stdout_safe()\n    base = tempfile.mkdtemp", "    base = tempfile.mkdtemp")],
+     "cp949 에서 결과를 끝까지"),
 ]
+
+
+def _current_version_heading():
+    """CHANGELOG.md 에서 **지금 판**(스크립트 `__version__`) 절 제목을 찾아 (원문, 변이) 쌍으로 돌려준다."""
+    with io.open(os.path.join(_REPO, _G), encoding="utf-8") as fh:
+        m = re.search(r'^__version__ = "([^"]+)"', fh.read(), re.M)
+    ver = m.group(1) if m else "?"
+    with io.open(os.path.join(_REPO, "CHANGELOG.md"), encoding="utf-8") as fh:
+        heads = [ln for ln in fh.read().splitlines()
+                 if ln == "## " + ver or ln.startswith("## %s " % ver)]
+    # 못 찾으면 원문이 없는 쌍을 돌려준다 → "정확히 한 번 나오지 않는다" 로 드러난다(조용히 넘기지 않는다).
+    head = heads[0] if len(heads) == 1 else "## %s (CHANGELOG 에서 못 찾음)" % ver
+    return [(head + "\n", head.replace("## " + ver, "## 0.0.0-mutated", 1) + "\n")]
+
+
+def _make_stdout_safe():
+    """cp949 콘솔에서 결과를 찍다 죽지 않게 한다(`tests/test_gemini_review.py` 와 같은 보호).
+
+    ⛔ [1.4.0 교차리뷰 HIGH — 재현] 이 스크립트는 보호 없이 `print` 로 em dash 를 찍어,
+      `PYTHONIOENCODING=cp949` 에서 적용 실패를 알리는 첫 줄에서 UnicodeEncodeError 로 죽었다 —
+      **무엇이 실패했는지 한 줄도 못 본다.** 1.3.2 부터 있던 결함이다.
+    """
+    for stream in ("stdout", "stderr"):
+        try:
+            getattr(sys, stream).reconfigure(errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
 
 
 def _run_suite(root, iso):
@@ -211,6 +247,7 @@ def _sha(path):
 
 
 def main():
+    _make_stdout_safe()
     base = tempfile.mkdtemp(prefix="gr_mutation_")
     iso = os.path.join(base, "i1", "i2", "iso_tmp")
     canaries = [os.path.join(d, "CANARY") for d in (
@@ -241,6 +278,8 @@ def main():
             return 1
 
         for name, rel, pairs, expect in _MUTATIONS:
+            if callable(pairs):
+                pairs = pairs()
             with io.open(os.path.join(_REPO, rel), encoding="utf-8") as fh:
                 src = fh.read()
             bad = [old for old, _ in pairs if src.count(old) != 1]

@@ -2949,6 +2949,522 @@ def _check_suite_state_is_sandboxed(gr):
            "스크립트가 해석한 상태 폴더가 샌드박스 밖이다: %r" % d)
 
 
+# ---------------------------------------------------------------------------
+# [1.6.0] 커밋 게이트 hook
+# ---------------------------------------------------------------------------
+
+_GATE_DIR = os.path.join(_ROOT, "plugins", "gemini-review", "hooks")
+_GATE_PY = os.path.join(_GATE_DIR, "commit_gate.py")
+_GATE_SH = os.path.join(_GATE_DIR, "commit-gate.sh")
+_HOOKS_JSON = os.path.join(_GATE_DIR, "hooks.json")
+
+
+def _load_gate():
+    spec = importlib.util.spec_from_file_location("commit_gate", _GATE_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Claude 가 실제로 쓰는 커밋 메시지 꼴. heredoc 본문에 따옴표 · 괄호 · git 명령 문구가 있다.
+_GATE_HEREDOC = ("git commit -m \"$(cat <<'EOF'\n"
+                 "fix: \"따옴표\" 와 ) 괄호, 그리고 git add -A 문구\n"
+                 "EOF\n)\"")
+
+# (명령, 기대 단계 요약 또는 "parse_error", 이 행이 지키는 것)
+_GATE_PARSE_CASES = [
+    (_GATE_HEREDOC, [("git", "commit")],
+     "heredoc 본문의 `\"` · `)` · git 문구가 명령 경계를 무너뜨리지 않는다(shlex 로는 깨진다)"),
+    ("git add -A && " + _GATE_HEREDOC, [("git", "add"), ("git", "commit")],
+     "스테이징과 커밋을 한 명령에 섞은 꼴을 순서대로 본다"),
+    ("git commit -F - <<'EOF'\nmsg: git add x\nEOF", [("git", "commit")],
+     "맨 바깥 heredoc 본문도 명령이 아니다"),
+    ("cd sub && git -C ../r commit -m x", [("cd", "sub"), ("git", "commit")],
+     "cd 와 -C 를 저장소 위치로 추적한다"),
+    ("bash -c 'git add . && git commit -m y'", [("git", "add"), ("git", "commit")],
+     "bash -c 안을 다시 해석한다"),
+    ("ls | xargs git add && git commit -m x", [("opaque", "add"), ("git", "commit")],
+     "git 이 첫 단어가 아닌 인덱스 변경도 잡는다"),
+    ("{ git commit -m x; } 2>&1 | tail -3", [("git", "commit")],
+     "묶음 · 리다이렉션 · 파이프"),
+    ("gh pr create --body \"run git commit here\"", [],
+     "평범한 인자 문자열 속 git commit 은 명령이 아니다(오탐이면 게이트가 매일 막는다)"),
+    ("git commit -m 'unterminated", "parse_error", "해석하지 못한 명령은 해석 실패로 알린다"),
+    ("sudo -k git commit -m x", [("git", "commit")],
+     "감싸는 명령마다 값을 받는 옵션이 다르다 — `sudo -k` 가 `git` 을 값으로 삼키면 커밋을 놓친다"),
+    ("timeout -k 5 10 git commit -m x", [("git", "commit")], "timeout 의 값 옵션과 시간 인자"),
+    ("env -S 'git add . && git commit -m x'", [("git", "add"), ("git", "commit")],
+     "env -S 문자열 안을 다시 해석한다"),
+]
+
+# (명령, 게이트가 판정할 폴더 — cwd 기준 상대 경로 · 절대 경로 · None=확정할 수 없음, 이 행이 지키는 것)
+#   ⛔ [26.09.16 교차 리뷰 HIGH · 실측 재현] `env -C <경로>` 를 벗기면서 경로를 버려, 게이트가 cwd 를
+#     보고 cwd 의 빈 스테이징으로 **검증 없이 통과**시켰다. 폴더를 **맞게** 짚는지까지 본다 —
+#     "확정했다" 만 보면 경로를 버리고 cwd 를 짚어도 통과한다.
+_GATE_DIR_CASES = [
+    ("git commit -m x", ".", "기본"),
+    ("cd sub && git commit -m x", "sub", "cd 는 따라간다"),
+    ("env -C /elsewhere git commit -m x", "/elsewhere", "env -C"),
+    ("env --chdir=/elsewhere git commit -m x", "/elsewhere", "env --chdir="),
+    ("env -C/elsewhere git -C sub commit -m x", "/elsewhere/sub", "env -C 붙여 쓴 꼴 · 이어지는 git -C"),
+    ("sudo -D /elsewhere git commit -m x", "/elsewhere", "sudo -D"),
+    ("env -C $X git commit -m x", None, "변수 경로"),
+    ("env -C /elsewhere bash -c 'git commit -m x'", None, "폴더를 바꾼 뒤의 셸 안"),
+    ("GIT_DIR=/elsewhere/.git git commit -m x", None, "GIT_DIR"),
+    ("GIT_DIR=/elsewhere/.git bash -c 'git commit -m x'", None, "GIT_DIR 대입 뒤의 셸 안"),
+    ("env GIT_DIR=/elsewhere/.git bash -c 'git commit -m x'", None, "env 대입 뒤의 셸 안"),
+    ("export GIT_DIR=/elsewhere/.git; bash -c 'git commit -m x'", None, "앞선 export 뒤의 셸 안"),
+    ("cd $REPO && git commit -m x", None, "변수 경로"),
+]
+
+# (git commit 인자, 문제가 있어야 하는가, 이 행이 지키는 것)
+_GATE_FORM_CASES = [
+    (["-m", "x"], False, "기본 꼴"),
+    (["-qm", "msg", "--author=A <a@b>"], False, "묶은 짧은 옵션의 마지막이 값을 받는다"),
+    (["--amend", "--no-edit"], False, "--amend"),
+    (["-m", "-a"], False, "메시지 값이 `-a` 여도 옵션이 아니다"),
+    (["-am", "x"], True, "-a 는 스테이징 밖의 변경까지 커밋한다"),
+    (["--all", "-m", "x"], True, "--all"),
+    (["--inc", "-m", "x"], True, "긴 옵션의 앞부분만 적어도 git 은 받는다(--include)"),
+    (["-m", "x", "a.py"], True, "경로 지정 커밋"),
+    (["-m", "x", "--", "a.py"], True, "-- 뒤 경로 지정"),
+    (["--pathspec-from-file=f"], True, "파일로 넘긴 경로 지정"),
+]
+
+# (git config 인자, 막아야 하는가, 이 행이 지키는 것)
+_GATE_CONFIG_CASES = [
+    (["--global", "gemini-review.gate", "false"], True, "끄기는 사용자 몫"),
+    (["--unset", "gemini-review.gate"], True, "지우기"),
+    (["--remove-section", "gemini-review"], True, "구역째 지우기"),
+    (["set", "Gemini-Review.Gate", "off"], True, "새 문법 · 키 대소문자"),
+    (["--global", "gemini-review.gate", "true"], False, "켜기는 막지 않는다"),
+    (["gemini-review.gate"], False, "값 없는 호출은 읽기다"),
+    (["--get", "gemini-review.gate"], False, "읽기"),
+    (["user.name", "x"], False, "다른 키"),
+]
+
+
+def _check_gate_parsing(gr):
+    """게이트가 셸 명령을 **실행 순서대로** 올바르게 나눈다(1.6.0)."""
+    del gr
+    cg = _load_gate()
+    for command, want, why in _GATE_PARSE_CASES:
+        try:
+            got = [(s["kind"], s.get("sub") or s.get("path")) for s in cg.analyze(command)]
+        except cg._ParseError:
+            got = "parse_error"
+        yield (None if got == want else
+               "게이트 명령 해석 [%s]: %r (기대 %r): %s" % (command[:40], got, want, why))
+    here = os.path.join(os.sep, "gate-cwd")
+    for command, rel, why in _GATE_DIR_CASES:
+        steps = cg.analyze(command)
+        at = [k for k, st in enumerate(steps) if st.get("sub") == "commit"]
+        got = cg._resolve_dir(steps, at[0], here) if at else "커밋 없음"
+        want = None if rel is None else os.path.normpath(os.path.join(here, rel))
+        yield (None if got == want else
+               "게이트 저장소 위치 [%s]: %r (기대 %r): %s" % (command, got, want, why))
+    for args, bad, why in _GATE_FORM_CASES:
+        got = cg.commit_form_problem(args) is not None
+        yield (None if got == bad else
+               "게이트 커밋 형태 [%s]: 문제=%s (기대 %s): %s" % (" ".join(args), got, bad, why))
+    for args, bad, why in _GATE_CONFIG_CASES:
+        got = cg.config_write_problem({"sub": "config", "args": args}) is not None
+        yield (None if got == bad else
+               "게이트 설정 보호 [%s]: 막음=%s (기대 %s): %s" % (" ".join(args), got, bad, why))
+
+
+# 자식 프로세스에서 **진짜 git 저장소**를 `--staged` 로 리뷰한다. agy 만 가짜다.
+# argv: 스크립트 경로 · 판정(approve · request_changes)
+_CHILD_GATE_REVIEW = r'''
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("gemini_review", sys.argv[1])
+gr = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gr)
+verdict = sys.argv[2]
+
+def fake_invoke(agy, model, args, root_, schema_path, prompt):
+    return gr._AgyRun(0, stdout=json.dumps({"verdict": verdict, "summary": "t", "findings": []}))
+
+gr._find_agy = lambda *a, **k: "agy"
+gr._invoke_schema = fake_invoke
+sys.exit(gr.main(["--staged"]))
+'''
+
+
+def _gate_env(sandbox):
+    """게이트 검사용 환경 — 상태 폴더와 **git 전역 설정**을 샌드박스로 돌린다.
+
+    ⚠ 개발자가 `git config --global gemini-review.gate true` 를 켜 두었으면 "꺼진 저장소" 행이
+      실제 전역 설정을 읽어 뒤집힌다. 전역 · 시스템 설정을 빈 파일로 막는다.
+    """
+    env = _state_env(sandbox)
+    gitconfig = os.path.join(sandbox, "gitconfig")
+    with io.open(gitconfig, "w", encoding="utf-8") as fh:
+        fh.write("[user]\n\tname = t\n\temail = t@example.com\n")
+    env.update(GIT_CONFIG_GLOBAL=gitconfig, GIT_CONFIG_NOSYSTEM="1")
+    env.pop("PYTHONIOENCODING", None)
+    return env
+
+
+def _gate_payload(cwd, command):
+    return json.dumps({"session_id": "t", "cwd": cwd, "hook_event_name": "PreToolUse",
+                       "tool_name": "Bash", "tool_input": {"command": command}}).encode("utf-8")
+
+
+def _gate_call(argv, cwd, command, env):
+    proc = subprocess.run(argv, input=_gate_payload(cwd, command), cwd=cwd, env=env,
+                          capture_output=True, timeout=120, check=False)
+    return proc.returncode, proc.stderr.decode("utf-8", "replace")
+
+
+def _check_gate_end_to_end(gr):
+    """**실제 리뷰가 남긴 결과**로 게이트가 커밋을 열고 닫는다(1.6.0).
+
+    ⛔ 게이트의 해시와 리뷰의 해시가 한 바이트라도 다르면 **모든 커밋이 영원히 막힌다** —
+      같은 함수를 쓴다는 주석만으로는 지켜지지 않는다. 진짜 저장소를 진짜 `main --staged` 로
+      리뷰하고, 그 결과 폴더를 게이트가 읽는다.
+    ⚠ 게이트는 자식 프로세스로 부른다. git 이 받는 환경은 `os.environ` 을 바꿔서는 안 바뀐다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+
+        def git(*args):
+            subprocess.run(["git"] + list(args), cwd=repo, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def write(name, text):
+            with io.open(os.path.join(repo, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        def review(verdict):
+            proc = subprocess.run([sys.executable, "-c", _CHILD_GATE_REVIEW,
+                                   os.path.abspath(_TARGET), verdict],
+                                  cwd=repo, env=env, capture_output=True, timeout=120, check=False)
+            return proc.returncode
+
+        gate = [sys.executable, _GATE_PY]
+        seen = []
+
+        def expect(label, command, want_rc, phrase=None):
+            rc, err = _gate_call(gate, repo, command, env)
+            seen.append(err)
+            ok = rc == want_rc and (phrase is None or phrase in err)
+            return None if ok else ("게이트 [%s]: exit %d (기대 %d%s): %s"
+                                    % (label, rc, want_rc,
+                                       " · 문구 %r" % phrase if phrase else "", err.strip()[:200]))
+
+        git("init", "-q")
+        write("a.py", "x = 1\n")
+        git("add", "a.py")
+        git("commit", "-qm", "init")
+        git("config", "gemini-review.gate", "true")
+
+        write("a.py", "x = 1\ny = '한글'\n")
+        git("add", "a.py")
+        yield expect("리뷰 전", "git commit -m x", 2, "리뷰가 없다")
+        yield expect("평범한 명령은 건드리지 않는다", "git status", 0)
+
+        rc = review("approve")
+        yield None if rc == 0 else "게이트 검사용 리뷰가 exit %d 로 끝났다(기대 0)" % rc
+        yield expect("통과 리뷰 뒤", "git commit -m x", 0)
+        yield expect("통과 리뷰 뒤 heredoc 메시지", _GATE_HEREDOC, 0)
+        yield expect("git add -A && git commit", "git add -A && git commit -m x", 2, "git add")
+        yield expect("-am", "git commit -am x", 2, "-a")
+        yield expect("해석 실패", "git commit -m 'x", 2, "해석하지 못했다")
+        yield expect("게이트 끄기 시도", "git config --global gemini-review.gate false", 2,
+                     "사용자가 직접")
+
+        write("a.py", "x = 1\ny = '한글'\nz = 3\n")
+        git("add", "a.py")
+        yield expect("리뷰 뒤 스테이징이 바뀜", "git commit -m x", 2, "스테이징이 바뀌었다")
+        yield expect("--dry-run 은 커밋하지 않는다", "git commit --dry-run", 0)
+
+        rc = review("approve")
+        yield expect("바뀐 스테이징을 다시 통과시킨 뒤", "git commit -m x", 0)
+        # ⛔ 같은 내용의 결과가 여럿이면 **가장 최근 것**이 판정한다 — 통과 뒤 다시 돌려
+        #   request_changes 가 나왔다면 옛 통과로 커밋을 열어 주지 않는다.
+        rc = review("request_changes")
+        yield None if rc == 5 else "request_changes 리뷰가 exit %d 로 끝났다(기대 5)" % rc
+        yield expect("통과 뒤 같은 내용이 request_changes", "git commit -m x", 2, "지적")
+
+        git("config", "gemini-review.gate", "false")
+        write("a.py", "x = 2\n")
+        git("add", "a.py")
+        yield expect("꺼진 저장소", "git commit -m x", 0)
+        git("config", "gemini-review.gate", "true")
+        git("reset", "-q")
+        git("checkout", "--", "a.py")
+        yield expect("스테이징이 비었다(--amend 메시지만)", "git commit --amend -m x", 0)
+
+        # ⛔ 막힌 모델에게 우회 방법을 알려 주지 않는다(`--allow-sensitive` 안내를 뺀 것과 같은 이유).
+        leaks = [e for e in seen if re.search(r"--no-verify|--unset|gate\s+false|\.gate\s*=", e)]
+        yield (None if not leaks else
+               "게이트가 막으면서 우회 방법을 알려 준다: %s" % leaks[0].strip()[:200])
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_scopes_results_to_repo(gr):
+    """같은 변경이라도 **다른 저장소의 결과**로 커밋을 열거나 닫지 않는다(1.6.0).
+
+    ⛔ [26.09.16 교차 리뷰 CRITICAL · 실측 재현] 결과 폴더는 저장소들이 함께 쓰고, 같은 파일에 같은
+      변경을 하면 저장소가 달라도 diff 해시가 같다. 해시만 대조하면 B 의 최근 request_changes 가 A 의
+      통과를 덮어 A 를 막고, 거꾸로 A 의 통과가 B 를 연다.
+    """
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    cg = _load_gate()
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_xr_")
+    try:
+        env = _gate_env(sandbox)
+        repos = {}
+        for name in ("A", "B"):
+            repo = repos[name] = os.path.join(sandbox, name)
+            os.makedirs(repo)
+            for args in (["init", "-q"], ["add", "a.py"], ["commit", "-qm", "init"],
+                         ["config", "gemini-review.gate", "true"], ["add", "a.py"]):
+                if args == ["add", "a.py"]:
+                    with io.open(os.path.join(repo, "a.py"), "a", encoding="utf-8", newline="\n") as fh:
+                        fh.write("x = 1\n")
+                subprocess.run(["git"] + args, cwd=repo, env=env, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        same = len({gr._sha256_hex(gr._diff_bytes(gr._collect_diff(r, None, None, True)[0]))
+                    for r in repos.values()})
+        yield (None if same == 1 else
+               "전제가 깨졌다: 두 저장소의 같은 변경이 다른 해시다(%d개) — 이 검사가 아무것도 안 본다" % same)
+        for name, verdict, want in (("A", "approve", 0), ("B", "request_changes", 5)):
+            proc = subprocess.run([sys.executable, "-c", _CHILD_GATE_REVIEW,
+                                   os.path.abspath(_TARGET), verdict],
+                                  cwd=repos[name], env=env, capture_output=True, timeout=120,
+                                  check=False)
+            yield (None if proc.returncode == want else
+                   "저장소 %s 리뷰가 exit %d (기대 %d)" % (name, proc.returncode, want))
+        for name, want in (("A", cg.EXIT_ALLOW), ("B", cg.EXIT_BLOCK)):
+            rc, err = _gate_call([sys.executable, _GATE_PY], repos[name], "git commit -m x", env)
+            yield (None if rc == want else
+                   "게이트가 다른 저장소의 결과로 판정했다 [저장소 %s]: exit %d (기대 %d): %s"
+                   % (name, rc, want, err.strip()[:160]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_unknown_target_is_strict(gr):
+    """대상 저장소를 따라갈 수 있으면 **그 저장소의** 설정을, 확정할 수 없으면 현재 폴더와 전역 가운데
+    **엄한 쪽**을 본다(1.6.0).
+
+    ⛔ [26.09.16 교차 리뷰 CRITICAL · 실측 재현] 처음엔 늘 cwd 설정을 봤다. 게이트가 꺼진 폴더에서
+      `env -C <켜진 저장소> git commit` · `cd $REPO && git commit` 을 하면 리뷰 없이 통과했다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_ut_")
+    try:
+        env = _gate_env(sandbox)
+        global_on = os.path.join(sandbox, "gitconfig-on")
+        with io.open(global_on, "w", encoding="utf-8") as fh:
+            fh.write("[user]\n\tname = t\n\temail = t@example.com\n[gemini-review]\n\tgate = true\n")
+        target, here = os.path.join(sandbox, "target"), os.path.join(sandbox, "here")
+        for repo, value in ((target, "true"), (here, "false")):
+            os.makedirs(repo)
+            for args in (["init", "-q"], ["config", "gemini-review.gate", value]):
+                subprocess.run(["git"] + args, cwd=repo, env=env, check=True)
+        with io.open(os.path.join(target, "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        subprocess.run(["git", "add", "a.py"], cwd=target, env=env, check=True)
+        gate = [sys.executable, _GATE_PY]
+        rows = [
+            ("꺼진 폴더에서 env -C 로 켜진 저장소", "env -C %s git commit -m x" % target, env, 2),
+            ("꺼진 폴더에서 git -C 로 켜진 저장소", "git -C %s commit -m x" % target, env, 2),
+            ("전역으로 켰고 대상을 확정할 수 없다", "cd $REPO && git commit -m x",
+             dict(env, GIT_CONFIG_GLOBAL=global_on), 2),
+            ("어디에도 켜지 않았고 대상을 확정할 수 없다", "cd $REPO && git commit -m x", env, 0),
+        ]
+        for label, command, row_env, want in rows:
+            rc, err = _gate_call(gate, here, command, row_env)
+            yield (None if rc == want else
+                   "게이트 대상 판정 [%s]: exit %d (기대 %d): %s" % (label, rc, want, err.strip()[:160]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_fails_closed(gr):
+    """게이트 자신이 죽어도 **켜진 저장소에서는 막는다**(1.6.0).
+
+    ⛔ hook 이 예외로 exit 1 을 내면 Claude Code 는 막지 않고 넘긴다. 결함이 조용한 통과가 된다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    cg = _load_gate()
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_fc_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, env=env, check=True)
+        payload = _gate_payload(repo, "git commit -m x").decode("utf-8")
+
+        def boom(command, cwd):
+            raise RuntimeError("일부러 낸 결함")
+
+        for value, want in (("true", cg.EXIT_BLOCK), ("false", cg.EXIT_ALLOW)):
+            subprocess.run(["git", "config", "gemini-review.gate", value], cwd=repo, env=env,
+                           check=True)
+            with _patched(cg, "evaluate", boom), \
+                    _patched(cg, "gate_state", lambda where: "on" if value == "true" else "off"):
+                rc, message = cg.run(payload)
+            yield (None if rc == want else
+                   "게이트 내부 오류 [gate=%s]: exit %d (기대 %d)" % (value, rc, want))
+            if want == cg.EXIT_BLOCK:
+                yield (None if "내부 오류" in message else
+                       "게이트 내부 오류로 막았는데 원인을 적지 않았다: %r" % message)
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_shell_entry(gr):
+    """셸 진입점: 빠른 경로 · 파이썬 없음 · 게이트 스크립트 비정상 종료(1.6.0).
+
+    ⛔ hook 규약에서 막는 코드는 2 뿐이다. 파이썬을 못 찾거나 게이트가 다른 코드로 죽으면
+      Claude Code 가 **통과시키므로**, 셸이 켜진 저장소에서 2 로 바꿔야 한다.
+    ⚠ PATH 를 샌드박스의 bin 하나로 좁혀 "파이썬이 없는 기기" 를 만든다. Windows 는 Git Bash
+      위치가 러너마다 달라 여기서는 돌리지 않는다(요약 줄에 남긴다).
+    """
+    del gr
+    bash, git_bin = shutil.which("bash"), shutil.which("git")
+    if os.name == "nt" or not bash or not git_bin:
+        yield _Skip("셸 진입점은 POSIX bash 에서만 확인한다(Windows 실측은 TODOS)")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_sh_")
+    try:
+        env = _gate_env(sandbox)
+        bindir = os.path.join(sandbox, "bin")
+        os.makedirs(bindir)
+        for tool in ("cat", "dirname", "git"):
+            os.symlink(shutil.which(tool), os.path.join(bindir, tool))
+        env["PATH"] = bindir
+        repos = {}
+        for name, value in (("on", "true"), ("off", "false")):
+            repos[name] = os.path.join(sandbox, name)
+            os.makedirs(repos[name])
+            subprocess.run([git_bin, "init", "-q"], cwd=repos[name], env=env, check=True)
+            subprocess.run([git_bin, "config", "gemini-review.gate", value], cwd=repos[name],
+                           env=env, check=True)
+        shim = [bash, _GATE_SH]
+
+        # 입력의 `cwd` 는 샌드박스 경로다. 저장소 이름이 `gemini-review` 여도(CI 작업 폴더)
+        #   빠른 경로가 열려야 한다 — 그 이름을 cwd 에 넣어 확인한다.
+        named = os.path.join(sandbox, "gemini-review")
+        os.makedirs(named)
+        subprocess.run([git_bin, "init", "-q"], cwd=named, env=env, check=True)
+        subprocess.run([git_bin, "config", "gemini-review.gate", "true"], cwd=named, env=env,
+                       check=True)
+        rc, err = _gate_call(shim, named, "ls -la", env)
+        yield (None if rc == 0 else
+               "셸 빠른 경로: 게이트와 무관한 명령인데 exit %d (파이썬을 찾으러 갔다): %s"
+               % (rc, err[:120]))
+        rc, err = _gate_call(shim, repos["on"], "git config --global Gemini-Review.Gate false", env)
+        yield (None if rc == 2 else
+               "셸 빠른 경로: 대소문자를 바꾼 게이트 설정 명령을 건너뛰었다(exit %d)" % rc)
+        rc, err = _gate_call(shim, repos["on"], "git commit -m x", env)
+        yield (None if rc == 2 and "파이썬" in err else
+               "셸 진입점 [파이썬 없음 · 켜진 저장소]: exit %d (기대 2): %s" % (rc, err[:160]))
+        rc, err = _gate_call(shim, repos["off"], "git commit -m x", env)
+        yield (None if rc == 0 else
+               "셸 진입점 [파이썬 없음 · 꺼진 저장소]: exit %d (기대 0): %s" % (rc, err[:160]))
+        global_on = os.path.join(sandbox, "gitconfig-on")
+        with io.open(global_on, "w", encoding="utf-8") as fh:
+            fh.write("[gemini-review]\n\tgate = true\n")
+        rc, err = _gate_call(shim, repos["off"], "git commit -m x",
+                             dict(env, GIT_CONFIG_GLOBAL=global_on))
+        yield (None if rc == 2 else
+               "셸 진입점 [파이썬 없음 · 저장소는 끄고 전역은 켬]: exit %d (기대 2 — 해석하지 못한 명령은 "
+               "대상을 모르므로 엄한 쪽): %s" % (rc, err[:160]))
+
+        # 게이트 스크립트가 0 · 2 가 아닌 코드로 죽는 사본
+        broken = os.path.join(sandbox, "broken")
+        os.makedirs(broken)
+        shutil.copy(_GATE_SH, os.path.join(broken, "commit-gate.sh"))
+        with io.open(os.path.join(broken, "commit_gate.py"), "w", encoding="utf-8") as fh:
+            fh.write("import sys\nsys.exit(3)\n")
+        os.symlink(sys.executable, os.path.join(bindir, "python3"))
+        rc, err = _gate_call([bash, os.path.join(broken, "commit-gate.sh")], repos["on"],
+                             "git commit -m x", env)
+        yield (None if rc == 2 and "종료 코드 3" in err else
+               "셸 진입점 [게이트 스크립트 비정상 종료]: exit %d (기대 2): %s" % (rc, err[:160]))
+        # 진짜 게이트까지 이어지는가(파이썬 있음 · 리뷰 없음 → 파이썬이 막는다)
+        with io.open(os.path.join(repos["on"], "a.py"), "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+        subprocess.run([git_bin, "add", "a.py"], cwd=repos["on"], env=env, check=True)
+        rc, err = _gate_call(shim, repos["on"], "git commit -m x", env)
+        yield (None if rc == 2 and "리뷰가 없다" in err else
+               "셸 진입점 → 게이트 스크립트 연결: exit %d (기대 2 · 리뷰 없음): %s" % (rc, err[:160]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_hook_wiring(gr):
+    """`hooks.json` 이 게이트를 **실제로** 걸고, 게이트는 git 말고는 실행하지 않는다(1.6.0).
+
+    ⛔ 매처 오타 하나면 게이트가 조용히 안 돈다 — 스위트는 게이트 모듈만 부르므로 초록이다.
+    ⛔ 게이트는 커밋마다 돈다. agy 를 부르면 사용자 모르게 코드가 전송된다 — 프로세스는
+      `_git_rc` 한 곳에서 git 으로만 띄운다.
+    """
+    del gr
+    try:
+        hooks = _read_json(_HOOKS_JSON).get("hooks") or {}
+    except Exception as exc:
+        yield "hooks.json 을 읽지 못했다: %r" % exc
+        return
+    entries = [h for group in hooks.get("PreToolUse") or [] if group.get("matcher") == "Bash"
+               for h in group.get("hooks") or []]
+    wired = [h for h in entries if h.get("type") == "command"
+             and "${CLAUDE_PLUGIN_ROOT}/hooks/commit-gate.sh" in (h.get("command") or "")]
+    yield (None if len(wired) == 1 else
+           "hooks.json 에 PreToolUse(Bash) → commit-gate.sh 연결이 하나가 아니다: %r" % entries)
+    yield (None if os.path.isfile(_GATE_SH) and os.path.isfile(_GATE_PY) else
+           "hooks.json 이 가리키는 게이트 파일이 없다")
+    yield (None if not set(hooks) - {"PreToolUse"} else
+           "hooks.json 에 게이트 밖의 hook 이 있다: %r" % sorted(set(hooks) - {"PreToolUse"}))
+
+    with io.open(_GATE_PY, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    bad = []
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(func):
+            if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                    and node.value.id in ("subprocess", "os")
+                    and (node.value.id == "subprocess" and node.attr not in ("SubprocessError",)
+                         or node.attr in ("system", "popen") or node.attr.startswith(("exec", "spawn")))
+                    and func.name != "_git_rc"):
+                bad.append("%s 안의 %s.%s" % (func.name, node.value.id, node.attr))
+    yield (None if not bad else "게이트가 _git_rc 밖에서 프로세스를 띄운다: %s" % ", ".join(sorted(set(bad))))
+    runs = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute) and n.func.attr == "run"
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"]
+    first = [n.args[0] for n in runs if n.args]
+    only_git = all(isinstance(a, ast.BinOp) and isinstance(a.left, ast.List) and a.left.elts
+                   and isinstance(a.left.elts[0], ast.Constant) and a.left.elts[0].value == "git"
+                   or isinstance(a, ast.BinOp) and isinstance(a.left, ast.List) and a.left.elts
+                   and type(a.left.elts[0]).__name__ == "Str" and a.left.elts[0].s == "git"
+                   for a in first)
+    yield (None if runs and only_git else
+           "게이트의 프로세스 실행이 git 으로 시작하지 않는다(%d곳)" % len(runs))
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -2992,6 +3508,13 @@ _BEHAVIOR_CHECKS = (
     _check_isolation_guard_without_end_lineno,
     _check_suite_state_is_sandboxed,
     _check_every_check_is_registered,
+    _check_gate_parsing,
+    _check_gate_end_to_end,
+    _check_gate_scopes_results_to_repo,
+    _check_gate_unknown_target_is_strict,
+    _check_gate_fails_closed,
+    _check_gate_shell_entry,
+    _check_gate_hook_wiring,
     _check_utc_helpers,
     _check_classify_run,
     _check_small_parsers,

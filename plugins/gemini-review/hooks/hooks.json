@@ -1,0 +1,17 @@
+{
+  "description": "gemini-review 커밋 게이트: git config gemini-review.gate 가 true 인 저장소에서, 스테이징과 같은 내용으로 통과한 리뷰가 없으면 Claude 의 git commit 을 막는다. 기본은 꺼짐.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/commit-gate.sh\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

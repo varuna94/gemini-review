@@ -114,6 +114,20 @@ _MUTATIONS = [
      [("    try:\n        stamp = time.mktime(local.timetuple())\n    except (OverflowError, ValueError):\n        return None\n    return datetime(1970, 1, 1) + timedelta(seconds=stamp)",
        "    return local")],
      "_file_time [Asia/Seoul]"),
+    # [1.5.1] 스위트 전체 상태 샌드박스 — 격리를 잊은 검사가 있어도 진짜 폴더에 못 쓰게 하는 보호막.
+    ("스위트 상태 샌드박스를 안 건다", os.path.join("tests", "test_gemini_review.py"),
+     [("    _isolate_suite_state()                # ⛔ 검사보다 먼저 — 위 docstring 참조\n", "")],
+     "스위트 상태 샌드박스가 걸려 있지 않다"),
+    # [1.5.1] 격리 가드가 헬퍼 구간을 `end_lineno` 로 잰다 — 3.12 에서는 똑같고 3.7 에서만 죽는다.
+    ("격리 가드가 end_lineno 에 기댄다", os.path.join("tests", "test_gemini_review.py"),
+     [("            helper_nodes.update(id(c) for c in ast.walk(n))\n",
+       "            helper_nodes.update(id(c) for c in ast.walk(n)\n"
+       "                                if getattr(c, \"lineno\", 0) <= (getattr(n, \"end_lineno\", None) or n.lineno))\n")],
+     "end_lineno 가 없는 파이썬(3.7)"),
+    # [1.5.1] 정의만 있고 등록 안 된 검사(죽은 검사)를 잡는 가드 — 실제로 한 번 새었다.
+    ("검사 하나를 실행 목록에서 뺀다", os.path.join("tests", "test_gemini_review.py"),
+     [("    _check_hms_parser,\n", "")],
+     "정의만 있고 실행 목록에 없는 검사"),
     ("상대 경로 agy 허용", _G,
      [("        if not cand or not os.path.isabs(cand):\n            continue\n",
        "        if not cand:\n            continue\n")],

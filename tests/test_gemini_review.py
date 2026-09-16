@@ -13,6 +13,7 @@
 
 import contextlib
 import ast
+import atexit
 import datetime
 import hashlib
 import importlib.util
@@ -410,7 +411,7 @@ def _check_agy_calls_are_plan_mode(gr):
         #   같은 판별(`_mode_values`)로 본다.
         for cmd in calls:
             yield (None if _mode_values(cmd) == ["plan"] else
-                   "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다 — "
+                   "%s 의 agy 명령에 `--mode plan` 이 정확히 한 번 있지 않다: "
                    "Gemini 가 파일을 수정할 수 있게 된다: %s" % (name, cmd[:6]))
 
 
@@ -504,7 +505,7 @@ def _check_find_agy_skips_relative_candidates(gr):
                 _patched(gr, "_AGY_CANDIDATES", [relative]):
             got = gr._find_agy()
         yield (None if got is None else
-               "_find_agy 가 상대 경로 %r 를 골랐다 — 저장소가 심은 파일이 "
+               "_find_agy 가 상대 경로 %r 를 골랐다: 저장소가 심은 파일이 "
                "agy 대신 실행된다" % got)
         # 대조군 — 없으면 '언제나 None' 으로 고쳐도 위 검사가 통과한다.
         with _patched(os, "environ", empty_path), \
@@ -580,7 +581,7 @@ def _check_tmpdir_removed_after_real_run(gr):
             return
         left = os.path.join(tmp, dirs[0])
         yield (None if not os.path.exists(left) else
-               "프로세스가 끝났는데 diff 를 담은 임시 디렉터리 %s 가 남았다 — "
+               "프로세스가 끝났는데 diff 를 담은 임시 디렉터리 %s 가 남았다: "
                "저장소 코드가 평문으로 쌓인다" % dirs[0])
         gone = escaped()
         yield (None if not gone else
@@ -724,7 +725,7 @@ def _main_inprocess(gr, argv, sandbox, payload=None):
             "verdict": "approve", "summary": "t", "findings": []}
         return gr._AgyRun(0, stdout=json.dumps(body))
 
-    env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+    env = _state_env(sandbox)
     with _contained(gr, sandbox), _quiet(), \
             _patched(os, "environ", env), \
             _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
@@ -776,7 +777,7 @@ def _check_out_never_keeps_stale_result(gr):
             rc, _ = _main_inprocess(gr, ["--out", out2], sandbox)
         mode = _read_json(out2).get("mode")
         yield (None if rc == 2 and mode == "in_progress" else
-               "최종 기록이 실패했는데 exit %s · 파일 mode %r — 통과로 읽힐 수 있다"
+               "최종 기록이 실패했는데 exit %s · 파일 mode %r: 통과로 읽힐 수 있다"
                % (rc, mode))
 
         # ⚠ 아래는 환경에 따라 건너뛴다 — 환경과 무관한 검사는 **이 앞에** 둘 것
@@ -798,7 +799,7 @@ def _check_out_never_keeps_stale_result(gr):
         finally:
             os.chmod(locked, 0o700)
         yield (None if rc == 2 and not calls else
-               "쓸 수 없는 --out 인데 리뷰가 진행됐다(exit %s · agy 호출 %d회) — "
+               "쓸 수 없는 --out 인데 리뷰가 진행됐다(exit %s · agy 호출 %d회): "
                "종료 코드와 파일이 다른 이야기를 한다" % (rc, len(calls)))
 
     finally:
@@ -894,7 +895,7 @@ def _check_default_result_dir_is_private(gr):
 
     stray = []                             # 코드가 샌드박스 밖에 쓴 **파일**(폴더는 안 지움)
     try:
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         with _quiet(), _patched(os, "environ", env), \
                 _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
             path = gr._write_out(None, _STALE_APPROVE)
@@ -912,7 +913,7 @@ def _check_default_result_dir_is_private(gr):
         locked = os.path.join(state3, "gemini-review")
         os.makedirs(locked)
         os.chmod(locked, 0o500)
-        env = dict(os.environ, XDG_STATE_HOME=state3)
+        env = _state_env(sandbox, "state3")
         with _quiet(), _patched(os, "environ", env), \
                 _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
             path = gr._write_out(None, _STALE_APPROVE)
@@ -928,7 +929,7 @@ def _check_default_result_dir_is_private(gr):
         os.makedirs(state2)
         os.makedirs(elsewhere)
         os.symlink(elsewhere, os.path.join(state2, "gemini-review"))
-        env = dict(os.environ, XDG_STATE_HOME=state2)
+        env = _state_env(sandbox, "state2")
         with _quiet(), _patched(os, "environ", env), \
                 _patched(gr.tempfile, "mkdtemp", mkdtemp_in_sandbox):
             path = gr._write_out(None, _STALE_APPROVE)
@@ -1001,8 +1002,7 @@ def _check_signal_cleans_up(gr):
         sandbox = tempfile.mkdtemp(prefix="gr_test_sig_")
         try:
             tmp, escaped = _nested_tmp(sandbox)
-            env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp,
-                       XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = dict(_state_env(sandbox), TMPDIR=tmp, TEMP=tmp, TMP=tmp)
             env.pop("PYTHONIOENCODING", None)
             out = os.path.join(sandbox, "out.json")
             pidfile = os.path.join(sandbox, "agy.pid")
@@ -1113,7 +1113,7 @@ def _check_signal_handlers_restored(gr):
             return gr._AgyRun(0, stdout=json.dumps({"verdict": "approve", "summary": "t", "findings": []}))
 
         out = os.path.join(sandbox, "o2.json")
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                 _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
                 _patched(gr, "_git_root", lambda start: sandbox), \
@@ -1185,7 +1185,7 @@ def _check_sigterm_during_sigint_cleanup(gr):
 
     try:
         out = os.path.join(sandbox, "o.json")
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         rc = None
         try:
             with _quiet(), _patched(os, "environ", env), \
@@ -1360,7 +1360,7 @@ def _check_agy_error_is_not_empty_response(gr):
         try:
             calls = []
             out = os.path.join(sandbox, "o.json")
-            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = _state_env(sandbox)
             with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                     _patched(gr, "subprocess", _fake_subprocess(calls, **proc)), \
                     _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
@@ -1372,7 +1372,7 @@ def _check_agy_error_is_not_empty_response(gr):
             agy_calls = [c for c in calls if c and c[0] == "agy"]
             mode = _read_json(out).get("mode")
             yield (None if rc == 2 and len(agy_calls) == 1 and mode == want_mode else
-                   "%s: exit %s · agy 호출 %d회 · mode %r(기대: exit 2 · 1회 · %s — 생존 확인 · "
+                   "%s: exit %s · agy 호출 %d회 · mode %r(기대: exit 2 · 1회 · %s: 생존 확인 · "
                    "폴백 없음)" % (label, rc, len(agy_calls), mode, want_mode))
         finally:
             _rmtree_sandbox(sandbox, sandbox)
@@ -1443,6 +1443,145 @@ def _check_git_failures_are_exit_2(gr):
             yield None
         except BaseException as other:
             yield "%s: _git 이 RuntimeError 가 아니라 %r 을 냈다(→ traceback · exit 1)" % (label, other)
+
+
+# 상태 격리를 **일부러** 직접 적는 자리에 다는 표식. 문구가 흩어지면 예외가 조용히
+#   사라지거나 엉뚱한 줄이 통과한다 — 한 곳에 둔다.
+_ISOLATION_EXCEPTION = "격리 예외:"
+
+
+def _check_state_isolation_helper_is_used(gr):
+    """상태 폴더를 쓰는 검사는 **전부 `_state_env` 를 거친다**(1.5.0 Eng H5) — **보조 장치**다.
+
+    ⚠ 이 가드는 **흔한 실수를 일찍 알리는 린트**이지 보호막이 아니다. 구문으로는 모든 우회를
+      막을 수 없고, 격리를 아예 잊은 코드는 보이지도 않는다. 실제 보호는
+      `_isolate_suite_state` 가 맡는다. 이 가드의 완전성을 넓히는 지적은 받지 않는다
+      (`.gemini-review.md` 「이미 검증하고 기각한 지적」).
+
+    ⛔ [26.09.16 CI 실측] 이 가드가 없을 때 매트릭스가 `XDG_STATE_HOME` 만 덮었고, Windows
+      잡에서 쿼터 행이 뒤 행을 단락시켜 빨개졌다 — **리눅스에서는 영영 재현되지 않는다.**
+      한 자리만 빠져도 그 검사는 개발자의 진짜 `%LOCALAPPDATA%` 를 건드린다.
+    ⚠ 검사 대상은 이 파일 자신이다. `XDG_STATE_HOME=` 을 직접 적은 자리는 헬퍼 안과,
+      "없는 폴더" 를 일부러 가리키는 한 자리뿐이어야 한다.
+    """
+    del gr
+    with io.open(__file__, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    # ⚠ 구문 트리로 본다. 문자열 검색으로 하면 **이 검사 자신의 비교문**과 문서 문자열이
+    #   걸려 영영 빨간불이 된다(처음에 그렇게 짰다가 실제로 그랬다).
+    # ⛔ [26.09.16 교차리뷰 HIGH] 좁게 짜서 세 번 샜다. 각각 실측으로 확인하고 넓혔다.
+    #   1. `LOCALAPPDATA` 가 함께 있으면 통과시켰다 → 손으로 적은 호출이 우회했고 예외 검사가
+    #      도달 횟수 0 인 죽은 코드가 됐다.
+    #   2. 함수 안의 `Call` 만 봤다 → **모듈 수준 대입**과 `env["XDG_STATE_HOME"] = …`
+    #      **첨자 할당**을 둘 다 놓쳤다.
+    #   3. 호출의 첫 줄 근처만 봤다 → 여러 줄로 나뉜 호출에서 표식을 못 찾아 **오탐**이 났다.
+    want = "XDG_STATE_HOME"
+    tree = ast.parse("\n".join(lines))
+    # ⛔ [26.09.16 교차리뷰 CRITICAL] 구간을 `end_lineno` 로 재면 **3.7 에서 스위트가 죽는다** —
+    #   그 속성은 3.8 에 생겼다. 없으면 헬퍼 구간이 `def` 한 줄로 줄어 헬퍼 자신의 `dict(...)`
+    #   가 적발됐다(끝 줄 번호를 지운 트리로 실측 재현). 줄 번호가 아니라 **노드 자체**로 뺀다.
+    helper_nodes = set()
+    for n in ast.walk(tree):
+        if (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name == "_state_env"):
+            helper_nodes.update(id(c) for c in ast.walk(n))
+
+    def _marked(node):
+        """호출 · 대입이 **걸친 전체 구간**과 바로 앞줄에서 표식을 찾는다.
+
+        ⚠ 여러 줄로 나뉜 호출의 `lineno` 는 여는 괄호가 있는 첫 줄이다. 첫 줄 근처만 보면
+          포매터가 줄을 나눈 순간 표식이 안 보여 **고칠 수 없는 빨간불**이 된다.
+        ⚠ 끝 줄은 하위 노드의 가장 큰 `lineno` 다 — `end_lineno` 는 3.7 에 없다(위와 같은 이유).
+        """
+        first = max(1, node.lineno - 1)
+        last = max(getattr(c, "lineno", 0) for c in ast.walk(node))
+        return any(_ISOLATION_EXCEPTION in lines[i - 1]
+                   for i in range(first, min(last, len(lines)) + 1))
+
+    stray = []
+    for node in ast.walk(tree):
+        if id(node) in helper_nodes or not hasattr(node, "lineno"):
+            continue                      # 헬퍼 자신이 유일하게 직접 적는 자리다
+        hit = False
+        if isinstance(node, ast.Call):
+            hit = want in [kw.arg for kw in node.keywords if kw.arg]
+        elif isinstance(node, ast.Subscript):
+            # `env["XDG_STATE_HOME"] = …` — 상수 첨자만 본다.
+            # ⛔ [26.09.16 교차리뷰 HIGH] `node.slice.value` 를 문자열로 보면 **3.8 에서 죽는다** —
+            #   3.8 은 첨자를 `ast.Index(value=Constant)` 로 한 겹 싸서 `.value` 가 노드다. 선언한
+            #   지원 범위(3.7+)인데 CI 는 3.9 부터라 안 보였다. 하위 트리에서 문자열 상수를 찾으면
+            #   `Index` 유무와 3.7 의 `ast.Str` 까지 버전과 무관하게 같다.
+            hit = any((isinstance(c, ast.Constant) and c.value == want)
+                      or (type(c).__name__ == "Str" and getattr(c, "s", None) == want)
+                      for c in ast.walk(node.slice))
+        elif isinstance(node, ast.Constant):
+            hit = False                   # 문자열 리터럴 자체는 세지 않는다
+        if not hit or _marked(node):
+            continue
+        stray.append("%d: %s" % (node.lineno, lines[node.lineno - 1].strip()[:70]))
+    stray = sorted(set(stray))
+    yield (None if not stray else
+           "상태 격리가 `_state_env` 를 안 쓰는 자리가 있다(Windows 에서 격리가 사라진다): %s"
+           % " · ".join(stray))
+
+    # ⛔ 헬퍼 **자신**이 반쪽이면 모든 자리가 함께 무너진다. 위 검사는 "헬퍼를 거쳤는가" 만
+    #   보므로 그것을 못 잡는다(실측으로 확인했다) — 계약을 직접 본다.
+    # ⚠ **상대 경로**를 준다. 이미 절대 경로인 입력을 주면 `os.path.abspath` 가 빠져도
+    #   통과해 그 계약이 시험되지 않는다(실측으로 확인했다).
+    env = _state_env(os.path.join("gr-probe-relative", "x"))
+    missing = [k for k in ("XDG_STATE_HOME", "LOCALAPPDATA") if k not in env]
+    yield (None if not missing else
+           "_state_env 가 %s 를 덮지 않는다: 모든 검사의 격리가 함께 사라진다"
+           % ", ".join(missing))
+    same = env.get("XDG_STATE_HOME") == env.get("LOCALAPPDATA")
+    yield (None if same else
+           "_state_env 의 두 값이 다르다: 플랫폼마다 다른 폴더를 보게 된다 (%r vs %r)"
+           % (env.get("XDG_STATE_HOME"), env.get("LOCALAPPDATA")))
+    yield (None if os.path.isabs(env.get("XDG_STATE_HOME") or "") else
+           "_state_env 가 상대 경로를 돌려준다: `_state_dir` 이 규약대로 무시하고 진짜 홈으로 "
+           "떨어져 격리가 조용히 사라진다")
+
+
+def _check_isolation_guard_without_end_lineno(gr):
+    """위 가드가 **`end_lineno` 가 없는 구문 트리**에서도 같은 판정을 낸다(1.5.1).
+
+    ⛔ [26.09.16 교차리뷰 CRITICAL] 선언한 지원 범위는 3.7+ 인데 `end_lineno` 는 3.8 에 생겼다.
+      가드가 그것으로 헬퍼 구간을 재자 3.7 에서 헬퍼 자신이 적발돼 스위트가 무조건 죽었다.
+      CI 에는 3.7 이 없으므로 **모든 노드에서 그 속성을 지운 트리**로 같은 상황을 만든다.
+    """
+    real = ast.parse
+
+    def _parse_without_end(*args, **kwargs):
+        tree = real(*args, **kwargs)
+        for node in ast.walk(tree):
+            for attr in ("end_lineno", "end_col_offset"):
+                if hasattr(node, attr):
+                    delattr(node, attr)
+        return tree
+
+    ast.parse = _parse_without_end
+    try:
+        failures = [m for m in _check_state_isolation_helper_is_used(gr) if m]
+    finally:
+        ast.parse = real
+    yield (None if not failures else
+           "end_lineno 가 없는 파이썬(3.7)에서 격리 가드가 다르게 판정한다: %s" % failures[0])
+
+
+def _state_env(sandbox, name="state"):
+    """상태 폴더를 샌드박스로 돌리는 환경. **두 이름을 함께** 덮는다.
+
+    ⛔ [26.09.16 CI 실측] `XDG_STATE_HOME` 만 덮으면 **Windows 에서 격리가 없다** — 그쪽은
+      `%LOCALAPPDATA%` 를 쓰므로 모든 검사가 개발자의 **진짜** 상태 파일을 공유한다.
+      실제로 결과 계약 매트릭스의 쿼터 행이 쓴 차단을 뒤 행이 읽어 단락시켰고, Windows
+      잡만 빨개졌다(순서 의존 실패). 리눅스에서는 영영 재현되지 않는다.
+    ⚠ 두 값 모두 **절대 경로**여야 한다. `_state_dir` 은 상대 `XDG_STATE_HOME` 을 규약대로
+      무시하고 진짜 홈으로 떨어진다 — 그러면 격리가 조용히 사라진다.
+    """
+    # ⚠ `assert` 로 지키지 않는다 — `python -O` 에서 통째로 사라진다. 절대 경로 계약은
+    #   `_check_state_isolation_helper_is_used` 가 검사로 확인한다.
+    root = os.path.abspath(os.path.join(sandbox, name))
+    return dict(os.environ, XDG_STATE_HOME=root, LOCALAPPDATA=root)
 
 
 def _git_cmd(cwd, *args):
@@ -1613,7 +1752,7 @@ def _check_sensitive_block_does_not_invite_bypass(gr):
     sandbox = tempfile.mkdtemp(prefix="gr_test_sens_")
     buf = io.StringIO()
     try:
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         with _contained(gr, sandbox), contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()), \
                 _patched(os, "environ", env), \
                 _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
@@ -1657,7 +1796,7 @@ def _check_early_exits_record_final_mode(gr):
         sandbox = tempfile.mkdtemp(prefix="gr_test_early_")
         try:
             out = os.path.join(sandbox, "o.json")
-            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = _state_env(sandbox)
 
             def collect(*a, **k):
                 if isinstance(diff, Exception):
@@ -1781,14 +1920,14 @@ def _check_skill_powershell_block_shape(gr):
              if ln.strip() and not ln.strip().startswith("#")]
     last = lines[-1].split("#", 1)[0].strip() if lines else ""
     yield (None if last == "exit $LASTEXITCODE" else
-           "PowerShell 블록의 마지막 줄이 `exit $LASTEXITCODE` 가 아니다(%r) — exit 5 가 0 으로 "
+           "PowerShell 블록의 마지막 줄이 `exit $LASTEXITCODE` 가 아니다(%r): exit 5 가 0 으로 "
            "삼켜진다" % last)
     staged = [ln for ln in lines if "--staged" in ln]
     yield (None if len(staged) == 1 and staged[0].startswith("& $PY $GR ") else
            "PowerShell 블록의 `--staged` 가 스크립트 호출 줄 하나에만 있지 않다: %r" % staged)
     yield (None if "마지막 줄의 인자" not in _read_text(_SKILL_MD) else
-           "SKILL.md 가 '마지막 줄의 인자' 를 바꾸라고 한다 — PowerShell 블록의 마지막 줄은 exit 다")
-    yield _Skip("PowerShell 실행 블록은 돌리지 않았다(모양만 확인) — Windows 실측은 TODOS")
+           "SKILL.md 가 '마지막 줄의 인자' 를 바꾸라고 한다: PowerShell 블록의 마지막 줄은 exit 다")
+    yield _Skip("PowerShell 실행 블록은 돌리지 않았다(모양만 확인): Windows 실측은 TODOS")
 
 
 def _check_version_line_is_whole(gr):
@@ -1828,7 +1967,7 @@ def _check_empty_response_names_its_cause(gr):
                 ("text", "m"): gr._AgyRun(0, stdout="판정: approve"),
             })
             out = os.path.join(sandbox, "o.json")
-            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = _state_env(sandbox)
             with _contained(gr, sandbox), contextlib.redirect_stdout(buf), \
                     contextlib.redirect_stderr(io.StringIO()), _patched(os, "environ", env), \
                     _fake_repo(gr, sandbox), _patched(gr, "_run_agy", fake):
@@ -1950,7 +2089,7 @@ def _check_result_contract_matrix(gr):
             out = os.path.join(sandbox, "o.json")
             argv = ["--out", out] + (extra if extra[:1] == ["--model"] else base + extra)
             fake, log = _agy_script(gr, dict(responses))
-            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = _state_env(sandbox)
             with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                     _fake_repo(gr, sandbox, diff or _FAKE_DIFF), _patched(gr, "_run_agy", fake):
                 rc = gr.main(argv)
@@ -2029,7 +2168,7 @@ def _check_diff_bytes_and_hash(gr):
             return gr._AgyRun(0, stdout=_wrap(json.dumps(
                 {"verdict": "approve", "summary": "t", "findings": []})))
 
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                 _fake_repo(gr, sandbox, (diff_text, ["x.py"])), \
                 _patched(gr, "_invoke_schema", capture):
@@ -2037,7 +2176,7 @@ def _check_diff_bytes_and_hash(gr):
         meta = (_read_json(out).get("_meta") or {})
         raw = seen.get("bytes")
         if raw is None:
-            yield "리뷰가 changes.diff 를 쓰지 않았다 — 해시를 확인할 수 없다"
+            yield "리뷰가 changes.diff 를 쓰지 않았다: 해시를 확인할 수 없다"
         else:
             yield (None if b"\r\n" not in raw else "changes.diff 에 CRLF 가 들어갔다")
             yield (None if raw == gr._diff_bytes(diff_text) else
@@ -2090,7 +2229,7 @@ def _check_quota_short_circuit(gr):
         try:
             out = os.path.join(sandbox, "o.json")
             state_root = os.path.join(sandbox, "state")
-            env = dict(os.environ, XDG_STATE_HOME=state_root, LOCALAPPDATA=state_root)
+            env = _state_env(sandbox)
             fake, log = _agy_script(gr, {("quota_query", P): gr._AgyRun(0, stdout=quota_raw)})
             with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                     _fake_repo(gr, sandbox, _FAKE_DIFF), _patched(gr, "_run_agy", fake):
@@ -2122,7 +2261,7 @@ def _check_quota_short_circuit(gr):
     try:
         out = os.path.join(sandbox, "o.json")
         state_root = os.path.join(sandbox, "state")
-        env = dict(os.environ, XDG_STATE_HOME=state_root, LOCALAPPDATA=state_root)
+        env = _state_env(sandbox)
         fake, log = _agy_script(gr, {})
         with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                 _fake_repo(gr, sandbox, ("diff --git a/.env b/.env\n+K=v\n", [".env"])), \
@@ -2161,7 +2300,7 @@ def _check_quota_state_failure_keeps_exit_code(gr):
         try:
             out = os.path.join(sandbox, "o.json")
             state_root = os.path.join(sandbox, "state")
-            env = dict(os.environ, XDG_STATE_HOME=state_root, LOCALAPPDATA=state_root)
+            env = _state_env(sandbox)
             fake, _ = _agy_script(gr, {("structured", P): QUOTA})
 
             def explode(*a, **k):
@@ -2222,7 +2361,7 @@ def _check_call_usage_recorded(gr):
 
     # 픽스처가 실물과 갈라지면 `--check` 의 usage 검사가 헛것을 지킨다.
     yield (None if set(json.loads(_wrap("x"))["usage"]) == set(gr._KNOWN_USAGE_KEYS) else
-           "_wrap 의 usage 키가 _KNOWN_USAGE_KEYS 와 다르다 — 둘 중 하나가 낡았다")
+           "_wrap 의 usage 키가 _KNOWN_USAGE_KEYS 와 다르다: 둘 중 하나가 낡았다")
 
 
 def _check_utc_helpers(gr):
@@ -2240,16 +2379,16 @@ def _check_utc_helpers(gr):
     yield (None if back is not None and abs((back - now).total_seconds()) < 5 else
            "_utc_now_str → _parse_utc 왕복이 어긋난다: %r → %r" % (text, back))
     yield (None if back is not None and back.tzinfo is None else
-           "_parse_utc 가 naive 가 아니다 — 비교에서 TypeError 가 난다")
+           "_parse_utc 가 naive 가 아니다: 비교에서 TypeError 가 난다")
     # 지금 + 60초는 아직 안 지났다(로컬 시각을 섞으면 KST 에서 뒤집힌다).
     later = (now + datetime.timedelta(seconds=60)).strftime(gr._UTC_FMT)
     yield (None if gr._parse_utc(later) > gr._utc_now() else
-           "기록 직후 만료 판정이 뒤집혔다 — 시각 규약이 섞였다")
+           "기록 직후 만료 판정이 뒤집혔다: 시각 규약이 섞였다")
     # ⛔ [Eng H4] **시간대를 강제해서** 본다. 안 그러면 `_utc_now()` 를 로컬로 바꿔도 이 파일의
     #   모든 비교가 같이 움직여 통과하고, CI 가 UTC 라 **영원히 빨개지지 않는다.**
     #   `/quota` 의 `reset_time` 처럼 밖에서 오는 UTC 와 비교할 때만 9시간이 어긋난다.
     if not hasattr(time, "tzset"):
-        yield _Skip("time.tzset 이 없다(Windows) — 시간대 강제 검사는 건너뛴다")
+        yield _Skip("time.tzset 이 없다(Windows): 시간대 강제 검사는 건너뛴다")
     else:
         old_tz = os.environ.get("TZ")
         try:
@@ -2258,7 +2397,7 @@ def _check_utc_helpers(gr):
             true_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             drift = abs((gr._utc_now() - true_utc).total_seconds())
             yield (None if drift < 5 else
-                   "_utc_now() 가 UTC 가 아니다 — 로컬 시각과 %.0f초 어긋난다" % drift)
+                   "_utc_now() 가 UTC 가 아니다: 로컬 시각과 %.0f초 어긋난다" % drift)
         finally:
             if old_tz is None:
                 os.environ.pop("TZ", None)
@@ -2311,8 +2450,7 @@ def _check_stats(gr):
 
         ns = types.SimpleNamespace
         args = ns(stats=True, stats_dir=None, since="14d")
-        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"),
-                   LOCALAPPDATA=os.path.join(sandbox, "state"))
+        env = _state_env(sandbox)
         spawned = []
         out = io.StringIO()
         with _patched(os, "environ", env), \
@@ -2323,7 +2461,7 @@ def _check_stats(gr):
             except Exception as exc:      # noqa: BLE001
                 # 깨진 파일 하나가 예외로 전체 집계를 죽이는 것이 이 검사가 막는 실패다.
                 # 잡아서 문구로 남긴다 — 예외로 끝나면 무엇이 깨졌는지 읽히지 않는다.
-                yield ("--stats 가 예외로 끝났다 — 파일 하나로 전체 집계를 잃는다: %s: %s"
+                yield ("--stats 가 예외로 끝났다: 파일 하나로 전체 집계를 잃는다: %s: %s"
                        % (exc.__class__.__name__, str(exc)[:120]))
                 return
         text = out.getvalue()
@@ -2347,6 +2485,7 @@ def _check_stats(gr):
         # 폴더가 없으면 **만들지 않고** 0건으로 끝난다 — 빈 폴더를 만들면 "0건" 이 조용해진다.
         empty = os.path.join(sandbox, "empty")
         args2 = ns(stats=True, stats_dir=None, since="14d")
+        # 격리 예외: 없는 폴더를 **일부러** 가리켜 "폴더가 없으면 0건" 을 본다.
         env2 = dict(os.environ, XDG_STATE_HOME=empty, LOCALAPPDATA=empty)
         with _patched(os, "environ", env2):
             out = io.StringIO()
@@ -2363,7 +2502,7 @@ def _check_stats(gr):
     #   `--since` 필터가 통째로 어긋난다. CI 는 UTC 라 이 회귀가 **영원히 빨개지지 않는다** —
     #   시간대를 강제해서 본다.
     if not hasattr(time, "tzset"):
-        yield _Skip("time.tzset 이 없다(Windows) — 파일명 시각 변환 검사는 건너뛴다")
+        yield _Skip("time.tzset 이 없다(Windows): 파일명 시각 변환 검사는 건너뛴다")
     else:
         old_tz = os.environ.get("TZ")
         try:
@@ -2394,7 +2533,7 @@ def _check_stats(gr):
         state_root = os.path.join(sandbox, "state")
         d = os.path.join(state_root, "gemini-review")
         os.makedirs(d, mode=0o700)
-        env = dict(os.environ, XDG_STATE_HOME=state_root, LOCALAPPDATA=state_root)
+        env = _state_env(sandbox)
         with _quiet(), _patched(os, "environ", env):
             gr.main(["--stats"])
         yield (None if not os.listdir(d) else
@@ -2565,7 +2704,7 @@ def _check_scope_records_resolved_shas(gr):
             # 실제 증상은 이것이다 — 호출부가 try 밖이라 `main` 의 포괄 핸들러가 잡아
             # `internal_error`(exit 1) 가 된다. rebase · bisect 중 리뷰가 아예 안 돈다.
             got = None
-            yield ("detached HEAD 에서 예외가 샜다 — 리뷰가 exit 1 로 죽는다: %r" % (exc,))
+            yield ("detached HEAD 에서 예외가 샜다: 리뷰가 exit 1 로 죽는다: %r" % (exc,))
         if got is not None:
             yield (None if got.get("branch") is None and got.get("repo") == sandbox else
                    "detached HEAD 에서 branch 를 None 으로 두지 않았다: %r" % got)
@@ -2626,7 +2765,7 @@ def _check_check_mode(gr):
                 return fake(agy_, model, extra, cwd, timeout_spec, default_secs)
 
             out = os.path.join(sandbox, "o.json")
-            env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+            env = _state_env(sandbox)
             with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
                     _patched(gr, "_find_agy", lambda *a, **k: agy), \
                     _patched(gr, "_git", lambda *a, **k: "git version test"), \
@@ -2720,6 +2859,96 @@ def _load_module(path):
     return mod
 
 
+_SUITE_STATE = None
+
+
+def _isolate_suite_state():
+    """스위트 전체의 상태 폴더를 샌드박스로 돌린다. **검사보다 먼저** 부른다.
+
+    ⛔ [26.09.16] 이것이 상태 격리의 **실제 보호막**이다. 검사마다 `_state_env` 를 쓰게 하는
+      정적 가드는 흔한 실수를 일찍 알리는 보조 장치일 뿐이다 — 딕셔너리 리터럴, 위치 인자,
+      문자열 이어 붙이기, `os.putenv` 등 우회는 끝이 없고, 무엇보다 **격리를 아예 잊은 코드**는
+      어떤 구문 검사로도 보이지 않는다. 교차 리뷰가 회차마다 새 우회를 찾아 루프가 됐다.
+    → 프로세스 환경 자체를 샌드박스로 바꿔 두면, 검사가 무엇을 잊든 **진짜 사용자 폴더에는
+      쓸 수 없다.** 자식 프로세스도 `dict(os.environ, …)` 로 이것을 물려받는다.
+    ⚠ 두 이름을 **같은 한 폴더**로 둔다. 격리를 잊은 검사끼리 상태를 공유하게 되어, Windows 에서만
+      나던 순서 의존 실패(쿼터 행이 뒤 행을 단락)가 **리눅스에서도 드러난다.**
+    """
+    global _SUITE_STATE
+    root = os.path.abspath(tempfile.mkdtemp(prefix="gr_suite_state_"))
+    # 격리 예외: 스위트 전체 샌드박스 자신이다 — 이것이 보호막이다.
+    os.environ["XDG_STATE_HOME"] = root
+    os.environ["LOCALAPPDATA"] = root
+    _SUITE_STATE = root
+
+    def _cleanup(path=root):
+        if os.path.basename(path).startswith("gr_suite_state_"):
+            shutil.rmtree(path, True)
+    atexit.register(_cleanup)
+    return root
+
+
+def _check_every_check_is_registered(gr):
+    """정의한 검사 함수는 **전부 실행 목록에 등록**되고, 모듈 수준 이름은 **한 번만** 정의된다.
+
+    ⛔ [26.09.16 교차리뷰 HIGH] 빼기로 한 가드를 지우는 편집이 문자열 위치를 거꾸로 잡아, 함수는
+      남고 등록만 빠진 **죽은 검사**가 됐다(CHANGELOG 는 "뺐다" 고 적었다). 같은 편집이 상수
+      블록을 **두 번** 넣었는데 파이썬은 중복 정의를 허용해 스위트가 초록이었다. 이 저장소가 두 번
+      당한 계열(죽은 가드, `.gemini-review.md` 5번)이다 — 정의가 있으면 돈다고 믿지 않는다.
+    ⚠ 뒤에 정의한 함수가 앞의 같은 이름을 **조용히 덮는** 것도 같이 막는다. 검사 이름이 겹치면
+      먼저 쓴 검사가 영영 돌지 않는다.
+    """
+    del gr
+    with io.open(__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    names, assigned, registered = [], [], None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.append(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned.append(target.id)
+                    if target.id == "_BEHAVIOR_CHECKS" and isinstance(node.value, ast.Tuple):
+                        registered = {e.id for e in node.value.elts if isinstance(e, ast.Name)}
+    yield (None if registered is not None else "_BEHAVIOR_CHECKS 목록을 찾지 못했다")
+    if registered is None:
+        return
+    unregistered = sorted(n for n in set(names) if n.startswith("_check_") and n not in registered)
+    yield (None if not unregistered else
+           "정의만 있고 실행 목록에 없는 검사가 있다(죽은 검사): %s" % ", ".join(unregistered))
+    missing = sorted(n for n in registered if n not in set(names))
+    yield (None if not missing else "실행 목록에 있는데 정의가 없다: %s" % ", ".join(missing))
+    seen, dup = set(), set()
+    for n in names + assigned:
+        if n in seen:
+            dup.add(n)
+        seen.add(n)
+    yield (None if not dup else
+           "모듈 수준 이름이 두 번 정의됐다(뒤의 것이 앞의 것을 조용히 덮는다): %s"
+           % ", ".join(sorted(dup)))
+
+
+def _check_suite_state_is_sandboxed(gr):
+    """스위트 전체 상태 샌드박스가 **실제로 걸려 있다**(1.5.1).
+
+    ⛔ 이 보호막이 빠지면 격리를 잊은 검사가 개발자의 진짜 `~/.local/state` ·
+      `%LOCALAPPDATA%` 를 건드린다. 흔한 경로에서는 모든 검사가 `_state_env` 를 쓰므로
+      빠져도 다른 검사가 빨개지지 않는다 — 그래서 **걸려 있는지를 직접** 본다.
+    """
+    root = _SUITE_STATE
+    yield (None if root and os.path.basename(root).startswith("gr_suite_state_") else
+           "스위트 상태 샌드박스가 걸려 있지 않다: main 이 _isolate_suite_state 를 부르지 않았다")
+    if not root:
+        return
+    for key in ("XDG_STATE_HOME", "LOCALAPPDATA"):
+        yield (None if os.environ.get(key) == root else
+               "%s 가 스위트 샌드박스가 아니다: %r" % (key, os.environ.get(key)))
+    d, _status = gr._state_dir(create=False)
+    yield (None if d and os.path.realpath(d).startswith(os.path.realpath(root) + os.sep) else
+           "스크립트가 해석한 상태 폴더가 샌드박스 밖이다: %r" % d)
+
+
 _BEHAVIOR_CHECKS = (
     _check_retry_as_text_rejects_failed_agy,
     _check_agy_calls_are_plan_mode,
@@ -2759,6 +2988,10 @@ _BEHAVIOR_CHECKS = (
     _check_quota_state_failure_keeps_exit_code,
     _check_hms_parser,
     _check_stats,
+    _check_state_isolation_helper_is_used,
+    _check_isolation_guard_without_end_lineno,
+    _check_suite_state_is_sandboxed,
+    _check_every_check_is_registered,
     _check_utc_helpers,
     _check_classify_run,
     _check_small_parsers,
@@ -2772,6 +3005,7 @@ _BEHAVIOR_CHECKS = (
 
 def main():
     _make_stdout_safe()
+    _isolate_suite_state()                # ⛔ 검사보다 먼저 — 위 docstring 참조
     gr = _load()
     fails = []
 

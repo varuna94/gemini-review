@@ -1,6 +1,6 @@
 ---
 name: gemini-review
-version: 1.5.0
+version: 1.5.1
 description: Gemini 3.x 로 변경분을 교차 리뷰한다 (Antigravity CLI). 커밋 직전 독립 리뷰어로 쓴다. 같은 모델이 짠 코드를 같은 모델이 리뷰할 때 생기는 맹점을 잡는다.
 triggers:
   - gemini review

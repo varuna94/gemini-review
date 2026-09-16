@@ -3282,9 +3282,12 @@ def _check_gate_unknown_target_is_strict(gr):
             fh.write("x = 1\n")
         subprocess.run(["git", "add", "a.py"], cwd=target, env=env, check=True)
         gate = [sys.executable, _GATE_PY]
+        # ⛔ [26.09.16 Windows CI 실측] 경로를 **따옴표로 감싼다.** Windows 임시 경로(`C:\Users\…`)를
+        #   그대로 넣으면 bash 규칙대로 백슬래시가 이스케이프로 사라져 경로가 깨진다 — 실제 bash 도
+        #   같게 읽으므로 게이트가 아니라 검사가 틀렸다. 리눅스에서는 경로에 백슬래시가 없어 안 보였다.
         rows = [
-            ("꺼진 폴더에서 env -C 로 켜진 저장소", "env -C %s git commit -m x" % target, env, 2),
-            ("꺼진 폴더에서 git -C 로 켜진 저장소", "git -C %s commit -m x" % target, env, 2),
+            ("꺼진 폴더에서 env -C 로 켜진 저장소", "env -C '%s' git commit -m x" % target, env, 2),
+            ("꺼진 폴더에서 git -C 로 켜진 저장소", "git -C '%s' commit -m x" % target, env, 2),
             ("전역으로 켰고 대상을 확정할 수 없다", "cd $REPO && git commit -m x",
              dict(env, GIT_CONFIG_GLOBAL=global_on), 2),
             ("어디에도 켜지 않았고 대상을 확정할 수 없다", "cd $REPO && git commit -m x", env, 0),

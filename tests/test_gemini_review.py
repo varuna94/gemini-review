@@ -13,6 +13,8 @@
 
 import contextlib
 import ast
+import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -456,6 +458,21 @@ def _check_run_agy_contract(gr):
         run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
     yield (None if run.rc is None and run.hard_timeout and run.hard_limit == want else
            "하드 상한 초과를 구분하지 못한다: rc %r · hard_timeout %r" % (run.rc, run.hard_timeout))
+    # [1.5.0 C1] 하드 상한에 걸려도 부분 출력을 버리지 않는다. 버리면 쿼터가 timeout 으로
+    # 뭉쳐 기록이 남지 않고 다음 실행이 같은 720초를 또 태운다(609초 실측).
+    with _patched(gr, "subprocess", _fake_subprocess(
+            [], raises=subprocess.TimeoutExpired(
+                ["agy"], want, output=b' {"status":"ERROR"} ', stderr=b" partial err \n"))):
+        run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
+    yield (None if run.hard_timeout and run.stdout == '{"status":"ERROR"}'
+           and run.stderr == "partial err" else
+           "하드 상한의 부분 출력을 버렸다(C1): stdout %r · stderr %r" % (run.stdout, run.stderr))
+    # 아무것도 못 읽은 경우(stdout · stderr 가 None)에도 죽지 않는다.
+    with _patched(gr, "subprocess", _fake_subprocess(
+            [], raises=subprocess.TimeoutExpired(["agy"], want))):
+        run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
+    yield (None if run.stdout == "" and run.stderr == "" else
+           "부분 출력이 없을 때 빈 문자열이 아니다: %r · %r" % (run.stdout, run.stderr))
     with _patched(gr, "subprocess", _fake_subprocess(
             [], raises=OSError(8, "Exec format error"))):
         run = gr._run_agy("agy", "m", ["-p", "x"], ".", "90s", 600)
@@ -1918,6 +1935,16 @@ def _check_result_contract_matrix(gr):
                 problems.append("주 모델이 아닌 모델로 리뷰를 요청했다: %r" % judged)
             if want_calls and want_mode != "internal_error" and len(meta.get("calls") or []) != len(log):
                 problems.append("_meta.calls %d건 (호출 %d회)" % (len(meta.get("calls") or []), len(log)))
+            # [1.5.0 A2 · Eng H1] diff 가 있었던 **모든** 종료 경로에 해시가 남는다.
+            #   호출부마다 넘기는 방식이면 언젠가 한 갈래에서 빠진다 — 최상위 `model` 이 그랬다.
+            #   민감 경로 차단 행에도 남아야 "무엇을 보려 했는가" 가 집계에서 안 사라진다.
+            had_diff = bool((diff or _FAKE_DIFF)[0].strip())
+            if had_diff and not meta.get("diff_sha256"):
+                problems.append("diff 가 있는데 _meta.diff_sha256 이 없다")
+            if not had_diff and meta.get("diff_sha256"):
+                problems.append("diff 가 없는데 _meta.diff_sha256 이 있다: %r" % meta.get("diff_sha256"))
+            if not meta.get("written_at"):
+                problems.append("_meta.written_at 이 없다")
             if more and not problems:
                 msg = more(body)
                 if msg:
@@ -1925,6 +1952,105 @@ def _check_result_contract_matrix(gr):
             yield (None if not problems else "계약표 [%s]: %s" % (label, " · ".join(problems)))
         finally:
             _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_diff_bytes_and_hash(gr):
+    """`_meta.diff_sha256` 은 **agy 에 보낸 파일의 바이트**와 같고, 줄바꿈이 바뀌지 않는다(1.5.0 A2).
+
+    ⛔ 텍스트 모드로 쓰면 Windows 에서 `\\n` 이 `\\r\\n` 이 되어 **같은 변경의 해시가 기기마다
+      달라진다.** 커밋 게이트 hook 이 이 해시로 "이 diff 는 이미 리뷰했다" 를 판단할 것이므로,
+      기기마다 다른 값이 나오면 그 판단이 조용히 무너진다.
+    ⚠ 해시 대상은 `git diff` 의 원본 바이트가 아니라 **스크립트가 재인코딩한 UTF-8** 이다.
+      hook 을 `git diff | sha256sum` 으로 짜면 안 맞는다 — 비UTF-8 픽스처로 그 규칙을 고정한다.
+    """
+    # 헬퍼 두 개가 같은 바이트를 낸다(파일 쓰기와 해시가 갈라지지 않는다).
+    for label, text in [("아스키", "diff --git a/x b/x\n+x\n"),
+                        ("한글", "diff --git a/가 b/가\n+값\n"),
+                        ("비UTF-8 대체문자", "diff --git a/x b/x\n+\udcff\n")]:
+        data = gr._diff_bytes(text)
+        yield (None if isinstance(data, bytes) else "_diff_bytes [%s] 가 bytes 가 아니다" % label)
+        yield (None if b"\r\n" not in data else "_diff_bytes [%s] 에 CRLF 가 들어갔다" % label)
+        want = hashlib.sha256(data).hexdigest()
+        yield (None if gr._sha256_hex(data) == want else "_sha256_hex [%s] 가 다르다" % label)
+
+    # 실제 실행: 파일에 쓴 바이트의 sha256 과 `_meta.diff_sha256` 이 같아야 한다.
+    sandbox = tempfile.mkdtemp(prefix="gr_test_hash_")
+    try:
+        out = os.path.join(sandbox, "o.json")
+        diff_text = "diff --git a/x.py b/x.py\n+x = 1\n+# 한글 주석\n"
+        seen = {}
+
+        def capture(agy, model, args, root_, schema_path, prompt):
+            path = os.path.join(os.path.dirname(schema_path), "changes.diff")
+            with open(path, "rb") as fh:
+                seen["bytes"] = fh.read()
+            return gr._AgyRun(0, stdout=_wrap(json.dumps(
+                {"verdict": "approve", "summary": "t", "findings": []})))
+
+        env = dict(os.environ, XDG_STATE_HOME=os.path.join(sandbox, "state"))
+        with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                _fake_repo(gr, sandbox, (diff_text, ["x.py"])), \
+                _patched(gr, "_invoke_schema", capture):
+            gr.main(["--out", out])
+        meta = (_read_json(out).get("_meta") or {})
+        raw = seen.get("bytes")
+        if raw is None:
+            yield "리뷰가 changes.diff 를 쓰지 않았다 — 해시를 확인할 수 없다"
+        else:
+            yield (None if b"\r\n" not in raw else "changes.diff 에 CRLF 가 들어갔다")
+            yield (None if raw == gr._diff_bytes(diff_text) else
+                   "changes.diff 의 바이트가 _diff_bytes 결과와 다르다")
+            want = hashlib.sha256(raw).hexdigest()
+            yield (None if meta.get("diff_sha256") == want else
+                   "_meta.diff_sha256 %r 가 파일 바이트의 sha256 %r 과 다르다"
+                   % (meta.get("diff_sha256"), want))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_utc_helpers(gr):
+    """시각 헬퍼는 UTC 한 곳에서 나오고, `Z` 표기를 왕복한다(1.5.0 Eng E2-1 · A4).
+
+    ⛔ `datetime.fromisoformat` 은 3.7~3.10 이 `Z` 를 거부한다. CI 와 개발 기기가 3.12 라
+      그 회귀는 **테스트로 잡히지 않는다** — 그래서 코드가 `strptime` 을 쓰는지 왕복으로 본다.
+    ⛔ 로컬 시각과 섞이면 KST 에서 9시간 어긋난다. 기록 직후 만료 판정이 뒤집히지 않는지 본다.
+    """
+    now = gr._utc_now()
+    text = gr._utc_now_str()
+    yield (None if text.endswith("Z") and len(text) == 20 else
+           "_utc_now_str 이 `Z` 표기가 아니다: %r" % text)
+    back = gr._parse_utc(text)
+    yield (None if back is not None and abs((back - now).total_seconds()) < 5 else
+           "_utc_now_str → _parse_utc 왕복이 어긋난다: %r → %r" % (text, back))
+    yield (None if back is not None and back.tzinfo is None else
+           "_parse_utc 가 naive 가 아니다 — 비교에서 TypeError 가 난다")
+    # 지금 + 60초는 아직 안 지났다(로컬 시각을 섞으면 KST 에서 뒤집힌다).
+    later = (now + datetime.timedelta(seconds=60)).strftime(gr._UTC_FMT)
+    yield (None if gr._parse_utc(later) > gr._utc_now() else
+           "기록 직후 만료 판정이 뒤집혔다 — 시각 규약이 섞였다")
+    # ⛔ [Eng H4] **시간대를 강제해서** 본다. 안 그러면 `_utc_now()` 를 로컬로 바꿔도 이 파일의
+    #   모든 비교가 같이 움직여 통과하고, CI 가 UTC 라 **영원히 빨개지지 않는다.**
+    #   `/quota` 의 `reset_time` 처럼 밖에서 오는 UTC 와 비교할 때만 9시간이 어긋난다.
+    if not hasattr(time, "tzset"):
+        yield _Skip("time.tzset 이 없다(Windows) — 시간대 강제 검사는 건너뛴다")
+    else:
+        old_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Seoul"
+            time.tzset()
+            true_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            drift = abs((gr._utc_now() - true_utc).total_seconds())
+            yield (None if drift < 5 else
+                   "_utc_now() 가 UTC 가 아니다 — 로컬 시각과 %.0f초 어긋난다" % drift)
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+    for bad in ["", "not a time", "2026-09-23T02:30:41+00:00", "2026-09-23 02:30:41", None, 123]:
+        yield (None if gr._parse_utc(bad) is None else
+               "_parse_utc 가 %r 를 받아들였다" % (bad,))
 
 
 def _check_classify_run(gr):
@@ -1937,6 +2063,17 @@ def _check_classify_run(gr):
         ("agy 시간 초과(exit 0 · stderr)", R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE), True, ("timeout", "agy")),
         ("부분 응답 + 시간 초과", R(0, stdout=_wrap('{"verdict":"appr'), stderr=_TIMEOUT_NOTICE), True, ("timeout", "agy")),
         ("하드 상한", R(None, hard_timeout=True, hard_limit=720), True, ("timeout", "hard")),
+        # [1.5.0 C1] 가장 비싼 경우 — 쿼터에 걸린 agy 가 내부 재시도를 쌓다 하드 상한에 닿는다.
+        # 여기서 timeout 으로 뭉치면 쿼터 기록이 남지 않아 다음 실행이 또 720초를 태운다.
+        ("하드 상한 + stderr 쿼터(C1)",
+         R(None, hard_timeout=True, hard_limit=720,
+           stderr="API error (attempt 8): " + _QUOTA_MSG), True, ("quota", "")),
+        ("하드 상한 + 래퍼 쿼터(C1)",
+         R(None, hard_timeout=True, hard_limit=720,
+           stdout=_wrap("", status="ERROR", error=_QUOTA_MSG)), True, ("quota", "")),
+        ("하드 상한 + 쿼터 아닌 부분 출력",
+         R(None, hard_timeout=True, hard_limit=720, stderr="still thinking"),
+         True, ("timeout", "hard")),
         ("실행 실패", R(None, error="boom"), True, ("tool_error", "")),
         ("쿼터(래퍼)", R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG)), True, ("quota", "")),
         ("쿼터(텍스트 · stderr)", R(1, stderr="error: " + _QUOTA_MSG), False, ("quota", "")),
@@ -2008,14 +2145,36 @@ def _check_scope_records_resolved_shas(gr):
             return subprocess.run(["git", "rev-parse", ref], cwd=sandbox, capture_output=True,
                                   check=True).stdout.decode().strip()
 
+        # [1.5.0 A3] 루프 키가 되는 `repo` · `branch` 가 두 범위 모두에 붙는다. 기대값은
+        #   샌드박스가 만든 값에서 읽는다 — 실제 저장소 경로를 픽스처에 박지 않는다(CEO A3-1).
+        here = subprocess.run(["git", "symbolic-ref", "--short", "HEAD"], cwd=sandbox,
+                              capture_output=True, check=True).stdout.decode().strip()
+        common = {"repo": sandbox, "branch": here}
         ns = types.SimpleNamespace
         got = gr._resolve_scope(sandbox, ns(staged=True, base="HEAD~1", head="HEAD", two_dot=False))
-        yield (None if got == {"kind": "staged", "head_sha": rev("HEAD")} else
-               "--staged 범위 기록이 다르다: %r" % got)
+        want = {"kind": "staged", "head_sha": rev("HEAD")}
+        want.update(common)
+        yield (None if got == want else "--staged 범위 기록이 다르다: %r (기대 %r)" % (got, want))
         got = gr._resolve_scope(sandbox, ns(staged=False, base="HEAD~1", head="HEAD", two_dot=False))
         want = {"kind": "range", "base": "HEAD~1", "head": "HEAD", "two_dot": False,
                 "base_sha": rev("HEAD~1"), "head_sha": rev("HEAD"), "merge_base_sha": rev("HEAD~1")}
-        yield (None if got == want else "범위 기록이 다르다: %r" % got)
+        want.update(common)
+        yield (None if got == want else "범위 기록이 다르다: %r (기대 %r)" % (got, want))
+        # detached HEAD 에서 죽지 않는다(Eng H3). `_git` 은 rc≠0 에 RuntimeError 를 던지고
+        # `_resolve_scope` 호출부는 try 밖이라, 삼키지 않으면 rebase · bisect 중 exit 1 이 된다.
+        _git_cmd(sandbox, "checkout", "-q", "--detach", "HEAD")
+        try:
+            got = gr._resolve_scope(sandbox, ns(staged=True, base="HEAD~1", head="HEAD",
+                                                two_dot=False))
+        except RuntimeError as exc:
+            # 실제 증상은 이것이다 — 호출부가 try 밖이라 `main` 의 포괄 핸들러가 잡아
+            # `internal_error`(exit 1) 가 된다. rebase · bisect 중 리뷰가 아예 안 돈다.
+            got = None
+            yield ("detached HEAD 에서 예외가 샜다 — 리뷰가 exit 1 로 죽는다: %r" % (exc,))
+        if got is not None:
+            yield (None if got.get("branch") is None and got.get("repo") == sandbox else
+                   "detached HEAD 에서 branch 를 None 으로 두지 않았다: %r" % got)
+        _git_cmd(sandbox, "checkout", "-q", here)
         got = gr._resolve_scope(sandbox, ns(staged=False, base="no-such-ref", head="--output=x", two_dot=True))
         yield (None if got.get("base_sha") is None and got.get("head_sha") is None
                and not os.path.exists(os.path.join(sandbox, "x")) else
@@ -2199,6 +2358,8 @@ _BEHAVIOR_CHECKS = (
     _check_skill_powershell_block_shape,
     _check_empty_response_names_its_cause,
     _check_result_contract_matrix,
+    _check_diff_bytes_and_hash,
+    _check_utc_helpers,
     _check_classify_run,
     _check_small_parsers,
     _check_help_survives_cp949,

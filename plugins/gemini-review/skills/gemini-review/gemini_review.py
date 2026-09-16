@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -63,7 +64,7 @@ import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 # agy 는 PATH 에 없을 수 있어 알려진 설치 경로를 fallback 으로 둔다.
@@ -671,7 +672,10 @@ def _record_interrupt(out: Optional[str], signum: int, model: Optional[str] = No
 def main(argv=None) -> int:
     """진입점. 본문(`_main`)을 신호 처리 · 내부 오류 기록으로 감싼다(26.09.14 S1 · 1.4.0)."""
     restore, suppress = _install_signal_handlers()
-    ctx = {"out": None, "tmpdir": None, "model": None}
+    # `calls` · `diff_sha256` 은 `_main` 이 채운다 — `internal_error` 는 `finish` 를 거치지
+    #   않으므로(아래 except), 여기에 없으면 **토큰을 태운 회차가 집계에서 통째로 빠진다**
+    #   (Eng H4 · H1). `calls` 는 같은 리스트 객체를 공유해 추가가 그대로 보인다.
+    ctx = {"out": None, "tmpdir": None, "model": None, "calls": [], "diff_sha256": None}
     try:
         return _main(argv, ctx)
     except (_Interrupted, KeyboardInterrupt) as exc:
@@ -700,7 +704,9 @@ def main(argv=None) -> int:
             if ctx["model"]:
                 body["model"] = ctx["model"]
             _write_out(ctx["out"], _result("internal_error", body, EXIT_PARSE_FAILED,
-                                           model=ctx["model"]), quiet=bool(ctx["out"]))
+                                           model=ctx["model"], calls=ctx["calls"] or None,
+                                           diff_sha256=ctx["diff_sha256"]),
+                       quiet=bool(ctx["out"]))
         except Exception:
             pass
         return EXIT_PARSE_FAILED
@@ -755,7 +761,11 @@ def _main(argv, ctx: dict) -> int:
     ctx["model"] = args.model
 
     calls: List[dict] = []                # agy 호출마다 원인 기록 → `_meta.calls`
-    state = {"scope": None}
+    # ⛔ [1.5.0 Eng H1] 새 `_meta` 키는 **상태에 담아 `finish` 안에서 한 번** 대입한다.
+    #   호출부마다 넘기면 언젠가 빠진다 — 최상위 `model` 이 같은 실수를 두 번 했고 직전
+    #   커밋이 그 수정이었다.
+    state = {"scope": None, "diff_sha256": None}
+    ctx["calls"] = calls                  # 같은 객체 — internal_error 도 호출 기록을 잃지 않는다
 
     def finish(mode: str, body: dict, rc: Optional[int] = None, **meta) -> int:
         """최종 결과를 `--out` 에 남긴다. **명시한 `--out` 에 못 쓰면 exit 2.**
@@ -777,6 +787,8 @@ def _main(argv, ctx: dict) -> int:
         meta["scope"] = state["scope"]
         meta["calls"] = calls
         meta["elapsed_seconds"] = round(time.time() - started, 1)
+        if state["diff_sha256"]:
+            meta["diff_sha256"] = state["diff_sha256"]
         if _write_out(args.out, _result(mode, body, rc, **meta)) is None and args.out:
             _safe_print("⛔ --out 에 결과를 쓰지 못했다 — 종료코드 %d 대신 2 로 끝낸다."
                         % rc)
@@ -827,6 +839,12 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("변경분이 없다. 리뷰는 수행되지 않았다.")
         return finish("no_changes",
                       {"note": "리뷰할 변경분이 없었다 — 리뷰가 수행되지 않았다."}, EXIT_PASSED)
+
+    # ⛔ [1.5.0 A2] 빈 diff 를 거른 **직후**, 민감 경로 판정보다 **먼저** 계산한다(Eng M3).
+    #   `sensitive_blocked` 로 끝난 실행에도 "무엇을 보려 했는가" 가 남아야 집계가 구멍 나지
+    #   않는다. 해시 대상은 아래에서 파일에 쓰는 바이트와 **같은** `_diff_bytes` 결과다.
+    diff_bytes = _diff_bytes(diff)
+    state["diff_sha256"] = ctx["diff_sha256"] = _sha256_hex(diff_bytes)
 
     classified = [(f, _classify_path(f)) for f in files]
     blocked = [f for f, c in classified if c == "block"]
@@ -903,8 +921,11 @@ def _main(argv, ctx: dict) -> int:
     ctx["tmpdir"] = tmpdir
     diff_path = os.path.join(tmpdir, "changes.diff")
     schema_path = os.path.join(tmpdir, "schema.json")
-    with open(diff_path, "w", encoding="utf-8") as f:
-        f.write(diff)
+    # ⛔ [1.5.0 A2] **바이너리로 쓴다.** 텍스트 모드는 Windows 에서 `\n` 을 `\r\n` 으로 바꿔
+    #   같은 변경의 해시가 기기마다 달라진다. agy 는 이 파일을 경로로 읽으므로 줄바꿈이 LF 로
+    #   통일돼도 리뷰 내용에는 영향이 없다.
+    with open(diff_path, "wb") as f:
+        f.write(diff_bytes)
     with open(schema_path, "w", encoding="utf-8") as f:
         json.dump(_SCHEMA, f, ensure_ascii=False)
 
@@ -1309,11 +1330,30 @@ def _resolve_scope(root: str, args) -> dict:
         except RuntimeError:
             return None
 
+    def branch():
+        """현재 브랜치 이름. detached HEAD 면 None.
+
+        ⛔ [1.5.0 Eng H3] `_git` 은 rc≠0 에서 `RuntimeError` 를 던지고,
+          `git symbolic-ref --short -q HEAD` 는 detached HEAD 에서 rc 1 이다. 이 함수의
+          호출부는 `try` 밖이라 삼키지 않으면 `main` 의 포괄 핸들러가 잡아 **exit 1
+          (`internal_error`)** 이 된다 — rebase · bisect 중에는 리뷰가 아예 안 돈다.
+        """
+        try:
+            return _git(["symbolic-ref", "--short", "-q", "HEAD"], root).strip() or None
+        except RuntimeError:
+            return None
+
+    # `repo` 는 저장소 **절대 경로**다. 결과 파일은 0600 이지만 `--out` 으로 저장소 안에 쓰면
+    # 그 경로가 커밋될 수 있다 — README · SKILL.md 의 `--out` 주의 문구에 적는다(CEO A3-1).
+    common = {"repo": root, "branch": branch()}
     if args.staged:
-        return {"kind": "staged", "head_sha": sha("HEAD")}
+        scope = {"kind": "staged", "head_sha": sha("HEAD")}
+        scope.update(common)
+        return scope
     scope = {"kind": "range", "base": args.base, "head": args.head,
              "two_dot": bool(args.two_dot),
              "base_sha": sha(args.base), "head_sha": sha(args.head)}
+    scope.update(common)
     if not args.two_dot:
         scope["merge_base_sha"] = None
         if scope["base_sha"] and scope["head_sha"]:
@@ -1547,6 +1587,64 @@ class _AgyRun(object):
         self.error = error
 
 
+_UTC_FMT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _utc_now() -> datetime:
+    """시각 비교의 **유일한** 기준(1.5.0).
+
+    ⛔ 이 파일의 다른 시각은 전부 로컬이다(`started_at` · 결과 파일명). `_meta.written_at` 과
+      쿼터 상태는 UTC 로 적으므로, 한 곳에서만 만들지 않으면 KST 에서 9시간 어긋난다.
+    ⚠ `datetime.utcnow()` 는 3.12 가 경고를 낸다 — aware 로 만들고 tzinfo 를 떼어 쓴다.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_now_str() -> str:
+    return _utc_now().strftime(_UTC_FMT)
+
+
+def _parse_utc(text) -> Optional[datetime]:
+    """`2026-09-23T02:30:41Z` → naive UTC. 읽지 못하면 None.
+
+    ⛔ `datetime.fromisoformat` 을 쓰지 말 것 — 3.7~3.10 이 `Z` 접미사를 거부해 **조용히**
+      실패한다. CI 와 개발 기기가 3.12 라 그 회귀는 테스트로 잡히지 않는다.
+    """
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.strptime(text.strip(), _UTC_FMT)
+    except ValueError:
+        return None
+
+
+def _diff_bytes(diff: str) -> bytes:
+    """리뷰에 **실제로 보낸 바이트**. 해시와 파일 쓰기가 같은 것을 쓰게 한 곳에 둔다.
+
+    ⚠ 이것은 `git diff` 의 원본 바이트가 아니라 **스크립트가 디코딩·재인코딩한 UTF-8** 이다
+      (`_git` 이 `utf-8/replace` 로 읽는다). 나중에 커밋 게이트 hook 을
+      `git diff | sha256sum` 으로 짜면 값이 맞지 않는다 — 같은 헬퍼를 쓸 것.
+    """
+    return diff.encode("utf-8", "surrogateescape")
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _decode_stream(data) -> str:
+    """자식 프로세스의 stdout · stderr 를 문자열로. 하드 상한에 걸린 호출은 None 일 수 있다.
+
+    `subprocess.TimeoutExpired` 의 `stdout` · `stderr` 는 아무것도 못 읽었으면 None 이고,
+    `subprocess.run` 의 정상 반환은 항상 bytes 다. 두 자리가 같은 규칙을 쓰게 모아 둔다.
+    """
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace").strip()
+    return str(data).strip()
+
+
 def _run_agy(agy: str, model: str, extra: List[str], cwd: str,
              timeout_spec: str, default_secs: int) -> _AgyRun:
     """agy 를 부르는 **유일한** 자리. `--mode plan` · stdin 차단 · 바깥 하드 상한을 여기서만 건다.
@@ -1566,15 +1664,21 @@ def _run_agy(agy: str, model: str, extra: List[str], cwd: str,
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, check=False,
                               stdin=subprocess.DEVNULL, timeout=hard)
-    except subprocess.TimeoutExpired:
-        return _AgyRun(None, elapsed=time.time() - started, hard_limit=hard,
+    except subprocess.TimeoutExpired as exc:
+        # ⛔ [1.5.0 C1] 부분 출력을 버리지 않는다. 쿼터에 걸린 agy 는 내부에서 8회까지
+        #   재시도하므로(609초 실측, 기본 하드 상한 720초 — 여유 111초) 조금만 더 끌면
+        #   쿼터가 이 갈래로 떨어진다. 버리면 `_classify_run` 이 `timeout` 으로 뭉쳐
+        #   쿼터 기록이 남지 않고 **다음 실행이 같은 720초를 또 태운다.**
+        return _AgyRun(None, stdout=_decode_stream(exc.stdout),
+                       stderr=_decode_stream(exc.stderr),
+                       elapsed=time.time() - started, hard_limit=hard,
                        hard_timeout=True)
     except (OSError, subprocess.SubprocessError) as exc:
         return _AgyRun(None, elapsed=time.time() - started, hard_limit=hard,
                        error=str(exc) or exc.__class__.__name__)
     return _AgyRun(proc.returncode,
-                   stdout=proc.stdout.decode("utf-8", "replace").strip(),
-                   stderr=proc.stderr.decode("utf-8", "replace").strip(),
+                   stdout=_decode_stream(proc.stdout),
+                   stderr=_decode_stream(proc.stderr),
                    elapsed=time.time() - started, hard_limit=hard)
 
 
@@ -1614,6 +1718,12 @@ def _classify_run(run: _AgyRun, structured: bool) -> Tuple[str, str, str]:
       4. 응답 본문이 비었다 → `tool_denied`(stderr 에 권한 거부 안내) · `empty`.
     """
     if run.hard_timeout:
+        # ⛔ [1.5.0 C1] 하드 상한에 걸려도 **쿼터를 먼저 본다.** 쿼터에 걸린 agy 는 내부에서
+        #   재시도를 쌓으므로 가장 비싼 경우가 바로 이 갈래로 온다(609초 실측 대 720초 상한).
+        #   여기서 `timeout` 으로 뭉치면 쿼터 기록이 남지 않아 다음 실행이 또 태운다.
+        detail = _agy_error_detail(run.stdout, run.stderr)
+        if _looks_like_quota_error(detail):
+            return "quota", "", _first_line(detail)
         return "timeout", "hard", "바깥 상한 %d초 초과로 강제 종료" % run.hard_limit
     if run.rc is None:
         return "tool_error", "", "agy 실행 실패: %s" % (run.error or "원인 불명")
@@ -2066,8 +2176,11 @@ def _result(mode: str, body: dict, exit_code, **meta) -> dict:
     호출부의 추가 필드가 덮어쓰지 못한다. 값이 None 인 추가 필드는 싣지 않는다.
     """
     m = dict((k, v) for k, v in meta.items() if v is not None)
+    # [1.5.0 A5] 집계가 회차 순서를 세려면 시각이 있어야 한다. `in_progress` 기록에도 붙으므로
+    #   "finished" 가 아니라 **written** 이다. 1.4.x 파일은 이 키가 없어 파일명(로컬 시각)으로
+    #   떨어지므로, 읽는 쪽이 둘을 같은 UTC 로 정규화한다.
     m.update({"mode": mode, "exit_code": exit_code, "passed": _passed(mode, exit_code),
-              "plugin_version": __version__})
+              "plugin_version": __version__, "written_at": _utc_now_str()})
     out = dict(body)
     out["mode"] = mode
     out["_meta"] = m

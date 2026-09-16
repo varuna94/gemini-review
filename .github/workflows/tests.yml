@@ -1,5 +1,6 @@
 # [1.4.0 결정 7] 가드가 조용히 죽는 것을 사람이 스위트를 돌리는 데 기대지 않는다.
-#   - 스위트: ubuntu · windows (Windows 는 신호 · POSIX 권한 · bash 블록 검사를 건너뜀으로 알린다)
+#   - 스위트: ubuntu · windows 의 3.12, 그리고 ubuntu 의 3.9(선언한 하한 검증)
+#     (Windows 는 신호 · POSIX 권한 · bash 블록 검사를 건너뜀으로 알린다)
 #   - 변이 검사: ubuntu 만 — 몇몇 변이의 기대 문구가 POSIX 전용 검사에서 나온다.
 # ⚠ 실제 agy 는 부르지 않는다(인증이 없다). 테스트의 가짜 subprocess 가 진짜 프로세스를 막는다.
 # ⚠ Windows 러너는 한국어 로캘(cp949)이 아니다 — 실제 cp949 콘솔 확인은 TODOS.md 에 남아 있다.
@@ -18,12 +19,20 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+        # [1.5.0] 선언한 하한(3.7+)을 **처음으로 실제 검증**한다. 3.9 를 고른 이유:
+        #   `datetime.fromisoformat` 이 `Z` 접미사를 거부하는 마지막 계열이라, 그 회귀가
+        #   3.12 단일 CI 에서는 **영원히 빨개지지 않는다**. 우분투에서만 돌린다 —
+        #   Windows 전용 검사는 이미 3.12 행이 덮는다.
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: git identity (테스트가 임시 저장소에 커밋한다)
         run: |
           git config --global user.email ci@example.com

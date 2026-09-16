@@ -51,7 +51,11 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 그 밖의 인자: `--model`(기본 `gemini-3.1-pro-high` — **flash 로 낮추지 말 것**),
 `--timeout`(기본 `10m`), `--allow-empty`(빈 스테이징을 8 대신 0 으로), `--out`(결과 JSON 저장 경로. 생략하면
 `~/.local/state/gemini-review/`, Windows 는 `%LOCALAPPDATA%\gemini-review\`),
-`--allow-sensitive`(사용자가 전송을 명시적으로 승인했을 때만).
+`--allow-sensitive`(사용자가 전송을 명시적으로 승인했을 때만),
+`--ignore-quota-cache`(기록된 쿼터 차단을 무시하고 실제로 호출한다 — **사용자 전용**).
+
+⚠ `--out` 으로 저장소 안에 결과를 쓰면 **저장소 절대 경로**(`_meta.scope.repo`)와 리뷰 대상
+코드가 그 파일에 담긴다. 그 경로를 gitignore 할 것.
 
 ## 결과를 읽는 법
 
@@ -83,6 +87,39 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 
 결과 JSON(`--out`)의 `_meta.passed` 는 주 모델이 리뷰해 통과 판정을 냈을 때만 `true` 다.
 `_meta.mode` 가 원인(`timeout` · `quota_exhausted` · `no_changes` …)을 말한다.
+
+### exit 4 는 두 가지다 [1.5.0]
+
+`_meta.quota_cached` 가 `true` 면 **이미 기록된 쿼터 차단** 때문에 agy 를 부르지 않고 끝난
+것이다. 즉시 다시 돌려도 같은 코드가 나온다 — 화면에 적힌 재설정 시각 뒤에 돌려라.
+그 값이 없으면 실제로 호출했다가 실패한 것이다(시간 초과 · 무응답 · 첫 쿼터 차단).
+
+왜 이렇게 하는가: 쿼터에 걸린 agy 는 내부에서 8회까지 재시도한다. 실측에서 **609초를
+태우고** exit 4 로 끝났고, 다음 실행이 같은 609초를 또 썼다. 차단이 한 번 기록되면 그 뒤
+실행은 `agy -p "/quota"`(토큰 0 · 약 6초)로 먼저 확인하고, 아직 차단이면 리뷰를 요청하지
+않는다. 풀린 것이 확인되면 기록을 지우고 정상 진행한다. **차단 기록이 없는 평상시에는
+조회하지 않는다** — 추가 비용이 0초다.
+
+### 1.5.0 이 더한 `_meta` 필드
+
+| 필드 | 뜻 |
+|---|---|
+| `diff_sha256` | 리뷰에 **실제로 보낸 바이트**의 sha256. ⚠ `git diff \| sha256sum` 과는 다르다 — 스크립트가 디코딩·재인코딩한 UTF-8 이 대상이다 |
+| `scope.repo` · `scope.branch` | 커밋 단위로 회차를 묶는 키. detached HEAD 면 `branch` 는 `null` |
+| `written_at` | 결과를 쓴 시각(UTC). `in_progress` 기록에도 붙는다 |
+| `calls[].usage` | 호출별 토큰(`input_tokens` · `output_tokens` · `thinking_tokens` · `cache_read_tokens` · `total_tokens`). 수치가 아닌 값은 걸러내고 그 키 이름을 `usage_dropped_keys` 에 남긴다 |
+| `calls[].agy_turns` · `agy_duration_seconds` | agy 래퍼가 보고한 값. 기존 `seconds` 는 **스크립트가 잰 벽시계**로 별개다 |
+| `calls[].usage_unavailable` | 텍스트 출력 호출에는 래퍼가 없어 토큰을 알 수 없다 |
+| `quota_cached` · `quota_source` · `quota_cached_streak` | 쿼터 단락으로 끝났을 때. `quota_source` 는 `quota_query`(조회로 확인) 또는 `cached`(조회가 답하지 못해 기록으로 판단) |
+
+시각 필드가 셋이라 헷갈리기 쉽다. `calls[].seconds` 는 스크립트가 잰 그 호출의 벽시계,
+`calls[].agy_duration_seconds` 는 agy 가 보고한 값, `elapsed_seconds` 는 실행 전체다.
+
+### 결과 폴더
+
+결과는 실행마다 쌓이고 **자동으로 지워지지 않는다.** 오래된 것은 손으로 지워도 된다 —
+`--stats` 집계가 그만큼 짧아질 뿐 다른 동작에는 영향이 없다. 쿼터 상태는 같은 폴더의
+`quota-state.json` 이고, 지우면 다음 차단 때 다시 만들어진다.
 
 **지적을 액면 그대로 받지 말 것.** 해당 코드와 데이터를 직접 보고 사실인지
 확인한 뒤 고치고, 아니면 근거를 남기고 넘어간다. 리뷰어가 둘이 됐다고 검증을

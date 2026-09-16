@@ -64,7 +64,7 @@ import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 # agy 는 PATH 에 없을 수 있어 알려진 설치 경로를 fallback 으로 둔다.
@@ -226,7 +226,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # ⛔ [1.4.0] **진단 전용**이다 — 이 모델로 리뷰를 요청하지 않는다(`_recover_empty_response`).
@@ -746,6 +746,15 @@ def _main(argv, ctx: dict) -> int:
     ap = _build_parser()
     try:
         args = ap.parse_args(argv)
+        # ⛔ [1.5.0 A5] 충돌 검사는 `parse_args` 를 감싼 try **안에서** `ap.error()` 로 낸다.
+        #   밖에서 내면 `--out` 파일에 `in_progress`("중간에 죽었다") 가 남는다.
+        #   ⚠ "사용자가 명시했는가" 는 파싱된 값이 아니라 **argv 토큰**으로 판정한다 —
+        #     `--base` 는 기본값이 `HEAD~1` 이라 값 비교로는 가릴 수 없다. 약어도 잡는다
+        #     (`--stats --stag` 가 새면 안 된다, Eng M6).
+        if args.stats:
+            clash = _named_in_argv(argv, _STATS_CONFLICTS)
+            if clash:
+                ap.error(_STATS_CONFLICT_MSG % ", ".join(clash))
     except SystemExit as exc:
         # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] `--help` · 인자 오류로 여기서 끝나면 방금
         #   쓴 `in_progress`("중간에 죽었다") 가 사실과 다르게 남는다. 리뷰를 시작하지도
@@ -756,6 +765,8 @@ def _main(argv, ctx: dict) -> int:
                         "수행되지 않았다. 통과가 아니다.",
             }, exc.code), quiet=True)
         raise
+    if args.stats:
+        return _run_stats(args)
     _apply_deprecated_flags(args)
     # 중단 · 내부 오류 기록(`main`)도 판정 모델을 남기게 한다 — 인자 해석을 마친 뒤의 모든 결과에 있다.
     ctx["model"] = args.model
@@ -764,7 +775,7 @@ def _main(argv, ctx: dict) -> int:
     # ⛔ [1.5.0 Eng H1] 새 `_meta` 키는 **상태에 담아 `finish` 안에서 한 번** 대입한다.
     #   호출부마다 넘기면 언젠가 빠진다 — 최상위 `model` 이 같은 실수를 두 번 했고 직전
     #   커밋이 그 수정이었다.
-    state = {"scope": None, "diff_sha256": None}
+    state = {"scope": None, "diff_sha256": None, "diff_bytes": None}
     ctx["calls"] = calls                  # 같은 객체 — internal_error 도 호출 기록을 잃지 않는다
 
     def finish(mode: str, body: dict, rc: Optional[int] = None, **meta) -> int:
@@ -789,6 +800,7 @@ def _main(argv, ctx: dict) -> int:
         meta["elapsed_seconds"] = round(time.time() - started, 1)
         if state["diff_sha256"]:
             meta["diff_sha256"] = state["diff_sha256"]
+            meta["diff_bytes"] = state["diff_bytes"]
         if _write_out(args.out, _result(mode, body, rc, **meta)) is None and args.out:
             _safe_print("⛔ --out 에 결과를 쓰지 못했다 — 종료코드 %d 대신 2 로 끝낸다."
                         % rc)
@@ -845,6 +857,10 @@ def _main(argv, ctx: dict) -> int:
     #   않는다. 해시 대상은 아래에서 파일에 쓰는 바이트와 **같은** `_diff_bytes` 결과다.
     diff_bytes = _diff_bytes(diff)
     state["diff_sha256"] = ctx["diff_sha256"] = _sha256_hex(diff_bytes)
+    # [1.5.0 A5] 크기도 남긴다. OQ6 분류에서 **회차 간 diff 크기 증가율**이 루프 종류를
+    #   가르는 유일하게 확실한 손잡이였다 — 범위가 커지는 루프는 수정이 새 코드를 낳아
+    #   스스로 연료를 만들고(H-B), 고정된 루프는 재현율이 제약이다(H-A, 실측 67%).
+    state["diff_bytes"] = len(diff_bytes)
 
     classified = [(f, _classify_path(f)) for f in files]
     blocked = [f for f, c in classified if c == "block"]
@@ -899,6 +915,39 @@ def _main(argv, ctx: dict) -> int:
     if blocked or warned:
         _safe_print("")
 
+    # ⛔ [1.5.0 A4] **쿼터 단락은 여기다** — 민감 경로 판정과 `_find_agy` 뒤, tmpdir 생성 앞.
+    #   · 민감 경로가 먼저여야 캐시가 있어도 exit 3 이 난다.
+    #   · agy 미설치는 여전히 exit 2 다(처방이 뒤집히면 안 된다).
+    #   · tmpdir 앞이어야 **보내지 않을 diff 를 디스크에 쓰지 않는다**(잔류 사고 2회 이력).
+    if not args.ignore_quota_cache:
+        state_path = _quota_guard(_quota_state_path)
+        models = _quota_guard(_load_quota_state, state_path) or {}
+        hit = _quota_guard(_quota_short_circuit, agy, args.model, root,
+                           state_path, models, calls)
+        if hit:
+            reset, entry, source, buckets = hit
+            streak = int(entry.get("cached_hits") or 0)
+            since = _parse_utc(entry.get("blocked_since"))
+            _say_not_reviewed(
+                "구독 사용량 한도에 걸려 있다(%s) — agy 를 부르지 않았다" % args.model,
+                "[%s 기록 당시 원문] %s" % (entry.get("recorded_at") or "?",
+                                        entry.get("detail") or "쿼터 한도"),
+                "%s 이 지난 뒤 **같은 모델로** 다시 돌릴 것. 모델을 낮추지 않는다."
+                % _fmt_until(reset))
+            # ⛔ [DX critical] 단락은 609초를 0.1초로 만든다 — 사람이 **게이트가 없다는 사실
+            #   자체를** 못 보게 된다. 누적을 화면에 적어 그 부재를 보이게 한다.
+            if streak >= _QUOTA_STREAK_WARN:
+                hours = int((_utc_now() - since).total_seconds() // 3600) if since else None
+                _safe_print("   ⚠ 이 기기에서 게이트 없이 %d회째다%s."
+                            % (streak, " · 멈춘 지 %d시간" % hours if hours else ""))
+            return finish("quota_exhausted", {
+                "error": entry.get("detail") or "쿼터 한도",
+                "retry_after": _fmt_hms(int((reset - _utc_now()).total_seconds())) or None,
+                "note": "agy 구독 사용량 한도로 리뷰가 수행되지 않았다. 통과가 아니다."},
+                quota_cached=True, quota_source=source,
+                quota_cached_streak=streak,
+                quota_buckets=[b.get("id") for b in buckets] or None)
+
     # ⛔ **정리를 등록해 두고 만든다** — `mkdtemp` 만 하면 지워지지 않는다.
     #   이 결함은 **두 번째**다. 처음엔 `/tmp` 에 50개 1.5MB 가 쌓였고 그 안에
     #   diff 전문이 평문으로 남아 있어 고쳤는데(그 주석이 플러그인 v1.2.0 에
@@ -939,7 +988,15 @@ def _main(argv, ctx: dict) -> int:
 
     if cause in _FAILURE_CAUSES:
         mode, body, extra = _failure_result("구조화 호출", model, run, cause, kind, detail, args)
+        if cause == "quota":
+            # [1.5.0 A4] 차단을 기록한다. 이미 수백 초를 쓴 뒤라 `/quota` 6초는 무시할 만하고,
+            #   그 대가로 **추정이 아닌** 해제 시각을 저장해 다음 실행이 0.1초로 끝난다.
+            extra.update(_quota_guard(_record_quota_block, agy, model, root, detail, calls) or {})
         return finish(mode, body, **extra)
+    if cause == "ok":
+        # 성공은 해제 신호다. `timeout` · `tool_error` 로는 지우지 않는다 — 쿼터가 풀렸다는
+        #   증거가 아니기 때문이다.
+        _quota_guard(_clear_quota_block, model)
     if cause in ("empty", "tool_denied"):
         mode, body, extra = _recover_empty_response(
             agy, model, args, root, diff_path, files, project_ctx,
@@ -980,6 +1037,23 @@ def _say_not_reviewed(problem: str, cause: str = "", fix: str = "") -> None:
     if fix:
         _safe_print("   해결: %s" % fix)
     _safe_print("   이 결과를 '지적 없음'으로 읽지 말 것.")
+
+
+def _say_note(problem: str, cause: str = "", fix: str = "") -> None:
+    """리뷰는 계속되지만 **무언가를 잃었을 때** 쓰는 형제 헬퍼(1.5.0 DX).
+
+    `_say_not_reviewed` 와 같은 세 부분(문제 · 원인 · 해결)을 쓰되, "리뷰가 수행되지 않았다"
+    라고 말하지 않는다 — 판정은 정상적으로 난다.
+
+    ⛔ [DX] `fix` 에는 **대가**를 적는다. "한 줄 알린다" 로만 규정하면 문구를 테스트로
+      고정할 수 없고, 문구 없는 알림은 조용한 실패의 축소판이다. 예: "다음 실행이 같은
+      609초 대기를 다시 쓴다", "이 실행은 --stats 집계에 잡히지 않는다".
+    """
+    _safe_print("⚠ %s" % problem)
+    if cause:
+        _safe_print("   원인: %s" % cause)
+    if fix:
+        _safe_print("   대가: %s" % fix)
 
 
 def _failure_result(stage: str, model: str, run: "_AgyRun", cause: str, kind: str,
@@ -1232,6 +1306,23 @@ def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]
             % _first_line(_response_text(run.stdout))[:80]))
         mark("출력 래퍼", True, "status · response 필드 있음")
 
+    # ①-b [1.5.0 X2] usage 모양이 바뀌면 토큰 집계가 **조용히** 값을 잃는다. 알던 키가
+    #   사라진 것만 실패로 올린다 — 새 키가 생기는 것은 무해하므로 참고다.
+    usage, _, _, _ = _wrapper_usage(run.stdout)
+    if usage is None:
+        mark("usage 필드", None,
+             "래퍼에 usage 가 없다 — 이 판에서는 리뷰당 토큰을 집계할 수 없다")
+    else:
+        lost = sorted(_KNOWN_USAGE_KEYS - set(usage))
+        extra = sorted(set(usage) - _KNOWN_USAGE_KEYS)
+        if lost:
+            mark("usage 필드", False,
+                 "알던 키가 사라졌다: %s — 집계가 조용히 값을 잃는다(_KNOWN_USAGE_KEYS 갱신 필요)"
+                 % ", ".join(lost))
+        else:
+            mark("usage 필드", True, "키 %d개%s" % (
+                len(usage), " · 처음 보는 키: " + ", ".join(extra) if extra else ""))
+
     # ② 출력 시간 초과 안내문을 알아보는가 — 못 알아보면 시간 초과가 '빈 응답' 으로 오진된다
     run = _run_agy(agy, args.model, ["--output-format", "json", "--print-timeout", "1s",
                                      "-p", _CHECK_SLOW_PROMPT], where, "1s", 30)
@@ -1285,6 +1376,58 @@ def _probe_cause(alive: bool, run: "_AgyRun") -> Tuple[str, str, str]:
     return cause, kind, detail
 
 
+# 텍스트 출력이라 래퍼가 없는 단계. 나머지는 `--output-format json` 이라 래퍼가 있다.
+_TEXT_OUTPUT_STAGES = frozenset(("probe", "text"))
+
+# agy 1.2.3 실측(2026-09-16). **알던 키가 사라지면** 집계가 조용히 값을 잃으므로 `--check` 가
+#   실패로 올린다. 모르는 키가 생기는 것은 무해하므로 참고로만 적는다.
+#   ⚠ 기준선을 상태 파일이 아니라 상수로 두는 이유: 상수는 git 에 남아 변경이 리뷰되고,
+#     "첫 실행은 참고" 라는 예외(그 자체가 조용한 실패 경로)가 필요 없다.
+_KNOWN_USAGE_KEYS = frozenset((
+    "input_tokens", "output_tokens", "thinking_tokens",
+    "cache_read_tokens", "total_tokens"))
+
+
+def _wrapper_usage(raw: str):
+    """agy 래퍼에서 `(수치 usage, 걸러낸 키, num_turns, duration_seconds)`.
+
+    래퍼가 아니거나 `usage` 가 없으면 `(None, [], …)` — **필드를 빼고 진행한다.**
+    기록 실패가 판정이나 종료 코드를 바꾸면 안 된다.
+
+    ⛔ [1.5.0 Eng H5] `usage` 를 "키 그대로" 실으면 agy 가 문자열이나 중첩 dict 를 넣는 순간
+      `--stats` 가 `TypeError` 로 죽는다. JSON 자체는 멀쩡하니 "깨진 파일" 규칙에도 걸리지
+      않아 **조용히** 죽는다. 그래서 수치만 남기고 걸러낸 키 이름을 따로 적는다.
+    ⚠ `bool` 은 `int` 의 하위형이라 따로 뺀다 — `True` 가 1 로 집계되면 안 된다.
+    """
+    try:
+        wrapper = json.loads(raw)
+    except ValueError:
+        return None, [], None, None
+    if not isinstance(wrapper, dict):
+        return None, [], None, None
+
+    def _num(value, ints_only=False):
+        if isinstance(value, bool):
+            return None
+        if ints_only:
+            return value if isinstance(value, int) else None
+        return value if isinstance(value, (int, float)) else None
+
+    turns = _num(wrapper.get("num_turns"), ints_only=True)
+    secs = _num(wrapper.get("duration_seconds"))
+    usage = wrapper.get("usage")
+    if not isinstance(usage, dict):
+        return None, [], turns, secs
+    nums, dropped = {}, []
+    for key, value in usage.items():
+        number = _num(value)
+        if number is None:
+            dropped.append(str(key))
+            continue
+        nums[str(key)] = number
+    return nums, sorted(dropped), turns, secs
+
+
 def _call_record(stage: str, model: str, run: "_AgyRun", cause: str, kind: str,
                  detail: str) -> dict:
     """`_meta.calls` 한 줄 — agy 호출마다 **원인**을 남긴다(1.4.0).
@@ -1298,6 +1441,22 @@ def _call_record(stage: str, model: str, run: "_AgyRun", cause: str, kind: str,
         rec["timeout_kind"] = kind
     if detail:
         rec["detail"] = detail[:300]
+    # [1.5.0 A1] 토큰은 **여기 한 곳**에서 붙인다. 호출부가 일곱 군데라 거기서 넣으면
+    #   언젠가 빠진다 — 최상위 `model` 이 같은 실수를 두 번 했다(Eng H1).
+    if stage in _TEXT_OUTPUT_STAGES:
+        # 텍스트 출력에는 래퍼가 없다. "값이 0" 이 아니라 **알 길이 없다** 는 사실을 남긴다.
+        rec["usage_unavailable"] = "text_output"
+    else:
+        usage, dropped, turns, secs = _wrapper_usage(run.stdout)
+        if usage is not None:
+            rec["usage"] = usage
+            if dropped:
+                rec["usage_dropped_keys"] = dropped
+        if turns is not None:
+            rec["agy_turns"] = turns
+        if secs is not None:
+            # 기존 `seconds` 는 **스크립트가 잰 벽시계**다. 둘은 다른 값이고 둘 다 쓸모가 있다.
+            rec["agy_duration_seconds"] = secs
     return rec
 
 
@@ -1430,6 +1589,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--two-dot", action="store_true",
                     help="base..head 2-dot diff (기본은 merge-base 기준 3-dot). "
                          "브랜치 리뷰에서는 쓰지 마라 (남의 커밋이 섞인다)")
+    # ⛔ 자기 우회 계열이다(`--allow-sensitive` 와 같다). 구독을 올렸거나 다른 기기에서
+    #   풀린 것을 확인했을 때 **사용자가** 쓴다. 화면 · 결과에서 이것을 권하지 않는다.
+    ap.add_argument("--ignore-quota-cache", action="store_true",
+                    help="기록된 쿼터 차단을 무시하고 실제로 호출한다 "
+                         "(사용자 전용: Claude 가 스스로 붙이지 말 것)")
+    ap.add_argument("--stats", action="store_true",
+                    help="쌓인 결과 파일을 집계한다 (agy 를 부르지 않고 결과도 쓰지 않는다)")
+    ap.add_argument("--stats-dir", metavar="경로",
+                    help="--stats 가 읽을 폴더 (기본: 결과 폴더. 폴더를 만들지 않는다)")
+    ap.add_argument("--since", default="14d", metavar="기간",
+                    help="--stats 의 기간. d(일) · h(시간) 단위 (기본 14d)")
     # ⚠ `--effort` 는 두지 않는다. agy 는 **모델명에 effort 가 내장**돼 있고
     # (`gemini-3.1-pro-high`/`-low`, `gemini-3.6-flash-medium` …), 모델 접미사와
     # 다른 --effort 를 주면 즉시 status=ERROR 로 죽는다 (실측: 0초, tokens 0).
@@ -1475,6 +1645,34 @@ def _exit_code_epilog() -> str:
     return "\n".join(lines)
 
 
+# `--stats` 와 함께 쓸 수 없는 인자. 집계는 리뷰를 하지 않으므로 범위 · 출력이 무의미하다.
+_STATS_CONFLICTS = ("--staged", "--base", "--two-dot", "--out", "--allow-sensitive",
+                    "--allow-empty", "--check", "--ignore-quota-cache")
+# cp949 검사가 훑도록 문자열 상수로 뺀다(Eng M5). em dash 를 쓰지 않는다.
+_STATS_CONFLICT_MSG = ("--stats 는 집계만 한다 — 리뷰 인자와 함께 쓸 수 없다: %s")
+
+
+def _named_in_argv(argv, names) -> List[str]:
+    """argv 에 그 인자가 **사용자가 적은 형태로** 있는가. 약어까지 잡는다.
+
+    ⛔ [Eng M6] 문자열 완전 일치로 보면 argparse 의 약어(`--stag` · `--ou=x`)가 샌다.
+      `_peek_out` 과 같은 규칙을 쓴다 — `--` 로 시작하고 `=` 앞부분이 어떤 이름의
+      **접두사**이면 그 이름을 적은 것으로 본다.
+    ⚠ `--` 뒤는 인자가 아니라 값이다.
+    """
+    hit = []
+    for token in list(sys.argv[1:] if argv is None else argv):
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        head = token.split("=", 1)[0]
+        for name in names:
+            if name.startswith(head) and name not in hit:
+                hit.append(name)
+    return hit
+
+
 def _peek_out(argv) -> Optional[str]:
     """argparse 로 본 해석을 하기 **전에** `--out` 값만 알아낸다.
 
@@ -1509,6 +1707,55 @@ def _peek_out(argv) -> Optional[str]:
     return found
 
 
+def _state_dir(create: bool = True) -> Tuple[Optional[str], str]:
+    """결과 · 상태 파일을 둘 폴더와 그 **신뢰 상태**. 반환 `(경로, 상태)`.
+
+    상태는 셋이다.
+      `ok`      — 사용자 전용이 확실하다
+      `shared`  — Windows 에서 `%LOCALAPPDATA%` 가 없어 공유 `%TEMP%` 로 떨어졌다
+      `unsafe`  — 링크 · 남의 소유 · 만들 수 없음 (이때 경로는 None)
+
+    ⛔ [1.5.0 Eng M2] 세 호출부의 실패 동작이 **서로 다르다** — 결과 폴더는 `mkdtemp` 로
+      폴백하고, 쿼터 상태는 아예 쓰지 않으며, `--stats` 는 exit 2 다. 그래서 여기서
+      폴백을 정하지 않고 상태만 돌려준다.
+    ⚠ `create=False` 는 폴더를 **만들지 않는다.** `--stats` 가 빈 폴더를 새로 만들면
+      "0건 · exit 0" 으로 조용히 끝나 사용자가 결과가 없다고 오해한다.
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        # ⛔ [Eng M7] `%LOCALAPPDATA%` 가 없으면 공유 `%TEMP%` 다. 남이 심은 `reset_at` 으로
+        #   게이트를 막을 수 있으므로(통과 위조는 불가 — DoS) 호출부가 구분할 수 있게 알린다.
+        status = "ok" if base else "shared"
+        d = os.path.join(base or tempfile.gettempdir(), "gemini-review")
+        if create:
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                return None, "unsafe"
+        return d, status
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):          # XDG 규약: 상대 경로는 무시한다
+        base = os.path.join(os.path.expanduser("~"), ".local", "state")
+    d = os.path.join(base, "gemini-review")
+    try:
+        if create:
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        elif not os.path.isdir(d):
+            return d, "ok"               # 없는 폴더는 "안전하지 않음" 이 아니라 **0건**이다
+        st = os.lstat(d)
+        if (stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.getuid()):
+            return None, "unsafe"
+        # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] "느슨하면 좁힌다"만으로는 부족하다. 내 소유
+        #   폴더가 쓰기 권한 없이(0500, 엄격한 umask) 있으면 `& 0o077` 이 0 이라 그대로
+        #   반환되고 결과 기록이 실패한다 → 정확히 0700 으로 맞춘다.
+        if create and stat.S_IMODE(st.st_mode) != 0o700:
+            os.chmod(d, 0o700)
+        return d, "ok"
+    except OSError:
+        return None, "unsafe"
+
+
 def _default_result_dir() -> str:
     """`--out` 을 주지 않았을 때 결과 JSON 을 둘 **사용자 전용** 폴더.
 
@@ -1516,35 +1763,539 @@ def _default_result_dir() -> str:
       `gemini_review_<시각>.json` 이었다. 이 PC 실측으로 `-rw-rw-r--` 파일
       137개가 공유 `/tmp` 에 쌓여 있었고, 담긴 것은 코드가 인용된 지적이다.
       같은 초에 끝난 두 실행은 서로 덮어썼다(→ 파일명에 PID).
-    → POSIX 는 `$XDG_STATE_HOME/gemini-review`(기본 `~/.local/state`), Windows 는
-      `%LOCALAPPDATA%\\gemini-review`(이미 사용자별).
     ⚠ 폴더가 **링크이거나 남의 소유**면 쓰지 않고 새 임시 폴더로 대체한다.
-      이름을 짐작할 수 있는 경로는 다른 사용자가 먼저 만들어 둘 수 있다
-      (26.09.14 Eng 리뷰). 내 소유인데 권한만 느슨하면 0700 으로 좁힌다.
+      [1.5.0 Eng M8] 대체하면 그 실행은 `--stats` 가 **영원히 못 본다** — 한 줄 알린다.
     """
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-        d = os.path.join(base, "gemini-review")
-        os.makedirs(d, exist_ok=True)
-        return d
-    base = os.environ.get("XDG_STATE_HOME") or ""
-    if not os.path.isabs(base):          # XDG 규약: 상대 경로는 무시한다
-        base = os.path.join(os.path.expanduser("~"), ".local", "state")
-    d = os.path.join(base, "gemini-review")
+    d, status = _state_dir(create=True)
+    if d is None or status == "unsafe":
+        fallback = tempfile.mkdtemp(prefix="gemini_review_out_")
+        _say_note("결과 폴더가 안전하지 않아 임시 폴더에 남긴다",
+                  "기본 폴더가 링크이거나 남의 소유이거나 만들 수 없다.",
+                  "이 실행은 --stats 집계에 잡히지 않는다: %s" % fallback)
+        return fallback
+    return d
+
+
+_QUOTA_STATE_NAME = "quota-state.json"
+_QUOTA_QUERY_TIMEOUT = 20        # 실측 6초. `_run_agy` 는 여기에 120초를 더해 버려 쓸 수 없다
+_QUOTA_MAX_HOURS = 72            # **추정 기록에만** 적용한다. 실측 최악이 63h45m 이었다
+_QUOTA_STREAK_WARN = 2           # 이 횟수부터 화면에 게이트 부재 누적을 적는다
+
+
+def _quota_state_path() -> Optional[str]:
+    """쿼터 상태 파일. 폴더를 믿을 수 없으면 None — **대체 폴더를 만들지 않는다.**
+
+    `mkdtemp` 로 대체하면 실행마다 새 폴더가 생겨 캐시가 조용히 무력해진다. 그럴 바에는
+    캐시가 없는 편이 낫다 — 다음 실행이 609초를 쓰지만 그 사실이 화면에 보인다.
+    ⚠ Windows 에서 `%LOCALAPPDATA%` 가 없어 공유 `%TEMP%` 로 떨어진 경우(`shared`)도
+      쓰지 않는다. 남이 심은 `reset_at` 으로 게이트를 최대 72시간 막을 수 있다(Eng M7).
+    """
+    d, status = _state_dir(create=True)
+    return os.path.join(d, _QUOTA_STATE_NAME) if d and status == "ok" else None
+
+
+def _load_quota_state(path: Optional[str]) -> dict:
+    """모델 이름 → 항목. 읽지 못하거나 모양이 깨졌으면 빈 dict — **막지 않는다.**
+
+    ⛔ `main` 은 예기치 못한 예외를 전부 `internal_error`(exit 1)로 바꾼다. JSON 은 맞지만
+      모양이 깨진 파일(`{"models": []}` · `reset_at: 123`)은 `TypeError` ·
+      `AttributeError` 를 내므로 여기서 **전부** 잡는다.
+    ⚠ 모르는 키는 무시한다(거부하지 않는다) — 1.5.1 이 필드를 더해도 1.5.0 이 남의 상태를
+      버리지 않게.
+    """
+    if not path:
+        return {}
     try:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        st = os.lstat(d)
-        if (stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode)
-                or st.st_uid != os.getuid()):
-            raise OSError("안전하지 않은 결과 폴더: %s" % d)
-        # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] "느슨하면 좁힌다"만으로는 부족하다.
-        #   내 소유 폴더가 쓰기 권한 없이(0500, 엄격한 umask) 있으면 `& 0o077` 이
-        #   0 이라 그대로 반환되고 결과 기록이 실패한다 → 정확히 0700 으로 맞춘다.
-        if stat.S_IMODE(st.st_mode) != 0o700:
-            os.chmod(d, 0o700)
-        return d
+        with io.open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        models = data.get("models")
+        if not isinstance(models, dict):
+            return {}
+        return dict((name, item) for name, item in models.items()
+                    if isinstance(name, str) and isinstance(item, dict))
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return {}
+
+
+def _save_quota_state(path: Optional[str], models: dict) -> bool:
+    """원자적으로 기록. 실패해도 **종료 코드를 바꾸지 않는다** — 성패만 돌려준다."""
+    if not path:
+        return False
+    try:
+        _write_json_atomic(path, {"models": models})
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _quota_entry_reset(entry: dict, now=None):
+    """항목이 **아직 유효한 차단**이면 해제 시각, 아니면 None.
+
+    ⚠ 72시간 상한과 `recorded_at` 미래 검사는 **추정 기록에만** 적용한다. `/quota` 가 준
+      값은 권위 있으므로 자르지 않는다 — 자르면 실제보다 일찍 풀린 것으로 보여 609초를
+      다시 태운다.
+    """
+    now = now or _utc_now()
+    reset = _parse_utc(entry.get("reset_at"))
+    if reset is None or reset <= now:
+        return None
+    if entry.get("source") != "quota_query":
+        recorded = _parse_utc(entry.get("recorded_at"))
+        if recorded is None or recorded > now:
+            return None                  # 시계가 뒤로 갔다 — 믿지 않는다
+        if (reset - recorded).total_seconds() > _QUOTA_MAX_HOURS * 3600:
+            return None
+    return reset
+
+
+def _quota_query(agy: str, model: str, cwd: str, calls: Optional[List[dict]] = None,
+                 timeout: int = _QUOTA_QUERY_TIMEOUT) -> Optional[List[dict]]:
+    """`/quota` 의 그룹 목록. 읽지 못하면 None — **없다고 막지 않는다.**
+
+    ⭐ [1.5.0] agy 의 print 모드는 읽기 전용 슬래시 명령을 **에이전트 턴 없이** 답한다.
+      실측(agy 1.2.3): `usage` 전부 0 · `num_turns` 0 · `conversation_id` 빈 문자열 —
+      즉 **토큰을 쓰지 않는다.** 그래서 "커밋당 총 토큰을 늘리지 않는다" 는 제약을 지킨다.
+      소요는 실측 6초라 공짜는 아니다 → 차단이 기록된 뒤에만 부른다(호출부 참조).
+    ⚠ agy 호출은 `_run_agy` **한 곳**을 쓴다 — `--mode plan` · stdin 차단 · 바깥 상한이 거기
+      한 자리에 모여 있고, 흩어 두면 그 중 하나가 빠진다(26.09.15 S5, 실제로 세 자리에서
+      한 번씩 빠졌다). 짧은 상한이 필요해 `margin` 만 줄인다 — 모델이 도는 호출이 아니라
+      여유를 깎아도 정상 응답을 자를 위험이 없다.
+    """
+    run = _run_agy(agy, model, ["-p", "/quota", "--output-format", "json"],
+                   cwd, "%ds" % timeout, timeout, margin=5)
+    if calls is not None:
+        # 조회도 `_meta.calls` 에 남긴다. 단락 경로의 불변식은 "구조화(`structured`) 호출이
+        #   0회" 이지 "agy 호출이 0회" 가 아니다 — 무엇을 했는지 감추면 안 된다.
+        calls.append(_call_record("quota_query", model, run,
+                                  "ok" if run.rc == 0 else "tool_error", "", ""))
+    if run.rc != 0:
+        return None
+    try:
+        payload = json.loads(run.stdout)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    command = payload.get("command")
+    if not isinstance(command, dict) or command.get("name") != "usage":
+        return None                      # agy 판이 바뀌어 모양이 다르다 — 믿지 않는다
+    data = command.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
+        return None
+    return data["groups"]
+
+
+def _quota_group_for_model(groups: List[dict], model: str) -> Optional[dict]:
+    """모델이 속한 쿼터 그룹. **정확히 하나일 때만** 인정한다.
+
+    `/quota` 는 모델을 계열로 묶어 답한다(실측: `Gemini Models` · `Claude and GPT models`).
+    모델 id 의 첫 토큰(`gemini-3.1-pro-high` → `gemini`)을 그룹 이름에서 찾는다.
+    ⚠ 0개거나 2개 이상이면 None 을 돌려 **막지 않는다.** 비대칭이 분명하다 — 잘못 막으면
+      그 기기의 커밋 게이트가 사라지고, 못 막으면 609초를 한 번 더 태울 뿐이다.
+    """
+    token = (model or "").strip().lower().split("-")[0]
+    if not token:
+        return None
+    hits = [g for g in groups
+            if isinstance(g, dict) and token in str(g.get("name", "")).lower()]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _quota_blocked(group: dict, now=None):
+    """차단 중이면 `(해제 시각, 차단 버킷들)`, 아니면 None.
+
+    ⚠ 여유를 두지 않고 **정확히 0** 과 비교한다. 실측 차단값이 `remaining_fraction: 0`
+      이었고, 여유를 두면 쿼터가 남았는데도 막는다.
+    ⚠ 해제 시각을 읽지 못했거나 이미 지난 버킷은 세지 않는다 — 언제 풀리는지 말할 수 없는
+      차단으로 게이트를 막으면 사용자가 기다릴 근거를 잃는다.
+    """
+    now = now or _utc_now()
+    hit = []
+    for bucket in group.get("buckets") or []:
+        if not isinstance(bucket, dict):
+            continue
+        frac = bucket.get("remaining_fraction")
+        if isinstance(frac, bool) or not isinstance(frac, (int, float)) or frac > 0:
+            continue
+        when = _parse_utc(bucket.get("reset_time"))
+        if when is None or when <= now:
+            continue
+        hit.append((when, bucket))
+    if not hit:
+        return None
+    hit.sort(key=lambda pair: pair[0])
+    return hit[-1][0], [b for _, b in hit]   # 여럿이면 가장 늦게 풀리는 쪽까지 막힌다
+
+
+def _fmt_until(reset) -> str:
+    """`(49h20m 뒤 · 09-18 09:49 로컬)`. 남은 시간과 **절대 시각**을 함께 보여 준다.
+
+    남은 시간만 적으면 기록 당시 값인지 지금 값인지 구분되지 않는다(캐시 단락의 본문에는
+    기록 당시 원문이 그대로 실린다).
+    """
+    secs = max(0, int((reset - _utc_now()).total_seconds()))
+    local = datetime.fromtimestamp(
+        time.time() + secs).strftime("%m-%d %H:%M")
+    return "%s 뒤 · %s 로컬" % (_fmt_hms(secs) or "0s", local)
+
+
+def _quota_guard(fn, *args, **kwargs):
+    """쿼터 상태 부작용은 **판정 · 종료 코드를 바꿀 수 없다**(1.5.0 상태 불변식).
+
+    ⛔ `main` 은 예기치 못한 예외를 전부 `internal_error`(exit 1)로 바꾼다. 상태 기록 하나가
+      깨끗한 exit 4("기다리면 풀린다")를 exit 1("스크립트 결함이다")로 뒤집으면 처방이
+      정반대가 된다. 실측으로 확인했다 — 이 가드가 없을 때 가짜 agy 의 서명이 하나 달라진
+      것만으로 결과 계약 매트릭스의 쿼터 행이 exit 1 이 됐다.
+    ⚠ `except Exception` 이 넓은 것은 **의도**다. 이 경로에서 잃을 수 있는 것은 캐시뿐이고,
+      잃지 말아야 할 것은 판정이다. 무엇이 터졌는지는 화면에 남긴다.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:                 # noqa: BLE001 — 위 docstring 참조
+        _say_note("쿼터 상태를 다루지 못했다",
+                  "%s: %s" % (exc.__class__.__name__, str(exc)[:200]),
+                  "다음 실행이 같은 대기를 다시 쓴다. 판정과 종료 코드는 그대로다.")
+        return None
+
+
+def _quota_short_circuit(agy: str, model: str, cwd: str, state_path: Optional[str],
+                         models: dict, calls: Optional[List[dict]] = None):
+    """차단 기록이 있을 때만 `/quota` 로 확인한다. 아직 차단이면 `(해제 시각, 항목)`.
+
+    ⛔ **차단 기록이 없으면 조회하지 않는다.** 조회는 토큰 0 이지만 실측 6초다. 차단되지
+      않은 날이 대부분이므로 매 리뷰에 얹을 값이 아니다 — 첫 차단은 429 가 알려 준다
+      (C1 수정으로 하드 상한에 걸린 경우까지 잡는다).
+    반환이 None 이면 그대로 진행한다. 풀린 것이 확인되면 항목을 지운다 —
+    **조회 성공이 곧 해제 신호다**(그래서 별도의 재탐색이 필요 없다).
+    """
+    entry = models.get(model)
+    if not isinstance(entry, dict):
+        return None
+    cached_reset = _quota_entry_reset(entry)
+
+    groups = _quota_query(agy, model, cwd, calls)
+    if groups is not None:
+        group = _quota_group_for_model(groups, model)
+        if group is not None:
+            blocked = _quota_blocked(group)
+            if blocked is None:
+                models.pop(model, None)          # 풀렸다 — 기록을 지우고 정상 진행
+                _save_quota_state(state_path, models)
+                return None
+            reset, buckets = blocked
+            entry["reset_at"] = reset.strftime(_UTC_FMT)
+            entry["source"] = "quota_query"
+            entry["cached_hits"] = int(entry.get("cached_hits") or 0) + 1
+            entry.setdefault("blocked_since", entry.get("recorded_at") or _utc_now_str())
+            models[model] = entry
+            _save_quota_state(state_path, models)
+            return reset, entry, "quota_query", buckets
+        # 모델을 그룹에 대응시키지 못했다 — 막지 않고 저장된 값으로만 판단한다.
+    if cached_reset is None:
+        return None
+    entry["cached_hits"] = int(entry.get("cached_hits") or 0) + 1
+    models[model] = entry
+    _save_quota_state(state_path, models)
+    return cached_reset, entry, "cached", []
+
+
+def _record_quota_block(agy: str, model: str, cwd: str, detail: str,
+                        calls: Optional[List[dict]] = None) -> dict:
+    """429 를 만났을 때 차단을 기록한다. 반환은 `_meta` 에 실을 필드.
+
+    권위 있는 값을 먼저 노린다 — 이미 609초를 쓴 뒤라 6초짜리 `/quota` 는 무시할 만하고,
+    그 대가로 **추정이 아닌** `reset_time` 을 저장한다. 조회가 답하지 못하면 오류 문자열의
+    `Resets in …` 을 읽어 추정으로 기록하고(72시간 상한), 그것도 못 읽으면 보수적으로
+    15분만 막는다 — 손익이 비대칭이다(최대 15분 대 매 실행 609초).
+    """
+    now = _utc_now()
+    meta: dict = {}
+    reset = None
+    source = "error_hint"
+    groups = _quota_query(agy, model, cwd, calls)
+    if groups is not None:
+        group = _quota_group_for_model(groups, model)
+        if group is not None:
+            blocked = _quota_blocked(group, now)
+            if blocked is not None:
+                reset, _ = blocked
+                source = "quota_query"
+            meta["quota_probe"] = "blocked" if blocked else "clear"
+    if reset is None:
+        secs = _quota_reset_seconds(detail)
+        if secs is None:
+            meta["quota_reset_raw"] = _first_line(detail)[:300]
+            _say_note("쿼터 재설정 시각을 읽지 못했다",
+                      "오류 문구에서 `Resets in …` 을 찾지 못했다.",
+                      "보수적으로 15분만 막는다 — 그 뒤 실행은 다시 609초를 쓸 수 있다.")
+            secs = 15 * 60
+        reset = now + timedelta(seconds=min(secs, _QUOTA_MAX_HOURS * 3600))
+
+    path = _quota_state_path()
+    if path is None:
+        _say_note("쿼터 차단을 기록하지 못했다", "상태 폴더를 믿을 수 없다.",
+                  "다음 실행이 같은 대기를 다시 쓴다.")
+        return meta
+    models = _load_quota_state(path)
+    previous = models.get(model) if isinstance(models.get(model), dict) else {}
+    models[model] = {
+        "reset_at": reset.strftime(_UTC_FMT), "recorded_at": _utc_now_str(),
+        "source": source, "detail": _first_line(detail)[:300],
+        "blocked_since": previous.get("blocked_since") or _utc_now_str(),
+        "cached_hits": int(previous.get("cached_hits") or 0)}
+    if not _save_quota_state(path, models):
+        _say_note("쿼터 차단을 기록하지 못했다", "상태 파일에 쓰지 못했다.",
+                  "다음 실행이 같은 대기를 다시 쓴다.")
+    return meta
+
+
+def _clear_quota_block(model: str) -> None:
+    """그 모델의 호출이 `ok` 로 끝났을 때만 항목을 지운다.
+
+    ⚠ 지우기 직전에 다시 읽어, 그 사이 다른 세션이 새로 기록한 차단을 덮지 않는다.
+    """
+    path = _quota_state_path()
+    if path is None:
+        return
+    models = _load_quota_state(path)
+    if models.pop(model, None) is not None:
+        _save_quota_state(path, models)
+
+
+_STATS_FILE_CAP = 5000           # mtime 최신순. 넘으면 잘렸다는 사실을 알린다
+# 회차로 세는 mode — 리뷰를 위해 agy 에 **실제로 요청을 보낸** 실행이다.
+#   `check` 는 진단이고, `quota_cached` 단락과 `internal_error` 는 요청을 보내지 않았다.
+_STATS_ROUND_MODES = frozenset((
+    "reviewed", "text_fallback", "parse_failed", "timeout", "quota_exhausted",
+    "tool_unavailable", "review_unavailable", "primary_model_unavailable",
+    "model_unavailable", "tool_error"))
+_STATS_VERDICT_MODES = frozenset(("reviewed",))   # 통과율의 분모
+
+
+def _stats_read(path: str) -> Optional[dict]:
+    """결과 파일 하나에서 **집계에 필요한 필드만** 뽑는다. 읽지 못하면 None.
+
+    ⛔ [Eng M5] 파일을 통째로 메모리에 올리면 `text_fallback` 의 `raw_text` 나 대량
+      findings 가 섞였을 때 터진다. 개별 파일이 깨졌다고 전체 집계를 잃어서도 안 된다 —
+      건너뛰고 "읽지 못한 N건" 으로 보고한다.
+    """
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            body = json.load(fh)
+        meta = body.get("_meta")
+        if not isinstance(meta, dict):
+            return None
+        scope = meta.get("scope") if isinstance(meta.get("scope"), dict) else {}
+        calls = meta.get("calls") if isinstance(meta.get("calls"), list) else []
+        usage: dict = {}
+        incomplete = False
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            if call.get("stage") in ("quota_query", "probe"):
+                continue                 # 토큰이 없거나 무시할 만하다
+            values = call.get("usage")
+            if not isinstance(values, dict):
+                incomplete = True
+                continue
+            for key, value in values.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                usage[str(key)] = usage.get(str(key), 0) + value
+        return {
+            "mode": meta.get("mode"), "exit_code": meta.get("exit_code"),
+            "passed": bool(meta.get("passed")),
+            "written_at": _parse_utc(meta.get("written_at")) or _file_time(path),
+            "repo": scope.get("repo"), "branch": scope.get("branch"),
+            "key_sha": scope.get("merge_base_sha") or scope.get("base_sha")
+            or scope.get("head_sha"),
+            "diff_sha256": meta.get("diff_sha256"),
+            "diff_bytes": meta.get("diff_bytes"),
+            "quota_cached": bool(meta.get("quota_cached")),
+            "findings": len(body.get("findings") or []) if isinstance(
+                body.get("findings"), list) else 0,
+            "seconds": meta.get("elapsed_seconds"),
+            "usage": usage, "usage_incomplete": incomplete}
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
+def _file_time(path: str) -> Optional[datetime]:
+    """1.4.x 파일에는 `written_at` 이 없다 — 파일명의 `YYYYMMDD_HHMMSS` 를 **로컬** 시각으로
+    읽어 UTC 로 정규화한다(그 시절 코드가 `datetime.now()` 로 지었다).
+
+    ⛔ [Eng H4] 읽는 즉시 UTC 로 맞추지 않으면 `written_at`(UTC)과 한 정렬·한 필터에서
+      섞인다. CI 는 UTC 라 그 회귀가 **영원히 빨개지지 않는다.**
+    """
+    name = os.path.basename(path)
+    m = re.search(r"(\d{8})_(\d{6})", name)
+    if not m:
+        return None
+    try:
+        local = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    # ⛔ [26.09.16 교차리뷰 HIGH] `time.timezone` 을 손으로 빼지 말 것. 그 값은 **UTC 기준
+    #   서쪽으로의 초**라 KST 에서 -32400 이고, DST 분기까지 얹으면 부호를 뒤집기 쉽다 —
+    #   실제로 그렇게 짰다가 KST 오전 10시가 UTC 19:00(18시간 미래)으로 나왔고, 그러면
+    #   과거 결과가 미래로 둔갑해 `--since` 필터가 통째로 어긋난다.
+    #   `mktime` → `utcfromtimestamp` 는 OS 에 맡기므로 DST 도 자동으로 맞는다.
+    try:
+        stamp = time.mktime(local.timetuple())
+    except (OverflowError, ValueError):
+        return None
+    return datetime(1970, 1, 1) + timedelta(seconds=stamp)
+
+
+def _median(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _percentile(values, pct):
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * len(ordered) + 0.5)) - 1))
+    return ordered[idx]
+
+
+def _run_stats(args) -> int:
+    """쌓인 결과 파일을 집계한다. **agy 를 부르지 않고 결과 파일도 쓰지 않는다.**
+
+    종료 코드는 0(집계함 · 0건 포함) 또는 2(폴더를 믿을 수 없음)다. 개별 파일이 깨진 것은
+    건너뛰고 "읽지 못한 N건" 으로 보고하며 0 을 유지한다 — 파일 하나로 전체를 잃지 않는다.
+    """
+    if args.stats_dir:
+        base = os.path.abspath(os.path.expanduser(args.stats_dir))
+        if not os.path.isdir(base):
+            _safe_print("⛔ --stats-dir 경로가 폴더가 아니다: %s" % base)
+            return EXIT_TOOL_ERROR
+    else:
+        base, status = _state_dir(create=False)
+        if base is None or status == "unsafe":
+            _safe_print("⛔ 결과 폴더를 믿을 수 없다(링크 · 남의 소유 · 읽기 실패).")
+            _safe_print("   --stats-dir 로 폴더를 직접 지정하거나 폴더 권한을 확인할 것.")
+            return EXIT_TOOL_ERROR
+
+    since = _utc_now() - timedelta(seconds=_duration_seconds(args.since, 14 * 86400))
+    try:
+        names = [n for n in os.listdir(base)
+                 if n.startswith("gemini_review_") and n.endswith(".json")]
     except OSError:
-        return tempfile.mkdtemp(prefix="gemini_review_out_")
+        names = []
+    if not names:
+        _safe_print("결과 0건 — 집계할 것이 없다 (%s)" % base)
+        _safe_print("   `--out` 으로 다른 경로에 쓴 결과는 집계에 들어가지 않는다.")
+        return EXIT_PASSED
+
+    paths = [os.path.join(base, n) for n in names]
+    truncated = 0
+    if len(paths) > _STATS_FILE_CAP:
+        paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        truncated = len(paths) - _STATS_FILE_CAP
+        paths = paths[:_STATS_FILE_CAP]
+
+    rows, unreadable = [], 0
+    for path in paths:
+        row = _stats_read(path)
+        if row is None:
+            unreadable += 1
+            continue
+        if row["written_at"] is None or row["written_at"] >= since:
+            rows.append(row)
+
+    rounds = [r for r in rows if r["mode"] in _STATS_ROUND_MODES and not r["quota_cached"]]
+    judged = [r for r in rounds if r["mode"] in _STATS_VERDICT_MODES]
+    cached = [r for r in rows if r["quota_cached"]]
+    blocks = [r for r in rounds if r["mode"] == "quota_exhausted"]
+
+    _safe_print("gemini-review --stats · 최근 %s · %s" % (args.since, base))
+    _safe_print("")
+    _safe_print("회차 %d · 판정이 난 회차 %d · 통과 %d (%s)"
+                % (len(rounds), len(judged), len([r for r in judged if r["passed"]]),
+                   _pct(len([r for r in judged if r["passed"]]), len(judged))))
+    _safe_print("쿼터 차단 %d회 · 캐시 단락 %d회 · 읽지 못한 파일 %d건%s"
+                % (len(blocks), len(cached), unreadable,
+                   " · 상한으로 잘린 %d건" % truncated if truncated else ""))
+
+    # 루프 키별 회차 — 커밋 단위로 묶는다. 1.4.x 파일은 키가 없어 따로 센다.
+    loops: dict = {}
+    keyless = 0
+    for row in rounds:
+        if not row["repo"] or not row["key_sha"]:
+            keyless += 1
+            continue
+        loops.setdefault((row["repo"], row["branch"], row["key_sha"]), []).append(row)
+    if loops:
+        sizes = [len(v) for v in loops.values()]
+        singles = len([1 for n in sizes if n == 1])
+        _safe_print("")
+        _safe_print("루프 %d개 · 회차 중앙값 %s · p90 %s · 최대 %d"
+                    % (len(loops), _median(sizes), _percentile(sizes, 90), max(sizes)))
+        # ⚠ 쪼개짐 지표를 **p90 보다 먼저** 본다. 기본 실행(`--base HEAD~1`)에서 수정 커밋을
+        #   쌓으면 키가 회차마다 갈려 회차를 과소 계상한다(Eng M6).
+        _safe_print("  키 1회짜리 루프 %d개 (%s) — 이 값이 크면 위 회차 수를 믿지 말 것"
+                    % (singles, _pct(singles, len(loops))))
+        grew, fixed = _loop_shapes(loops)
+        _safe_print("  범위 증가형 %d · 범위 고정형 %d — 증가형은 수정이 새 결함을 낳는 쪽,"
+                    % (grew, fixed))
+        _safe_print("  고정형은 한 번에 다 못 찾는 쪽이다(처방이 다르다)")
+    if keyless:
+        _safe_print("  키 없음 %d회 (1.4.x 결과 — repo · branch 가 없다)" % keyless)
+
+    # ⚠ 해시가 있는 회차끼리만 센다. 1.4.x 결과에는 `diff_sha256` 이 없어, 전체 회차 수에서
+    #   빼면 "전부 반복" 이라는 거짓이 나온다(실측으로 확인했다).
+    hashed = [r["diff_sha256"] for r in rounds if r["diff_sha256"]]
+    repeats = len(hashed) - len(set(hashed))
+    if repeats > 0:
+        _safe_print("  같은 diff 를 다시 리뷰한 회차 %d (코드를 안 고치고 돌렸다)" % repeats)
+
+    secs = [r["seconds"] for r in rounds if isinstance(r["seconds"], (int, float))]
+    if secs:
+        _safe_print("")
+        _safe_print("소요 중앙값 %.0f초 · 최대 %.0f초" % (_median(secs), max(secs)))
+
+    keys = sorted(set(k for r in rounds for k in r["usage"]))
+    incomplete = len([1 for r in rounds if r["usage_incomplete"]])
+    _safe_print("")
+    if not keys:
+        _safe_print("리뷰당 토큰: 기록 없음 (1.4.x 결과이거나 래퍼에 usage 가 없었다)")
+    else:
+        for key in keys:
+            values = [r["usage"][key] for r in rounds if key in r["usage"]]
+            _safe_print("  %-18s 중앙값 %s · 최대 %s (%d회)"
+                        % (key, _median(values), max(values), len(values)))
+    if incomplete:
+        _safe_print("  ⚠ 토큰 불완전 %d회 (텍스트 재시도 · 하드 상한 등으로 래퍼가 없었다)"
+                    % incomplete)
+    return EXIT_PASSED
+
+
+def _loop_shapes(loops: dict):
+    """루프를 **범위 증가형 · 고정형**으로 가른다. 반환 `(증가, 고정)`.
+
+    OQ6 분류(2026-09-16)에서 이것이 원인을 가르는 유일하게 확실한 손잡이였다 —
+    범위가 커지는 루프는 (ii) 수정이 만든 결함이, 고정된 루프는 (i) 처음부터 있던 결함이
+    지배한다(실측 27% 대 67%). 처방이 다르므로 섞어 세면 안 된다.
+    """
+    grew = fixed = 0
+    for rows in loops.values():
+        sizes = [r["diff_bytes"] for r in sorted(
+            rows, key=lambda r: r["written_at"] or datetime.min)
+            if isinstance(r["diff_bytes"], int)]
+        if len(sizes) < 2:
+            continue
+        # 마지막이 처음보다 1.5배 넘게 커졌으면 "범위가 자란 루프" 로 본다.
+        (grew, fixed) = (grew + 1, fixed) if sizes[-1] > sizes[0] * 1.5 else (grew, fixed + 1)
+    return grew, fixed
+
+
+def _pct(part: int, whole: int) -> str:
+    return "%.0f%%" % (100.0 * part / whole) if whole else "-"
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -1646,7 +2397,7 @@ def _decode_stream(data) -> str:
 
 
 def _run_agy(agy: str, model: str, extra: List[str], cwd: str,
-             timeout_spec: str, default_secs: int) -> _AgyRun:
+             timeout_spec: str, default_secs: int, margin: int = None) -> _AgyRun:
     """agy 를 부르는 **유일한** 자리. `--mode plan` · stdin 차단 · 바깥 하드 상한을 여기서만 건다.
 
     ⛔ [26.09.14 Eng 교차리뷰 S5] 종전에는 세 함수(구조화 · 생존 확인 · 텍스트 재시도)가
@@ -1659,7 +2410,10 @@ def _run_agy(agy: str, model: str, extra: List[str], cwd: str,
     """
     cmd = [agy, "--mode", "plan",         # ★ read-only 고정 (협상 대상 아님)
            "--model", model] + list(extra)
-    hard = _duration_seconds(timeout_spec, default_secs) + _HARD_TIMEOUT_MARGIN
+    # ⚠ [1.5.0] `margin` 은 **agy 에 턴을 맡기지 않는 호출**만 줄인다(`/quota` 같은 읽기 전용
+    #   슬래시 명령). 모델이 도는 호출에서 여유를 줄이면 정상 응답을 잘라 버린다.
+    hard = _duration_seconds(timeout_spec, default_secs) + (
+        _HARD_TIMEOUT_MARGIN if margin is None else margin)
     started = time.time()
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, check=False,
@@ -1779,10 +2533,54 @@ def _looks_like_quota_error(detail: str) -> bool:
 _QUOTA_RESET = re.compile(r"resets in\s+([0-9][0-9hms.]*[hms])", re.I)
 
 
-def _quota_reset_hint(detail: str) -> str:
-    """쿼터 안내의 재설정까지 남은 시간(`23m10s`). 없으면 빈 문자열."""
+_HMS = re.compile(r"^(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?$")
+
+
+def _parse_hms(text: str) -> Optional[int]:
+    """`63h45m21s` → 229521. 문법에 맞지 않으면 None.
+
+    ⛔ 최소 한 단위를 **강제**한다 — `^(\\d+h)?(\\d+m)?(\\d+s)?$` 는 빈 문자열에도 매치해서
+      거부해야 할 입력에 0 을 주는 죽은 가드가 된다(Eng M8).
+    ⚠ `\\d` 가 아니라 `[0-9]` 를 쓴다 — `\\d` 는 유니코드 숫자(아라비아-인도 숫자 등)도 잡는다.
+    ⚠ 기존 `_duration_seconds` 와 합치지 않는다. 그쪽은 `--timeout` 의 단일 단위 표기를 읽고
+      **읽지 못하면 기본값을 돌려준다.** 여기서는 읽지 못한 것을 반드시 알아야 한다 —
+      기본값을 받으면 쿼터 차단을 엉뚱한 시각까지로 기록한다.
+    """
+    m = _HMS.match((text or "").strip())
+    if not m or not any(m.groups()):
+        return None
+    h, mi, s = (int(g or 0) for g in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def _fmt_hms(secs: Optional[int]) -> str:
+    """`229521` → `63h45m21s`. 앞자리 0 단위는 뺀다(`23m10s` · `49h20m10s`)."""
+    if secs is None or secs < 0:
+        return ""
+    h, rest = divmod(int(secs), 3600)
+    mi, s = divmod(rest, 60)
+    parts = []
+    if h:
+        parts.append("%dh" % h)
+    if mi or h:
+        parts.append("%dm" % mi)
+    parts.append("%ds" % s)
+    return "".join(parts)
+
+
+def _quota_reset_seconds(detail: str) -> Optional[int]:
+    """쿼터 안내에서 재설정까지 남은 **초**. 읽지 못하면 None.
+
+    화면의 `retry_after` 와 상태 파일의 추정 기록이 **같은 함수**를 쓰게 한 곳에 둔다 —
+    두 경로가 서로 다른 값을 내면 사용자가 어느 쪽을 믿을지 알 수 없다.
+    """
     m = _QUOTA_RESET.search(detail or "")
-    return m.group(1) if m else ""
+    return _parse_hms(m.group(1)) if m else None
+
+
+def _quota_reset_hint(detail: str) -> str:
+    """쿼터 안내의 재설정까지 남은 시간(`23m10s`). 없거나 읽지 못하면 빈 문자열."""
+    return _fmt_hms(_quota_reset_seconds(detail))
 
 
 def _wrapper_status(raw: str) -> str:

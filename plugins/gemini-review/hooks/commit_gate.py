@@ -16,7 +16,10 @@ Claude 가 Bash 도구로 `git commit` 을 실행하려 할 때, **스테이징�
 
 ⚠ 위협 모델은 **망각**이다. 모델이 일부러 게이트를 속이는 경우(결과 파일 위조, 설정 파일
   직접 편집, git alias)는 막지 않는다. 그 대신 모델이 흔히 쓰는 꼴(`git add … && git commit`,
-  `-am`, heredoc 메시지)은 해석하고, 해석하지 못한 꼴은 **막는다**(fail-closed).
+  `-am`, `git commit -- 경로`, heredoc 메시지)은 해석하고, 해석하지 못한 꼴은 **막는다**(fail-closed).
+⚠ [1.7.0] 커밋 형태를 막지 않고 **커밋이 담을 내용을 모사**해 해시를 잰다(`gemini_review._commit_diff`).
+  1.6.x 는 `add && commit` · 경로 지정 커밋을 형태만 보고 막아, 두 세션이 작업 트리를 공유할 때 쓰는
+  경로 지정 커밋이 아예 불가능했다(다른 프로젝트 운영 보고).
 """
 
 import importlib.util
@@ -38,8 +41,9 @@ _RESULT_SCAN_CAP = 500          # mtime 최신순으로 이만큼만 읽는다 �
 _MAX_NESTING = 4                # bash -c · eval 재귀 한도
 
 # 커밋보다 **앞에** 같은 명령에 있어도 되는 git 하위 명령 — 인덱스를 바꾸지 않는다.
-#   ⛔ 이 목록 밖은 막는다. `git add -A && git commit` 에서 게이트가 보는 인덱스는 add **전**의
-#     것이라, 리뷰 뒤에 스테이징된 변경이 해시 비교를 비껴 커밋된다.
+#   `git add` 는 따로 다룬다 — 임시 인덱스에서 **모사**해 커밋 내용에 반영한다(1.7.0).
+#   ⛔ 이 목록 밖(reset · rm · stash · checkout …)은 모사하지 않으므로 막는다. 게이트가 보는 인덱스는
+#     그 명령 **전**의 것이라, 리뷰 뒤에 바뀐 내용이 해시 비교를 비껴 커밋된다.
 _READ_ONLY_GIT = frozenset((
     "status", "diff", "log", "show", "rev-parse", "branch", "remote", "fetch", "ls-files",
     "describe", "blame", "grep", "shortlog", "reflog", "cat-file", "version", "help",
@@ -50,12 +54,14 @@ _READ_ONLY_GIT = frozenset((
 # `git commit` 옵션 — 값을 **다음 인자로** 받는 것. 이것을 모르면 메시지를 경로로 오인한다.
 _COMMIT_SHORT_WITH_VALUE = "mFCct"
 _COMMIT_SHORT_OPTIONAL = "uS"   # 값은 붙여서만 받는다(`-uno` · `-Skey`)
-# ⛔ 인덱스가 아닌 내용을 커밋하는 옵션 — 리뷰한 스테이징과 커밋 내용이 달라진다.
-_COMMIT_SHORT_UNSAFE = "aiop"
+# 커밋이 담을 내용을 바꾸는 옵션 — 막지 않고 모사한다(1.7.0). 짧은 이름 → 긴 이름.
+_COMMIT_CONTENT_FLAGS = {"a": "all", "i": "include", "o": "only"}
+# ⛔ 게이트가 모사할 수 없는 옵션 — 대화형 선택 · 파일로 넘긴 경로.
+_COMMIT_SHORT_UNSUPPORTED = "p"
+_COMMIT_LONG_UNSUPPORTED = ("interactive", "patch", "pathspec-from-file")
 _COMMIT_LONG_WITH_VALUE = (
     "message", "file", "reuse-message", "reedit-message", "template", "author", "date",
     "cleanup", "fixup", "squash", "trailer")
-_COMMIT_LONG_UNSAFE = ("all", "include", "only", "interactive", "patch", "pathspec-from-file")
 _COMMIT_LONG_SAFE = (
     "amend", "no-edit", "edit", "quiet", "verbose", "signoff", "no-signoff", "no-verify",
     "verify", "allow-empty", "allow-empty-message", "no-post-rewrite", "status", "no-status",
@@ -496,39 +502,49 @@ def _git_step(argv):
     return {"kind": "git", "sub": None, "args": [], "dirs": dirs, "repo_unknown": repo_unknown}
 
 
-def commit_form_problem(args):
-    """`git commit` 인자가 **인덱스 그대로를 커밋하는지** 본다. 문제가 있으면 그 설명, 없으면 None.
+def commit_plan(args):
+    """`git commit` 인자 → 커밋이 담을 내용의 **모사 계획**. 반환 (계획, 문제).
 
-    ⛔ `-a` · 경로 지정 · `--include` · `--only` · `--patch` 는 게이트가 해시를 잰 인덱스와
-      다른 내용을 커밋한다. 해석을 넓히는 대신 막고, 스테이징 뒤 단독 커밋을 안내한다.
+    계획은 `{"mode": index · all · include · only, "pathspec": [...]}` 이고, 문제가 있으면 계획은 None 이다.
+    ⚠ git 이 받는 규칙을 따른다: 경로가 있으면 기본이 `--only`, `-i` 는 경로가 있어야 하고, `-a` 는 경로와
+      함께 쓸 수 없다. git 이 거부하는 조합은 막는다 — 모사할 대상이 없다.
+    ⛔ 모르는 긴 옵션도 막는다. 값을 받는 옵션인지 모르면 메시지를 경로로 읽거나 경로를 값으로 삼킨다.
     """
+    flags = set()
+    pathspec = []
+    long_names = (_COMMIT_LONG_SAFE + _COMMIT_LONG_WITH_VALUE + _COMMIT_LONG_UNSUPPORTED
+                  + tuple(_COMMIT_CONTENT_FLAGS.values()))
     k = 0
     while k < len(args):
         a = args[k]
         if a == "--":
-            return "경로 지정(`--` 뒤)" if k + 1 < len(args) else None
+            pathspec.extend(args[k + 1:])
+            break
         if a.startswith("--"):
-            name = a[2:].split("=", 1)[0]
-            if name in _COMMIT_LONG_SAFE:
-                k += 1
-                continue
-            if name in _COMMIT_LONG_WITH_VALUE:
-                k += 1 if "=" in a else 2
-                continue
-            # git 은 긴 옵션의 **고유한 앞부분**도 받는다(`--inc` → `--include`).
-            if any(u.startswith(name) for u in _COMMIT_LONG_UNSAFE):
-                return "`%s`" % a
-            prefixed = [v for v in _COMMIT_LONG_WITH_VALUE if v.startswith(name)]
-            if len(prefixed) == 1 and "=" not in a:
-                k += 2
-                continue
+            name, eq, _value = a[2:].partition("=")
+            if name not in long_names:
+                # git 은 긴 옵션의 **고유한 앞부분**도 받는다(`--inc` → `--include`).
+                found = [full for full in long_names if full.startswith(name)]
+                if len(found) != 1:
+                    return None, "게이트가 모르는 옵션 `%s`" % a
+                name = found[0]
+            if name in _COMMIT_LONG_UNSUPPORTED:
+                return None, "`%s` 는 게이트가 모사할 수 없다" % a
+            if name in _COMMIT_LONG_WITH_VALUE and not eq:
+                k += 1                    # 값은 다음 인자다
+            for short, full in _COMMIT_CONTENT_FLAGS.items():
+                if name == full:
+                    flags.add(short)
             k += 1
             continue
         if a.startswith("-") and a != "-":
             cluster = a[1:]
             for pos, ch in enumerate(cluster):
-                if ch in _COMMIT_SHORT_UNSAFE:
-                    return "`-%s`" % ch
+                if ch in _COMMIT_SHORT_UNSUPPORTED:
+                    return None, "`-%s` 는 게이트가 모사할 수 없다" % ch
+                if ch in _COMMIT_CONTENT_FLAGS:
+                    flags.add(ch)
+                    continue
                 if ch in _COMMIT_SHORT_WITH_VALUE:
                     if pos == len(cluster) - 1:
                         k += 1           # 값은 다음 인자다
@@ -537,7 +553,35 @@ def commit_form_problem(args):
                     break
             k += 1
             continue
-        return "경로 지정(`%s`)" % a
+        pathspec.append(a)
+        k += 1
+    if len(flags & {"a", "i", "o"}) > 1:
+        return None, "`-a` · `-i` · `-o` 를 함께 썼다(git 이 거부한다)"
+    if "a" in flags:
+        if pathspec:
+            return None, "`-a` 와 경로를 함께 썼다(git 이 거부한다)"
+        return {"mode": "all", "pathspec": []}, None
+    if "i" in flags:
+        if not pathspec:
+            return None, "`-i` 에 경로가 없다(git 이 거부한다)"
+        return {"mode": "include", "pathspec": pathspec}, None
+    if pathspec:
+        return {"mode": "only", "pathspec": pathspec}, None
+    return {"mode": "index", "pathspec": []}, None
+
+
+def add_problem(args):
+    """커밋 앞의 `git add` 를 게이트가 모사할 수 없으면 설명, 아니면 None."""
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            if any(full.startswith(name) for full in ("patch", "interactive", "edit",
+                                                     "pathspec-from-file")) and name:
+                return "`git add %s` 는 게이트가 모사할 수 없다" % a
+        elif a.startswith("-") and a != "-" and set(a[1:]) & set("pie"):
+            return "`git add %s` 는 게이트가 모사할 수 없다(대화형)" % a
     return None
 
 
@@ -545,38 +589,63 @@ def _is_dry_run(args):
     return any(a == "--dry-run" for a in args)
 
 
-def config_write_problem(step):
-    """게이트 설정을 **끄거나 지우는** git config 명령이면 설명, 아니면 None.
+# `git config` 에서 값을 **다음 인자로** 받는 옵션 — 그 값을 설정 키로 읽지 않는다.
+_CONFIG_VALUE_OPTS = ("-f", "--file", "--blob", "--type", "--default", "--comment", "--value", "--url")
+# 새 문법(`git config set 키 값`)의 하위 명령.
+_CONFIG_SUBCOMMANDS = ("get", "set", "unset", "list", "edit", "rename-section", "remove-section")
 
-    ⛔ 게이트를 끄는 것은 사용자의 결정이다(`--allow-sensitive` 와 같은 규약). 켜는 것은 막지 않는다.
+
+def config_write_problem(step):
+    """게이트 설정(`gemini-review.*`)을 **바꾸거나 지우는** git config 명령이면 설명, 아니면 None.
+
+    ⛔ 게이트 설정은 사용자의 결정이다(`--allow-sensitive` 와 같은 규약). 막지 않는 쓰기는 게이트를
+      **켜는** 것 하나다. [1.7.0] 대체 리뷰 인정(`gateFallback`) 같은 다른 키도 보호한다 — 게이트를
+      느슨하게 하는 쪽이든 조이는 쪽이든 운영자의 선택이다.
+    ⚠ 키는 **옵션 값을 건너뛴 첫 위치 인자**다. 인자 아무 데서나 `gemini-review.` 를 찾으면
+      `git config --file gemini-review.conf user.name foo` 처럼 무관한 명령을 막는다(26.09.17 교차 리뷰
+      MEDIUM, 실측 재현).
+    ⚠ `git config -e`(편집기로 여는 것)는 키를 적지 않으므로 여기서 막지 않는다 — 설정 파일을 직접
+      고치는 것과 같이 **위협 모델(망각) 밖**이다.
     """
     if step.get("sub") != "config":
         return None
-    args = step["args"]
-    lowered = [a.lower() for a in args]
-    touches = [a for a in lowered if a == GATE_KEY or a == "gemini-review"
-               or a.startswith(GATE_KEY + "=")]
-    if not touches:
+    lowered = [a.lower() for a in step["args"]]
+    flags, positional = [], []
+    k = 0
+    while k < len(lowered):
+        a = lowered[k]
+        if a == "--":
+            positional.extend(lowered[k + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            name = a.split("=", 1)[0]
+            flags.append(name)
+            if name in _CONFIG_VALUE_OPTS and "=" not in a:
+                k += 1                   # 옵션 값은 키가 아니다
+            k += 1
+            continue
+        positional.append(a)
+        k += 1
+    if positional and positional[0] in _CONFIG_SUBCOMMANDS:
+        flags.append(positional.pop(0))
+    if not positional:
         return None
-    reads = ("--get", "--get-all", "--get-regexp", "--list", "-l", "get", "list",
-             "--show-origin", "--show-scope")
-    # ⚠ `git config -e`(편집기로 여는 것)는 키를 적지 않으므로 여기 오지 않는다 — 설정 파일을 직접
-    #   고치는 것과 같이 **위협 모델(망각) 밖**이다. 도달하지 않는 항목을 목록에 두지 않는다
-    #   (26.09.16 교차 리뷰가 "차단 코드가 배선 단절" 로 짚었다).
+    key = positional[0]
+    if not (key == "gemini-review" or key.startswith("gemini-review.")):
+        return None
     removes = ("--unset", "--unset-all", "--remove-section", "--rename-section", "unset",
                "remove-section", "rename-section")
-    if any(a in removes for a in lowered):
+    if any(f in removes for f in flags):
         return "게이트 설정을 지우는 명령"
-    if any(a in reads for a in lowered) and not any(a in ("set",) for a in lowered):
+    reads = ("--get", "--get-all", "--get-regexp", "--list", "-l", "get", "list")
+    if any(f in reads for f in flags):
         return None
-    try:
-        at = lowered.index(GATE_KEY)
-    except ValueError:
-        return "게이트 설정을 바꾸는 명령"
-    value = lowered[at + 1] if at + 1 < len(lowered) else None
-    if value is None or value in ("true", "yes", "on", "1"):
+    value = positional[1] if len(positional) > 1 else None
+    if value is None:
         return None                      # 값이 없으면 읽기다
-    return "게이트를 끄는 명령"
+    if key == GATE_KEY and value in ("true", "yes", "on", "1"):
+        return None
+    return "게이트 설정을 바꾸는 명령"
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +673,20 @@ def gate_state(where):
     if rc == 1:
         return "off"                     # 설정이 없다
     return "invalid"
+
+
+def fallback_state(where):
+    """대체 리뷰 기록(`fallback_reviewed`)을 게이트가 인정하는가. 반환 "on" · "off".
+
+    기본은 인정한다 — 대체 리뷰는 같은 내용의 Gemini 시도가 **수행되지 않았을 때만** 기록되기
+    때문이다(`gemini_review._record_fallback`). 운영자가 `gemini-review.gateFallback false` 로 끈다.
+    ⛔ 값을 읽지 못하거나 불리언이 아니면 **인정하지 않는다**(fail-closed).
+    """
+    cwd = where if where and os.path.isdir(where) else os.path.expanduser("~")
+    rc, out = _git_rc(["config", "--bool", "--get", "gemini-review.gatefallback"], cwd)
+    if rc == 1:
+        return "on"
+    return "on" if rc == 0 and out.strip() == "true" else "off"
 
 
 def unknown_target_state(cwd):
@@ -657,7 +740,7 @@ def evaluate(command, cwd):
             problem = config_write_problem(step)
             if problem:
                 return EXIT_BLOCK, _message(
-                    "%s이다. 게이트를 끄거나 지우는 것은 사용자가 직접 한다." % problem,
+                    "%s이다. 게이트 설정을 바꾸거나 지우는 것은 사용자가 직접 한다." % problem,
                     "이 명령을 실행하지 않는다. 게이트가 커밋을 막고 있다면 리뷰를 통과시킨다.")
 
     commits = [k for k, s in enumerate(steps) if s["kind"] == "git" and s["sub"] == "commit"]
@@ -675,7 +758,7 @@ def evaluate(command, cwd):
             "`%s` 값이 불리언이 아니다." % GATE_KEY,
             "사용자에게 설정 값을 확인해 달라고 알린다.")
 
-    alone = "`git commit` 을 **단독 명령**으로(앞에 `git add` 등을 잇지 않고) 다시 실행한다."
+    alone = "`git commit` 을 **단독 명령**으로(앞에 다른 git 명령을 잇지 않고) 다시 실행한다."
     if suspicious:
         return EXIT_BLOCK, _message("명령을 해석하지 못했다(%s)." % parse_error, alone)
     if opaque:
@@ -688,34 +771,62 @@ def evaluate(command, cwd):
         return EXIT_BLOCK, _message(
             "어느 저장소의 커밋인지 확정할 수 없다(`cd -` · 변수 경로 · GIT_DIR 등).",
             "저장소 폴더에서 " + alone)
-    for step in steps[:at]:
-        if step["kind"] in ("git", "opaque") and step["sub"] not in _READ_ONLY_GIT:
+    adds = []
+    for k, step in enumerate(steps[:at]):
+        if step["kind"] == "git" and step["sub"] == "add":
+            problem = add_problem(step["args"])
+            add_dir = _resolve_dir(steps, k, cwd)
+            if problem or add_dir is None:
+                return EXIT_BLOCK, _message(
+                    (problem or "앞의 `git add` 가 어느 폴더에서 도는지 확정할 수 없다") + ".",
+                    "스테이징을 먼저 끝내고, 리뷰를 통과시킨 뒤 " + alone)
+            adds.append((add_dir, list(step["args"])))
+        elif step["kind"] in ("git", "opaque") and step["sub"] not in _READ_ONLY_GIT:
             return EXIT_BLOCK, _message(
-                "커밋 앞에 인덱스를 바꿀 수 있는 `git %s` 가 같은 명령에 있다 — 게이트는 그 전의 "
-                "스테이징만 볼 수 있다." % step["sub"],
+                "커밋 앞에 인덱스를 바꾸는 `git %s` 가 같은 명령에 있다 — 게이트는 이 명령을 "
+                "모사하지 않는다." % step["sub"],
                 "스테이징을 먼저 끝내고, 리뷰를 통과시킨 뒤 " + alone)
     commit = steps[at]
-    form = commit_form_problem(commit["args"])
-    if form:
-        return EXIT_BLOCK, _message(
-            "%s 은 스테이징과 다른 내용을 커밋한다." % form,
-            "`git add` 로 스테이징한 뒤 리뷰를 통과시키고, 옵션 없이 " + alone)
+    plan, problem = commit_plan(commit["args"])
+    if problem:
+        return EXIT_BLOCK, _message(problem + ".", "옵션을 고쳐 " + alone)
     if _is_dry_run(commit["args"]):
         return EXIT_ALLOW, ""
-    return _check_review(where)
+    return _check_review(where, plan, adds)
 
 
-def _check_review(where):
+def _review_hint(plan, adds):
+    """막을 때 `해결:` 줄 — 커밋 형태마다 **같은 내용을 리뷰하는 방법**이 다르다."""
+    if plan["mode"] == "only":
+        return ("/gemini-review 를 `--paths %s` 로 돌려 exit 0 을 받은 뒤, 작업 트리를 바꾸지 않고 "
+                "같은 명령을 다시 실행한다." % " ".join(plan["pathspec"]))
+    first = ""
+    if adds or plan["mode"] in ("all", "include"):
+        first = ("커밋이 담을 내용을 먼저 스테이징하고(앞의 `git add` 를 따로 실행하거나 `-a` · `-i` "
+                 "대신 `git add`), ")
+    return (first + "/gemini-review 를 --staged 로 돌려 exit 0 을 받은 뒤, 스테이징을 바꾸지 않고 "
+            "같은 명령을 다시 실행한다.")
+
+
+def _check_review(where, plan, adds):
     rc, top = _git_rc(["rev-parse", "--show-toplevel"], where)
     if rc != 0 or not top.strip():
         return EXIT_ALLOW, ""            # 저장소가 아니면 git commit 자신이 실패한다
     root = top.strip()
+    real_root = os.path.realpath(root)
+    for add_dir, _args in adds:
+        real = os.path.realpath(add_dir)
+        if real != real_root and not real.startswith(real_root.rstrip(os.sep) + os.sep):
+            return EXIT_BLOCK, _message(
+                "앞의 `git add` 가 커밋과 다른 저장소에서 돈다.",
+                "스테이징을 먼저 끝내고 `git commit` 을 단독 명령으로 다시 실행한다.")
     gr = _load_review()
-    # ⛔ 리뷰와 **같은 함수**로 diff 를 모으고 같은 바이트로 해시한다. `git diff --cached |
-    #   sha256sum` 은 값이 다르다(`_diff_bytes` docstring).
-    diff, _files = gr._collect_diff(root, None, None, True)
+    # ⛔ 리뷰와 **같은 함수**로 커밋이 담을 diff 를 모으고 같은 바이트로 해시한다. `git diff --cached |
+    #   sha256sum` 은 값이 다르다(`_diff_bytes` docstring). 스테이징 그대로이고 앞선 add 가 없으면
+    #   `_commit_diff` 가 `--staged` 와 같은 `_collect_diff` 를 부른다.
+    diff, _files = gr._commit_diff(root, plan["mode"], plan["pathspec"], where, adds)
     if not diff.strip():
-        return EXIT_ALLOW, ""            # 스테이징이 비었다 — 메시지만 고치는 --amend 등
+        return EXIT_ALLOW, ""            # 담을 변경이 없다 — 메시지만 고치는 --amend 등
     sha = gr._sha256_hex(gr._diff_bytes(diff))
     base, trust = gr._state_dir(create=False)
     if base is None or trust != "ok":
@@ -725,18 +836,24 @@ def _check_review(where):
             "사용자에게 결과 폴더 권한을 확인해 달라고 알린다.")
     match, latest_here = _find_result(base, sha, root)
     short = sha[:12]
-    fix = ("/gemini-review 를 --staged 로 돌려 exit 0 을 받은 뒤, 스테이징을 바꾸지 않고 "
-           "`git commit` 을 단독 명령으로 다시 실행한다.")
+    fix = _review_hint(plan, adds)
+    what = "경로 지정 커밋이 담을 변경" if plan["mode"] == "only" else "커밋이 담을 변경"
     if match is None:
         if latest_here is not None:
             return EXIT_BLOCK, _message(
-                "스테이징된 변경(sha256 %s)에 대한 리뷰가 없다. 이 저장소의 마지막 리뷰 뒤에 "
-                "스테이징이 바뀌었다." % short, fix)
+                "%s(sha256 %s)에 대한 리뷰가 없다. 이 저장소의 마지막 리뷰 뒤에 "
+                "내용이 바뀌었다." % (what, short), fix)
         return EXIT_BLOCK, _message(
-            "스테이징된 변경(sha256 %s)에 대한 리뷰가 없다." % short, fix)
+            "%s(sha256 %s)에 대한 리뷰가 없다." % (what, short), fix)
     mode, code = match.get("mode"), match.get("exit_code")
     if match.get("passed") is True and mode == "reviewed" and code == 0:
         return EXIT_ALLOW, ""
+    if mode == "fallback_reviewed" and code == 0:
+        if fallback_state(where) == "on":
+            return EXIT_ALLOW, ""
+        return EXIT_BLOCK, _message(
+            "같은 내용의 대체 리뷰 기록이 있지만 이 저장소는 대체 리뷰를 인정하지 않는다(운영자 설정).",
+            "Gemini 리뷰가 수행될 때까지 기다리거나, 커밋하지 못한 사실을 사용자에게 보고한다.")
     if mode == "reviewed":
         why = "같은 변경의 최근 리뷰가 통과가 아니다(exit %s · 지적 있음)." % code
         fix = "지적을 실측으로 검증해 반영하고 다시 리뷰한다. " + fix
@@ -746,6 +863,11 @@ def _check_review(where):
     elif code == 4:
         why = "같은 변경의 최근 리뷰가 수행되지 않았다(exit 4 · %s)." % mode
         fix = "화면의 원인 · 해결 줄대로 같은 모델로 재시도한다. " + fix
+        if fallback_state(where) == "on":
+            # [1.7.0] 수행되지 않은 날에도 커밋할 길 — 운영 규칙이 허용한 대체 리뷰를 **실제로** 마친 뒤에만.
+            fix += (" 재시도해도 수행되지 않고 운영 규칙이 대체 리뷰를 허용하면, 대체 리뷰를 실제로 "
+                    "마치고 지적을 반영한 뒤 같은 범위 인자에 `--record-fallback --reviewer 이름 "
+                    "--summary 요약` 을 붙여 기록한다.")
     else:
         why = "같은 변경의 최근 리뷰가 통과가 아니다(%s · exit %s)." % (mode, code)
     return EXIT_BLOCK, _message(why, fix)

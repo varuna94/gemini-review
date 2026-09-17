@@ -27,6 +27,9 @@
     python gemini_review.py                    # 마지막 커밋
     python gemini_review.py --base HEAD~3      # 최근 3커밋
     python gemini_review.py --staged           # 스테이징된 변경 (커밋 직전)
+    python gemini_review.py --paths a.py b.py  # `git commit -- a.py b.py` 가 담을 변경 (1.7.0)
+    python gemini_review.py --staged --record-fallback --reviewer 이름 --summary 요약
+                                               # Gemini 가 수행되지 않았을 때 대체 리뷰 기록 (1.7.0)
 
 ⚠ 모델은 `gemini-3.1-pro-high` 고정이다 — 느리다고 flash 로 낮추지 않는다(SKILL.md).
   **판정은 주 모델만 낸다.** 진단 모델(`--probe-model`)은 빈 응답일 때 한 줄 생존
@@ -226,7 +229,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.6.1"
+__version__ = "1.7.0"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # ⛔ [1.4.0] **진단 전용**이다 — 이 모델로 리뷰를 요청하지 않는다(`_recover_empty_response`).
@@ -391,7 +394,8 @@ _DIFF_CONFIG = [
 _DIFF_ARGS = ["--no-ext-diff", "--no-textconv", "--no-color"]
 
 
-def _git(args: List[str], cwd: str, config: Optional[List[str]] = None) -> str:
+def _git(args: List[str], cwd: str, config: Optional[List[str]] = None,
+         env: Optional[dict] = None, stdin: Optional[bytes] = None) -> str:
     """⚠ `core.quotePath=false` 는 **보안 옵션**이다 [26.08.13].
 
     기본값(true)이면 git 이 비ASCII 경로를 `"\\354\\232\\264\\354\\230\\201.env"`
@@ -404,8 +408,8 @@ def _git(args: List[str], cwd: str, config: Optional[List[str]] = None) -> str:
     try:
         out = subprocess.run(["git", "-c", "core.quotePath=false"]
                              + (config or []) + args,
-                             cwd=cwd, capture_output=True,
-                             timeout=60, check=False)
+                             cwd=cwd, capture_output=True, input=stdin,
+                             timeout=60, check=False, env=env)
     except FileNotFoundError:
         # ⛔ [26.09.14 실측] 종전에는 traceback · exit 1 이었다. exit 1 은 문서상
         #   "파싱 실패" 라 원인을 오해한다.
@@ -510,6 +514,73 @@ _RULES = """## 규칙
 - 한국어로 답하라.
 
 지정된 JSON 스키마로만 출력하라."""
+
+
+# `git commit` 이 무엇을 담는지 가르는 형태. 커밋 게이트와 `--paths` 리뷰가 같은 이름을 쓴다.
+#   index   — 스테이징 그대로 (`git commit`)
+#   all     — 추적 파일의 변경을 모두 더한다 (`-a`)
+#   include — 지정 경로의 추적 파일 변경을 스테이징에 더한다 (`-i 경로`)
+#   only    — HEAD 에 지정 경로의 작업 트리 내용만 얹는다 (`-- 경로` · `경로` · `-o 경로`)
+_COMMIT_MODES = ("index", "all", "include", "only")
+
+
+def _commit_diff(root: str, mode: str = "index", pathspec=(), pathspec_cwd: Optional[str] = None,
+                 adds=()) -> Tuple[str, List[str]]:
+    """`git commit` 이 **실제로 담을** 변경의 diff. 반환 (diff, 파일 목록). [1.7.0]
+
+    `adds` 는 같은 명령에서 커밋보다 먼저 실행될 `git add` 들이다 — `[(실행 폴더, 인자 목록)]`.
+
+    ⛔ **진짜 인덱스는 건드리지 않는다.** 인덱스를 임시 사본으로 옮겨 그 위에서 모사한다. 두 세션이
+      작업 트리를 공유할 때 남의 스테이징을 바꾸면 안 된다 — 경로 지정 커밋을 쓰는 이유가 그것이다.
+    ⚠ git 의 커밋 구현(builtin/commit.c `prepare_index`)을 따른다. `only` 는 HEAD 트리로 새 인덱스를
+      만들고, **git 이 아는 파일**(인덱스 항목과 스테이징된 삭제) 가운데 경로에 맞는 것만 작업 트리
+      내용으로 갱신한다. 추적하지 않는 새 파일은 담지 않는다(그 커밋은 git 이 거부한다).
+      실제로 커밋한 뒤의 `git diff HEAD~1..HEAD` 와 바이트까지 같음을 검사가 고정한다.
+    ⚠ 스테이징 그대로이고 앞선 add 가 없으면 `--staged` 와 **같은 함수**를 부른다 — 해시가 갈리지 않는다.
+    """
+    if mode not in _COMMIT_MODES:
+        raise RuntimeError("알 수 없는 커밋 형태: %s" % mode)
+    if mode == "index" and not adds:
+        return _collect_diff(root, None, None, True)
+    where = pathspec_cwd or root
+    tmp = tempfile.mkdtemp(prefix="gemini_review_idx_")
+    try:
+        real = _git(["rev-parse", "--git-path", "index"], root).strip()
+        real = real if os.path.isabs(real) else os.path.join(root, real)
+        work = os.path.join(tmp, "index")
+        if os.path.isfile(real):
+            shutil.copyfile(real, work)
+        env = dict(os.environ, GIT_INDEX_FILE=work)
+        for add_cwd, add_args in adds:
+            _git(["add"] + list(add_args), add_cwd, env=env)
+        if mode == "all":
+            _git(["add", "-u"], root, env=env)
+        elif mode == "include":
+            _git(["add", "-u", "--"] + list(pathspec), where, env=env)
+        elif mode == "only":
+            known = set(_git(["ls-files", "--full-name", "-z", "--"] + list(pathspec),
+                             where, env=env).split("\0"))
+            known |= set(_git(["diff", "--cached", "--name-only", "-z", "--diff-filter=D", "--"]
+                              + list(pathspec), where, _DIFF_CONFIG, env=env).split("\0"))
+            known.discard("")
+            only = os.path.join(tmp, "only-index")
+            env = dict(os.environ, GIT_INDEX_FILE=only)
+            try:
+                _git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], root)
+                _git(["read-tree", "HEAD"], root, env=env)
+            except RuntimeError:
+                _git(["read-tree", "--empty"], root, env=env)   # 첫 커밋 전
+            if known:
+                # ⛔ [26.09.17 교차 리뷰 HIGH · 실측 재현] 경로를 명령줄로 펼치면 `git commit -- 폴더` 가
+                #   인자 길이 상한에 걸린다(Windows 는 32,767자 — 수백 파일이면 넘는다). 표준 입력으로 준다.
+                _git(["update-index", "--add", "--remove", "-z", "--stdin"], root, env=env,
+                     stdin=b"".join(p.encode("utf-8") + b"\0" for p in sorted(known)))
+        diff = _git(["diff", "--cached"] + _DIFF_ARGS, root, _DIFF_CONFIG, env=env)
+        files = [f for f in _git(["diff", "--cached", "--name-only"] + _DIFF_ARGS,
+                                 root, _DIFF_CONFIG, env=env).splitlines() if f]
+        return diff, files
+    finally:
+        shutil.rmtree(tmp, True)
 
 
 def _load_project_context(root: str) -> str:
@@ -755,6 +826,20 @@ def _main(argv, ctx: dict) -> int:
             clash = _named_in_argv(argv, _STATS_CONFLICTS)
             if clash:
                 ap.error(_STATS_CONFLICT_MSG % ", ".join(clash))
+        if args.paths:
+            clash = _named_in_argv(argv, _PATHS_CONFLICTS)
+            if clash:
+                ap.error(_PATHS_CONFLICT_MSG % ", ".join(clash))
+        if args.record_fallback:
+            if not (args.staged or args.paths):
+                ap.error(_FALLBACK_SCOPE_MSG)
+            if not ((args.reviewer or "").strip() and (args.summary or "").strip()):
+                ap.error(_FALLBACK_FIELDS_MSG)
+            clash = _named_in_argv(argv, _FALLBACK_CONFLICTS)
+            if clash:
+                ap.error(_FALLBACK_CONFLICT_MSG % ", ".join(clash))
+        elif args.reviewer is not None or args.summary is not None:
+            ap.error(_FALLBACK_ONLY_MSG)
     except SystemExit as exc:
         # ⚠ [26.09.14 Gemini 교차리뷰 HIGH] `--help` · 인자 오류로 여기서 끝나면 방금
         #   쓴 `in_progress`("중간에 죽었다") 가 사실과 다르게 남는다. 리뷰를 시작하지도
@@ -813,8 +898,11 @@ def _main(argv, ctx: dict) -> int:
 
     try:
         root = _git_root(os.getcwd())
-        diff, files = _collect_diff(root, args.base, args.head, args.staged,
-                                    args.two_dot)
+        if args.paths:
+            diff, files = _commit_diff(root, "only", args.paths, os.getcwd())
+        else:
+            diff, files = _collect_diff(root, args.base, args.head, args.staged,
+                                        args.two_dot)
     except RuntimeError as exc:
         _safe_print(str(exc))
         if not args.staged and args.base == "HEAD~1":
@@ -825,8 +913,9 @@ def _main(argv, ctx: dict) -> int:
 
     # ⚠ [26.09.14] 저장소 루트를 안 뒤에 찾는다 — PATH 에서 저장소 안 항목을 빼려면
     #   루트가 필요하다(`_which_agy`).
-    agy = _find_agy(root)
-    if not agy:
+    # [1.7.0] 대체 리뷰 기록은 agy 를 부르지 않는다 — agy 가 망가진 날에도 기록할 수 있어야 한다.
+    agy = None if args.record_fallback else _find_agy(root)
+    if not agy and not args.record_fallback:
         _safe_print("agy(Antigravity CLI)를 찾지 못했다 — 리뷰가 수행되지 않았다.")
         _safe_print("  확인한 곳: 알려진 설치 경로 · PATH(현재 폴더와 저장소 안은 제외)")
         _safe_print("  설치: https://antigravity.google/cli "
@@ -840,6 +929,13 @@ def _main(argv, ctx: dict) -> int:
         # ⛔ [1.4.0 결정 8] `--staged` 인데 스테이징이 비면 **exit 8** 이다. 1.3.x 는 0 이라,
         #   `git add` 를 빠뜨린 커밋이 "리뷰 통과" 로 읽혔다(전역 규약이 "exit 0 도 통과가
         #   아니다" 는 **문서 경고**로 막고 있었다). 범위 리뷰(`--base`)의 빈 diff 는 0 그대로다.
+        if args.paths and not args.allow_empty:
+            _safe_print("⛔ 지정한 경로에 커밋할 변경이 없다 — 리뷰는 수행되지 않았다(exit %d)."
+                        % EXIT_EMPTY_STAGED)
+            _safe_print("   경로가 git 이 아는 파일인지(새 파일은 먼저 git add) 확인할 것.")
+            return finish("no_changes", {
+                "note": "지정한 경로에 커밋할 변경이 없었다 — 리뷰가 수행되지 않았다. 통과가 아니다."},
+                EXIT_EMPTY_STAGED)
         if args.staged and not args.allow_empty:
             _safe_print("⛔ 스테이징된 변경이 없다 — 리뷰는 수행되지 않았다(exit %d)."
                         % EXIT_EMPTY_STAGED)
@@ -861,6 +957,8 @@ def _main(argv, ctx: dict) -> int:
     #   가르는 유일하게 확실한 손잡이였다 — 범위가 커지는 루프는 수정이 새 코드를 낳아
     #   스스로 연료를 만들고(H-B), 고정된 루프는 재현율이 제약이다(H-A, 실측 67%).
     state["diff_bytes"] = len(diff_bytes)
+    if args.record_fallback:
+        return _record_fallback(args, root, files, state, finish)
 
     classified = [(f, _classify_path(f)) for f in files]
     blocked = [f for f, c in classified if c == "block"]
@@ -880,6 +978,8 @@ def _main(argv, ctx: dict) -> int:
     project_ctx = _load_project_context(root)
     if args.staged:
         scope = "staged"
+    elif args.paths:
+        scope = "paths %s" % " ".join(args.paths)
     else:
         scope = "%s%s%s" % (args.base, ".." if args.two_dot else "...", args.head)
     if blocked:
@@ -1027,6 +1127,116 @@ def _main(argv, ctx: dict) -> int:
 
 # 이 원인이면 곧바로 끝낸다(재시도 없음). 빈 응답(`empty` · `tool_denied`)만 복구를 시도한다.
 _FAILURE_CAUSES = ("tool_error", "model_unavailable", "quota", "timeout")
+
+
+# [1.7.0] "Gemini 리뷰가 수행되지 않았다" 로 치는 mode — exit 4 의 원인들이다. 설치 · 인증 문제(2),
+#   민감 경로(3), 텍스트 모드(6)는 고칠 것이 따로 있으므로 대체 리뷰의 근거가 되지 않는다.
+_NOT_PERFORMED_MODES = frozenset((
+    "timeout", "quota_exhausted", "primary_model_unavailable", "tool_unavailable",
+    "review_unavailable"))
+# 시도로 치지 않는 기록 — 가장 최근 **시도**를 찾을 때 건너뛴다.
+_NOT_ATTEMPT_MODES = frozenset((
+    "fallback_reviewed", "fallback_refused", "not_run", "in_progress", "check", "interrupted",
+    "internal_error", "no_changes"))
+
+
+def _latest_attempt(root: str, sha: str) -> Optional[dict]:
+    """같은 저장소 · 같은 diff 해시로 **가장 최근에 Gemini 리뷰를 시도한** 결과의 `_meta`. 없으면 None.
+
+    ⚠ 결과 폴더는 저장소들이 함께 쓰고, 같은 변경은 저장소가 달라도 해시가 같다 — 저장소를 함께 본다.
+    """
+    base, trust = _state_dir(create=False)
+    if base is None or trust != "ok":
+        return None
+    try:
+        names = [n for n in os.listdir(base)
+                 if n.startswith("gemini_review_") and n.endswith(".json")]
+    except OSError:
+        return None
+    ordered = []
+    for n in names:
+        path = os.path.join(base, n)
+        try:
+            ordered.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    ordered.sort(reverse=True)
+    real_root = os.path.realpath(root)
+    for _mtime, path in ordered:
+        try:
+            with io.open(path, encoding="utf-8") as fh:
+                meta = json.load(fh).get("_meta")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(meta, dict) or meta.get("diff_sha256") != sha:
+            continue
+        scope = meta.get("scope") if isinstance(meta.get("scope"), dict) else {}
+        if not (isinstance(scope.get("repo"), str)
+                and os.path.realpath(scope["repo"]) == real_root):
+            continue
+        if meta.get("mode") in _NOT_ATTEMPT_MODES:
+            continue
+        return meta
+    return None
+
+
+def _record_fallback(args, root: str, files: List[str], state: dict, finish) -> int:
+    """대체 리뷰를 **마쳤다는 기록**을 남긴다(`--record-fallback`, 1.7.0). 리뷰를 요청하지 않는다.
+
+    ⛔ 같은 내용의 **가장 최근 Gemini 시도가 수행되지 않음(exit 4)** 일 때만 남긴다. Gemini 에게 묻지도
+      않고 대체 리뷰로 건너뛰거나, Gemini 가 낸 지적(request_changes)을 대체 리뷰로 덮는 경로를 닫는다.
+    ⚠ 기록은 주 모델 판정이 아니다 — `_meta.passed` 는 false 다. 커밋 게이트만 운영자가 막지 않았다면
+      이 기록을 인정한다(`git config gemini-review.gateFallback false` 로 끈다).
+    ⚠ 위협 모델은 망각이다. 대체 리뷰를 실제로 했는지는 코드가 확인할 수 없다 — 기록에 주체와 요약을
+      남겨 사후에 추적할 수 있게 한다.
+    """
+    sha = state["diff_sha256"]
+    attempt = _latest_attempt(root, sha)
+    mode = attempt.get("mode") if attempt else None
+    why = None
+    if attempt is None:
+        why = ("같은 내용으로 Gemini 리뷰를 시도한 기록이 없다",
+               "먼저 같은 범위 인자로 리뷰를 돌린다. 수행되지 않으면(exit 4) 그때 기록한다.")
+    elif mode == "reviewed" and attempt.get("passed") is True:
+        why = ("같은 내용이 이미 Gemini 리뷰를 통과했다", "기록할 필요가 없다.")
+    elif mode == "reviewed":
+        why = ("같은 내용에 Gemini 가 판정을 냈다(exit %s) — 대체 리뷰로 덮을 수 없다"
+               % attempt.get("exit_code"),
+               "지적을 실측 검증해 반영하고 다시 리뷰한다.")
+    elif mode not in _NOT_PERFORMED_MODES:
+        why = ("가장 최근 시도가 '수행되지 않음(exit 4)' 이 아니다(%s · exit %s)"
+               % (mode, attempt.get("exit_code")),
+               "그 원인(설치 · 인증 · 민감 경로 · 텍스트 모드)을 먼저 해결한다.")
+    if why is not None:
+        _safe_print("⛔ 대체 리뷰를 기록하지 않았다(exit %d)." % EXIT_TOOL_ERROR)
+        _safe_print("   원인: %s." % why[0])
+        _safe_print("   해결: %s" % why[1])
+        if args.out:
+            _write_out(args.out, _result("fallback_refused", {
+                "note": "대체 리뷰 기록을 거부했다: %s. 통과가 아니다." % why[0]},
+                EXIT_TOOL_ERROR, scope=state["scope"], diff_sha256=sha,
+                diff_bytes=state["diff_bytes"]))
+        return EXIT_TOOL_ERROR
+
+    _safe_print("=" * 74)
+    _safe_print("대체 리뷰 기록 v%s (Gemini 리뷰가 수행되지 않았다)" % __version__)
+    _safe_print("저장소: %s" % root)
+    _safe_print("범위: %s / 변경 파일 %d개 / sha256 %s"
+                % ("staged" if args.staged else "paths %s" % " ".join(args.paths),
+                   len(files), sha[:12]))
+    _safe_print("Gemini 시도: %s (exit %s · %s)"
+                % (mode, attempt.get("exit_code"), attempt.get("written_at")))
+    _safe_print("대체 리뷰: %s" % args.reviewer.strip())
+    _safe_print("요약: %s" % args.summary.strip())
+    _safe_print("⚠ 주 모델 판정이 아니다(_meta.passed false). 커밋 게이트는 운영자가 막지 않았다면 인정한다.")
+    _safe_print("=" * 74)
+    return finish("fallback_reviewed", {
+        "reviewer": args.reviewer.strip(),
+        "summary": args.summary.strip(),
+        "gemini_attempt": {"mode": mode, "exit_code": attempt.get("exit_code"),
+                           "written_at": attempt.get("written_at")},
+        "note": "Gemini 리뷰가 수행되지 않아 운영 규칙의 대체 리뷰로 갈음한 기록이다. "
+                "주 모델 판정이 아니다."}, EXIT_PASSED)
 
 
 def _say_not_reviewed(problem: str, cause: str = "", fix: str = "") -> None:
@@ -1509,6 +1719,10 @@ def _resolve_scope(root: str, args) -> dict:
         scope = {"kind": "staged", "head_sha": sha("HEAD")}
         scope.update(common)
         return scope
+    if getattr(args, "paths", None):
+        scope = {"kind": "paths", "paths": list(args.paths), "head_sha": sha("HEAD")}
+        scope.update(common)
+        return scope
     scope = {"kind": "range", "base": args.base, "head": args.head,
              "two_dot": bool(args.two_dot),
              "base_sha": sha(args.base), "head_sha": sha(args.head)}
@@ -1586,6 +1800,20 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="스테이징된 변경 리뷰 (커밋 직전). 스테이징이 비면 exit 8")
     ap.add_argument("--allow-empty", action="store_true",
                     help="--staged 인데 스테이징이 비었을 때 exit 8 대신 0 (그래도 통과는 아니다)")
+    # [1.7.0] 두 세션이 작업 트리를 공유하면 스테이징을 건드리지 않는 경로 지정 커밋을 쓴다.
+    #   그 커밋이 담을 내용은 스테이징과 다르므로 `--staged` 로는 리뷰할 수 없었다.
+    ap.add_argument("--paths", nargs="+", metavar="경로",
+                    help="`git commit -- 경로` 가 커밋할 내용(HEAD 에 그 경로의 작업 트리 내용을 "
+                         "얹은 것)을 리뷰한다. 스테이징을 건드리지 않는다. 변경이 없으면 exit 8")
+    ap.add_argument("--record-fallback", action="store_true",
+                    help="Gemini 리뷰가 수행되지 않았을 때(같은 내용의 최근 시도가 exit 4) 운영 "
+                         "규칙이 정한 대체 리뷰를 **마쳤다는 기록**을 남긴다. --staged 또는 --paths "
+                         "와 --reviewer · --summary 가 필요하다. 리뷰를 요청하지 않는다. "
+                         "0 기록함 · 2 거부")
+    ap.add_argument("--reviewer", metavar="이름",
+                    help="--record-fallback: 대체 리뷰를 한 주체 (예: codex · 서브에이전트 다렌즈)")
+    ap.add_argument("--summary", metavar="요약",
+                    help="--record-fallback: 대체 리뷰 결과 요약 (반영한 지적 포함)")
     ap.add_argument("--two-dot", action="store_true",
                     help="base..head 2-dot diff (기본은 merge-base 기준 3-dot). "
                          "브랜치 리뷰에서는 쓰지 마라 (남의 커밋이 섞인다)")
@@ -1647,7 +1875,18 @@ def _exit_code_epilog() -> str:
 
 # `--stats` 와 함께 쓸 수 없는 인자. 집계는 리뷰를 하지 않으므로 범위 · 출력이 무의미하다.
 _STATS_CONFLICTS = ("--staged", "--base", "--two-dot", "--out", "--allow-sensitive",
-                    "--allow-empty", "--check", "--ignore-quota-cache")
+                    "--allow-empty", "--check", "--ignore-quota-cache", "--paths",
+                    "--record-fallback", "--reviewer", "--summary")
+# [1.7.0] `--paths` 는 범위를 스스로 정한다 — 다른 범위 인자와 섞으면 어느 쪽을 리뷰했는지 모호하다.
+_PATHS_CONFLICTS = ("--staged", "--base", "--head", "--two-dot")
+_PATHS_CONFLICT_MSG = "--paths 는 범위를 스스로 정한다: 함께 쓸 수 없다: %s"
+# [1.7.0] 대체 리뷰 기록은 리뷰를 요청하지 않으므로 전송 · 쿼터 · 빈 변경 인자가 무의미하다.
+_FALLBACK_CONFLICTS = ("--check", "--allow-sensitive", "--allow-empty", "--ignore-quota-cache",
+                       "--base", "--head", "--two-dot")
+_FALLBACK_CONFLICT_MSG = "--record-fallback 과 함께 쓸 수 없다: %s"
+_FALLBACK_SCOPE_MSG = "--record-fallback 은 --staged 또는 --paths 로 범위를 정해야 한다"
+_FALLBACK_FIELDS_MSG = "--record-fallback 은 --reviewer 와 --summary 가 필요하다(빈 값 불가)"
+_FALLBACK_ONLY_MSG = "--reviewer · --summary 는 --record-fallback 과 함께만 쓴다"
 # cp949 검사가 훑도록 문자열 상수로 뺀다(Eng M5). em dash 를 쓰지 않는다.
 _STATS_CONFLICT_MSG = ("--stats 는 집계만 한다 — 리뷰 인자와 함께 쓸 수 없다: %s")
 
@@ -2212,14 +2451,15 @@ def _run_stats(args) -> int:
     judged = [r for r in rounds if r["mode"] in _STATS_VERDICT_MODES]
     cached = [r for r in rows if r["quota_cached"]]
     blocks = [r for r in rounds if r["mode"] == "quota_exhausted"]
+    fallbacks = [r for r in rows if r["mode"] == "fallback_reviewed"]
 
     _safe_print("gemini-review --stats · 최근 %s · %s" % (args.since, base))
     _safe_print("")
     _safe_print("회차 %d · 판정이 난 회차 %d · 통과 %d (%s)"
                 % (len(rounds), len(judged), len([r for r in judged if r["passed"]]),
                    _pct(len([r for r in judged if r["passed"]]), len(judged))))
-    _safe_print("쿼터 차단 %d회 · 캐시 단락 %d회 · 읽지 못한 파일 %d건%s"
-                % (len(blocks), len(cached), unreadable,
+    _safe_print("쿼터 차단 %d회 · 캐시 단락 %d회 · 대체 리뷰 기록 %d건 · 읽지 못한 파일 %d건%s"
+                % (len(blocks), len(cached), len(fallbacks), unreadable,
                    " · 상한으로 잘린 %d건" % truncated if truncated else ""))
 
     # 루프 키별 회차 — 커밋 단위로 묶는다. 1.4.x 파일은 키가 없어 따로 센다.
@@ -2925,14 +3165,14 @@ EXIT_EMPTY_STAGED = 8
 # ⚠ **정본**이다. `--help` epilog 가 이 표를 찍고, README · SKILL.md · 모듈 docstring 의
 #   사본이 같은 코드 집합을 말하는지 테스트가 본다(`_check_exit_code_tables_agree`).
 _EXIT_TABLE = (
-    ("0", "통과: 주 모델의 approve · approve_with_comments"),
+    ("0", "통과: 주 모델의 approve · approve_with_comments (--record-fallback 은 기록함)"),
     ("1", "파싱 실패 · 내부 오류: 판정하지 않았다"),
-    ("2", "실행 실패: git · agy 없음, agy 가 실패를 알림(모델명 · 인증), --out 에 못 씀"),
+    ("2", "실행 실패: git · agy 없음, agy 가 실패를 알림(모델명 · 인증), --out 에 못 씀, 대체 리뷰 기록 거부"),
     ("3", "민감 경로: 전송 중단"),
     ("4", "리뷰 안 됨: 시간 초과 · 쿼터 · 모델 무응답 · 빈 응답"),
     ("5", "request_changes (모르는 판정값 포함)"),
     ("6", "텍스트로만 받음: 사람이 원문을 읽어야 한다"),
-    ("8", "--staged 인데 스테이징이 비었다 (--allow-empty 면 0)"),
+    ("8", "--staged · --paths 인데 커밋할 변경이 없다 (--allow-empty 면 0)"),
     ("130 · 143", "중단 (Ctrl+C · 종료 신호)"),
 )
 
@@ -2950,6 +3190,9 @@ _MODE_EXIT = {
     "primary_model_unavailable": EXIT_NOT_REVIEWED,
     "review_unavailable": EXIT_NOT_REVIEWED,
     "text_fallback": EXIT_UNSTRUCTURED,
+    # [1.7.0] 대체 리뷰 기록 — 기록 성공은 0 이지만 `_meta.passed` 는 false 다(판정이 아니다).
+    "fallback_reviewed": EXIT_PASSED,
+    "fallback_refused": EXIT_TOOL_ERROR,
 }
 
 # LLM 응답에서 결과 파일로 옮기는 키 — 스키마에 있는 것만. 나머지(`_meta` · `model` ·

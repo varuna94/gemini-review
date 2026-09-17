@@ -40,6 +40,8 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 | 마지막 커밋 | (없음) |
 | 최근 3개 커밋 | `--base HEAD~3` |
 | 브랜치 전체 (PR 전) | `--base main` |
+| 경로 지정 커밋 직전 (`git commit -- 경로`) | `--paths 경로…` |
+| Gemini 가 수행되지 않아 대체 리뷰를 마친 뒤 | `--staged --record-fallback --reviewer 이름 --summary 요약` |
 | 설치 · 로그인 점검 (코드를 보내지 않는다) | `--check` |
 
 처음 설치했으면 `/gemini-review --check` 를 먼저 돌린다. agy · 로그인 · 모델 응답과 agy 출력
@@ -68,14 +70,14 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 
 | 종료 코드 | 뜻 |
 |---|---|
-| `0` | 통과 (주 모델의 `approve` · `approve_with_comments`) |
+| `0` | 통과 (주 모델의 `approve` · `approve_with_comments`). `--record-fallback` 은 기록함 — 판정이 아니다 |
 | `1` | 파싱 실패 · 내부 오류 |
-| `2` | 실행 실패 — git · `agy` 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` 에 못 씀 |
+| `2` | 실행 실패 — git · `agy` 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` 에 못 씀, 대체 리뷰 기록 거부 |
 | `3` | 민감 경로가 diff 에 있어 중단 |
 | `4` | **리뷰가 안 된 것이다** — 시간 초과 · 쿼터 소진 · 모델 무응답 · 빈 응답. '지적 없음'으로 읽지 말 것 |
 | `5` | `request_changes` |
 | `6` | 구조화 실패 (텍스트 모드로 리뷰는 받았다) |
-| `8` | `--staged` 인데 스테이징이 비었다 — 리뷰가 안 된 것이다 |
+| `8` | `--staged` · `--paths` 인데 커밋할 변경이 없다 — 리뷰가 안 된 것이다 |
 | `130` · `143` | 중단(Ctrl+C · 종료 신호) — 리뷰가 안 된 것이다 |
 
 **이 표에 없는 코드는 통과가 아니다.** exit 4 는 화면의 `원인:` · `해결:` 줄을 보고 몇 분
@@ -134,24 +136,33 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 사내 코드나 고객 데이터가 걸린 저장소에서는 **전송 자체가 허용되는지 먼저
 판단**하라. `--mode plan` 고정이라 Gemini 가 파일을 수정하지는 못한다.
 
-## 커밋 게이트 (선택) [1.6.0]
+## 커밋 게이트 (선택) [1.6.0 · 1.7.0]
 
 플러그인에는 Claude 의 `git commit` 을 막는 hook 이 들어 있다. **기본은 꺼져 있다.** 켜면
-스테이징된 변경과 **같은 내용으로 통과한 리뷰**가 결과 폴더에 있을 때만 Claude 의 커밋이
+그 커밋이 담을 내용과 **같은 내용으로 통과한 리뷰**가 결과 폴더에 있을 때만 Claude 의 커밋이
 실행된다. 커밋 전 리뷰를 모델이 지시를 기억하는 데 맡기지 않게 된다.
 
 ```
-git config --global gemini-review.gate true     # 모든 저장소에서 켠다
-git config gemini-review.gate false             # 이 저장소만 끈다
+git config --global gemini-review.gate true           # 모든 저장소에서 켠다
+git config gemini-review.gate false                   # 이 저장소만 끈다
+git config gemini-review.gateFallback false           # 이 저장소에서 대체 리뷰 기록을 인정하지 않는다
 ```
 
-- **판정:** **같은 저장소**의 결과 가운데 스테이징 diff 의 sha256 이 `_meta.diff_sha256` 과 같은 것을
-  찾고, 그 해시의 **가장 최근** 결과가 `reviewed` · `passed` · exit 0 이어야 한다. 리뷰 뒤에 스테이징을
-  바꾸면 다시 리뷰해야 한다. 같은 변경이라도 다른 저장소의 결과는 쓰지 않는다.
-- **막는 꼴:** `git add … && git commit` 처럼 **한 명령에 섞은 것**(게이트는 add 전의 인덱스만 볼 수
-  있다), `-a` · 경로 지정 커밋, 저장소를 확정할 수 없는 명령(`env -C` · `GIT_DIR` 등), 해석하지 못한
+- **판정:** 커밋이 담을 diff 를 모사해 sha256 을 재고, **같은 저장소**의 결과 가운데 `_meta.diff_sha256`
+  이 같은 **가장 최근** 결과가 `reviewed` · `passed` · exit 0 이면 연다. 리뷰 뒤에 내용이 바뀌면 다시
+  리뷰해야 한다. 같은 변경이라도 다른 저장소의 결과는 쓰지 않는다.
+- **커밋 형태 [1.7.0]:** `git add … && git commit` · `-a` · `-i 경로` · `git commit -- 경로` 를 막지
+  않고, 인덱스의 **임시 사본**에서 git 과 같은 규칙으로 담을 내용을 만든다(진짜 인덱스는 건드리지
+  않는다). 실제로 커밋한 뒤의 diff 와 바이트까지 같음을 검사가 고정한다. 경로 지정 커밋은
+  `--paths 경로…` 로 리뷰한다 — 두 세션이 작업 트리를 공유할 때 남의 스테이징을 건드리지 않는다.
+- **Gemini 가 수행되지 않을 때 [1.7.0]:** 같은 내용의 가장 최근 Gemini 시도가 exit 4(시간 초과 · 쿼터 ·
+  무응답)이면, 운영 규칙이 정한 대체 리뷰를 마친 뒤 `--record-fallback --reviewer … --summary …` 로
+  기록할 수 있고 게이트가 그 기록을 인정한다. Gemini 에게 묻지 않았거나 Gemini 가 지적을 냈으면 기록을
+  거부한다. 기록은 주 모델 판정이 아니다(`_meta.passed` false). 인정하지 않으려면 위의 `gateFallback false`.
+- **막는 꼴:** 모사하지 않는 인덱스 명령(`git reset` · `git rm` · `git stash` 등)을 커밋 앞에 이은 것,
+  대화형 커밋(`--patch`), 저장소를 확정할 수 없는 명령(`cd $REPO` · `GIT_DIR` 등), 해석하지 못한
   명령, 파이썬을 못 찾은 경우, 게이트 내부 오류.
-  Claude 가 게이트 설정을 끄거나 지우는 `git config` 명령도 막는다. 끄는 것은 사람이 한다.
+  Claude 가 게이트 설정(`gemini-review.*`)을 바꾸는 `git config` 명령도 막는다. 설정은 사람이 한다.
 - **막지 않는 것:** 스테이징이 빈 커밋(메시지만 고치는 `--amend`), `--dry-run`, Claude Code 밖의
   터미널에서 사람이 하는 커밋.
 - **대상 저장소:** `cd` · `git -C` · `env -C` 처럼 경로가 적힌 명령은 그 저장소의 설정을 본다.

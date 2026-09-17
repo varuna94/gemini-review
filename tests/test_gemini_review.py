@@ -3018,17 +3018,24 @@ _GATE_DIR_CASES = [
 ]
 
 # (git commit 인자, 문제가 있어야 하는가, 이 행이 지키는 것)
+# (git commit 인자, 기대 (모사 형태, 경로) 또는 None=막음, 이 행이 지키는 것)
+#   ⚠ [1.7.0] 1.6.x 는 `-a` · 경로 지정을 **형태만 보고 막았다.** 두 세션이 작업 트리를 공유할 때 쓰는
+#     경로 지정 커밋이 불가능하다는 운영 보고로, 막지 않고 커밋이 담을 내용을 모사한다.
 _GATE_FORM_CASES = [
-    (["-m", "x"], False, "기본 꼴"),
-    (["-qm", "msg", "--author=A <a@b>"], False, "묶은 짧은 옵션의 마지막이 값을 받는다"),
-    (["--amend", "--no-edit"], False, "--amend"),
-    (["-m", "-a"], False, "메시지 값이 `-a` 여도 옵션이 아니다"),
-    (["-am", "x"], True, "-a 는 스테이징 밖의 변경까지 커밋한다"),
-    (["--all", "-m", "x"], True, "--all"),
-    (["--inc", "-m", "x"], True, "긴 옵션의 앞부분만 적어도 git 은 받는다(--include)"),
-    (["-m", "x", "a.py"], True, "경로 지정 커밋"),
-    (["-m", "x", "--", "a.py"], True, "-- 뒤 경로 지정"),
-    (["--pathspec-from-file=f"], True, "파일로 넘긴 경로 지정"),
+    (["-m", "x"], ("index", []), "기본 꼴"),
+    (["-qm", "msg", "--author=A <a@b>"], ("index", []), "묶은 짧은 옵션의 마지막이 값을 받는다"),
+    (["--amend", "--no-edit"], ("index", []), "--amend"),
+    (["-m", "-a"], ("index", []), "메시지 값이 `-a` 여도 옵션이 아니다"),
+    (["-am", "x"], ("all", []), "-a 는 추적 파일의 변경을 모두 담는다"),
+    (["--all", "-m", "x"], ("all", []), "--all"),
+    (["-m", "x", "a.py"], ("only", ["a.py"]), "경로를 주면 기본이 --only 다"),
+    (["-m", "x", "--", "a.py", "b.py"], ("only", ["a.py", "b.py"]), "-- 뒤 경로 지정"),
+    (["--inc", "-m", "x", "a.py"], ("include", ["a.py"]), "긴 옵션의 앞부분만 적어도 git 은 받는다"),
+    (["-i", "-m", "x"], None, "-i 에 경로가 없으면 git 이 거부한다"),
+    (["-a", "-m", "x", "a.py"], None, "-a 와 경로는 git 이 거부한다"),
+    (["--patch"], None, "대화형은 모사할 수 없다"),
+    (["--pathspec-from-file=f"], None, "파일로 넘긴 경로"),
+    (["--bogus"], None, "모르는 옵션은 값을 받는지 몰라 막는다"),
 ]
 
 # (git config 인자, 막아야 하는가, 이 행이 지키는 것)
@@ -3041,6 +3048,11 @@ _GATE_CONFIG_CASES = [
     (["gemini-review.gate"], False, "값 없는 호출은 읽기다"),
     (["--get", "gemini-review.gate"], False, "읽기"),
     (["user.name", "x"], False, "다른 키"),
+    (["gemini-review.gateFallback", "true"], True, "대체 리뷰 인정 설정도 사용자 몫(1.7.0)"),
+    (["--file", "gemini-review.conf", "user.name", "foo"], False,
+     "옵션 값(설정 파일 이름)은 키가 아니다 — 무관한 명령을 막지 않는다"),
+    (["--replace-all", "gemini-review.gate", "false"], True, "다른 쓰기 옵션"),
+    (["--global", "gemini-review.gatefallback", "false"], True, "조이는 쪽도 사용자 몫"),
 ]
 
 
@@ -3063,18 +3075,19 @@ def _check_gate_parsing(gr):
         want = None if rel is None else os.path.normpath(os.path.join(here, rel))
         yield (None if got == want else
                "게이트 저장소 위치 [%s]: %r (기대 %r): %s" % (command, got, want, why))
-    for args, bad, why in _GATE_FORM_CASES:
-        got = cg.commit_form_problem(args) is not None
-        yield (None if got == bad else
-               "게이트 커밋 형태 [%s]: 문제=%s (기대 %s): %s" % (" ".join(args), got, bad, why))
+    for args, want, why in _GATE_FORM_CASES:
+        plan, _problem = cg.commit_plan(args)
+        got = (plan["mode"], plan["pathspec"]) if plan else None
+        yield (None if got == want else
+               "게이트 커밋 형태 [%s]: %r (기대 %r): %s" % (" ".join(args), got, want, why))
     for args, bad, why in _GATE_CONFIG_CASES:
         got = cg.config_write_problem({"sub": "config", "args": args}) is not None
         yield (None if got == bad else
                "게이트 설정 보호 [%s]: 막음=%s (기대 %s): %s" % (" ".join(args), got, bad, why))
 
 
-# 자식 프로세스에서 **진짜 git 저장소**를 `--staged` 로 리뷰한다. agy 만 가짜다.
-# argv: 스크립트 경로 · 판정(approve · request_changes)
+# 자식 프로세스에서 **진짜 git 저장소**를 리뷰한다. agy 만 가짜다.
+# argv: 스크립트 경로 · 판정(approve · request_changes · quota) · [리뷰 인자…, 기본 --staged]
 _CHILD_GATE_REVIEW = r'''
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("gemini_review", sys.argv[1])
@@ -3085,9 +3098,14 @@ verdict = sys.argv[2]
 def fake_invoke(agy, model, args, root_, schema_path, prompt):
     return gr._AgyRun(0, stdout=json.dumps({"verdict": verdict, "summary": "t", "findings": []}))
 
+def fake_quota(agy, model, args, root_, schema_path, prompt):
+    return gr._AgyRun(1, stderr="RESOURCE_EXHAUSTED: quota exceeded. Resets in 3h0m0s")
+
 gr._find_agy = lambda *a, **k: "agy"
-gr._invoke_schema = fake_invoke
-sys.exit(gr.main(["--staged"]))
+gr._invoke_schema = fake_quota if verdict == "quota" else fake_invoke
+# 쿼터 조회 · 생존 확인이 **진짜 agy** 를 부르지 않게 한다(개발 기기에는 agy 가 있다).
+gr._run_agy = lambda *a, **k: gr._AgyRun(None, error="테스트: agy 를 부르지 않는다")
+sys.exit(gr.main(sys.argv[3:] or ["--staged"]))
 '''
 
 
@@ -3175,15 +3193,25 @@ def _check_gate_end_to_end(gr):
         yield None if rc == 0 else "게이트 검사용 리뷰가 exit %d 로 끝났다(기대 0)" % rc
         yield expect("통과 리뷰 뒤", "git commit -m x", 0)
         yield expect("통과 리뷰 뒤 heredoc 메시지", _GATE_HEREDOC, 0)
-        yield expect("git add -A && git commit", "git add -A && git commit -m x", 2, "git add")
-        yield expect("-am", "git commit -am x", 2, "-a")
+        # [1.7.0] 한 줄 커밋과 `-a` 는 **담을 내용이 리뷰한 것과 같으면** 연다.
+        yield expect("같은 파일을 다시 add 하는 한 줄 커밋", "git add a.py && git commit -m x", 0)
+        yield expect("-am 인데 추적 파일에 더 바뀐 것이 없다", "git commit -am x", 0)
+        write("new.py", "n = 1\n")
+        yield expect("add -A 가 리뷰 안 된 새 파일을 더한다", "git add -A && git commit -m x", 2,
+                     "리뷰가 없다")
+        yield expect("모사하지 않는 인덱스 명령", "git rm -q --cached a.py && git commit -m x", 2,
+                     "모사하지 않는다")
+        os.remove(os.path.join(repo, "new.py"))
+        write("a.py", "x = 1\ny = '한글'\nw = 0\n")
+        yield expect("-am 이 스테이징 밖의 변경을 더한다", "git commit -am x", 2, "리뷰가 없다")
+        yield expect("스테이징만 커밋하면 여전히 리뷰한 내용이다", "git commit -m x", 0)
         yield expect("해석 실패", "git commit -m 'x", 2, "해석하지 못했다")
         yield expect("게이트 끄기 시도", "git config --global gemini-review.gate false", 2,
                      "사용자가 직접")
 
         write("a.py", "x = 1\ny = '한글'\nz = 3\n")
         git("add", "a.py")
-        yield expect("리뷰 뒤 스테이징이 바뀜", "git commit -m x", 2, "스테이징이 바뀌었다")
+        yield expect("리뷰 뒤 스테이징이 바뀜", "git commit -m x", 2, "내용이 바뀌었다")
         yield expect("--dry-run 은 커밋하지 않는다", "git commit --dry-run", 0)
 
         rc = review("approve")
@@ -3207,6 +3235,312 @@ def _check_gate_end_to_end(gr):
         leaks = [e for e in seen if re.search(r"--no-verify|--unset|gate\s+false|\.gate\s*=", e)]
         yield (None if not leaks else
                "게이트가 막으면서 우회 방법을 알려 준다: %s" % leaks[0].strip()[:200])
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+# (게이트가 받는 명령, 실제로 실행할 git 인자 목록들)
+#   기준 상태: a.py 스테이징된 수정 · b.py 스테이징 안 된 수정 · c.py 삭제(스테이징 안 됨) ·
+#   d.py 추적 안 하는 새 파일 · e.py 스테이징된 새 파일 · f.py 스테이징된 삭제(`git rm`).
+_COMMIT_SIM_CASES = [
+    ("git commit -m x", [["commit", "-qm", "x"]]),
+    ("git commit -am x", [["commit", "-qam", "x"]]),
+    ("git commit -m x -i b.py", [["commit", "-qm", "x", "-i", "b.py"]]),
+    ("git commit -m x -- b.py c.py", [["commit", "-qm", "x", "--", "b.py", "c.py"]]),
+    ("git commit -m x e.py", [["commit", "-qm", "x", "e.py"]]),
+    ("git commit -m x -- f.py", [["commit", "-qm", "x", "--", "f.py"]]),
+    ("git commit -m x -- '*.py'", [["commit", "-qm", "x", "--", "*.py"]]),
+    ("git add b.py && git commit -m x", [["add", "b.py"], ["commit", "-qm", "x"]]),
+    ("git add -A && git commit -m x", [["add", "-A"], ["commit", "-qm", "x"]]),
+    ("git add d.py && git commit -m x -- d.py", [["add", "d.py"], ["commit", "-qm", "x", "--", "d.py"]]),
+]
+
+
+def _check_commit_simulation_matches_git(gr):
+    """게이트가 모사한 커밋 내용이 **git 이 실제로 커밋한 내용과 바이트까지 같다**(1.7.0).
+
+    ⛔ 모사가 git 과 다르면 두 갈래로 무너진다 — 리뷰한 내용과 다른 것이 커밋되거나(구멍), 리뷰한
+      내용을 커밋하는데도 막힌다(게이트가 매일 방해). 주석으로 git 구현을 따랐다고 적는 것으로는
+      지켜지지 않는다. 같은 저장소를 복사해 **진짜로 커밋**하고 `HEAD~1..HEAD` 와 비교한다.
+    ⚠ 진짜 인덱스를 건드리지 않는 것도 본다 — 두 세션이 작업 트리를 공유하는 경우가 이 기능의 이유다.
+    """
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    cg = _load_gate()
+    sandbox = tempfile.mkdtemp(prefix="gr_test_commit_sim_")
+    empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+
+        def git(cwd, *args):
+            return subprocess.run(["git"] + list(args), cwd=cwd, env=env, capture_output=True,
+                                  timeout=60, check=False)
+
+        def write(name, text):
+            with io.open(os.path.join(repo, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        git(repo, "init", "-q")
+        for name in ("a", "b", "c", "f"):
+            write(name + ".py", "%s = 1\n" % name)
+        git(repo, "add", ".")
+        git(repo, "commit", "-qm", "init")
+        write("a.py", "a = 2\n")
+        git(repo, "add", "a.py")
+        write("b.py", "b = 2\n")
+        os.remove(os.path.join(repo, "c.py"))
+        write("d.py", "d = 1\n")
+        write("e.py", "e = 1\n")
+        git(repo, "add", "e.py")
+        git(repo, "rm", "-q", "f.py")
+        index_path = os.path.join(repo, ".git", "index")
+        with open(index_path, "rb") as fh:
+            index_before = fh.read()
+
+        # 모사는 전부 먼저 한다(실행은 사본에서) — 진짜 인덱스가 끝까지 그대로여야 한다.
+        with _patched(os, "environ", env):
+            simulated = []
+            for command, _argvs in _COMMIT_SIM_CASES:
+                steps = cg.analyze(command)
+                at = [k for k, st in enumerate(steps) if st.get("sub") == "commit"][0]
+                plan, problem = cg.commit_plan(steps[at]["args"])
+                adds = [(repo, st["args"]) for st in steps[:at] if st.get("sub") == "add"]
+                simulated.append(None if problem else
+                                 gr._commit_diff(repo, plan["mode"], plan["pathspec"], repo, adds)[0])
+        with open(index_path, "rb") as fh:
+            yield (None if fh.read() == index_before else
+                   "커밋 모사가 **진짜 인덱스**를 바꿨다: 작업 트리를 공유하는 다른 세션의 스테이징이 망가진다")
+
+        for (command, argvs), sim in zip(_COMMIT_SIM_CASES, simulated):
+            copy = os.path.join(sandbox, "copy")
+            shutil.rmtree(copy, True)
+            shutil.copytree(repo, copy)
+            failed = [argv for argv in argvs if git(copy, *argv).returncode != 0]
+            if failed:
+                yield "커밋 모사 [%s]: 사본에서 실제 커밋이 실패했다(%s) — 검사 전제가 깨졌다" % (command, failed[0])
+                continue
+            with _patched(os, "environ", env):
+                real = gr._collect_diff(copy, "HEAD~1", "HEAD", False, True)[0]
+            yield (None if sim == real else
+                   "커밋 모사 [%s]: 모사한 diff(%d자)가 실제 커밋(%d자)과 다르다"
+                   % (command, len(sim or ""), len(real)))
+
+        # [26.09.17 교차 리뷰 CRITICAL 주장 — 실측으로 거짓] "첫 커밋 전에는 HEAD 가 없어 모사가 죽는다".
+        #   git 2.43 에서 네 형태 모두 됐다. 주장이 그럴듯하므로 **첫 커밋**도 실제와 대조해 고정한다.
+        unborn = os.path.join(sandbox, "unborn")
+        os.makedirs(unborn)
+        git(unborn, "init", "-q")
+        for name in ("a", "b"):
+            with io.open(os.path.join(unborn, name + ".py"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("%s = 1\n" % name)
+        git(unborn, "add", "a.py")
+        for command, argvs, mode, pathspec, adds in (
+                ("git commit -m x", [["commit", "-qm", "x"]], "index", [], []),
+                ("git add b.py && git commit -m x", [["add", "b.py"], ["commit", "-qm", "x"]],
+                 "index", [], [(unborn, ["b.py"])]),
+                ("git commit -m x -- a.py", [["commit", "-qm", "x", "--", "a.py"]], "only", ["a.py"], [])):
+            with _patched(os, "environ", env):
+                try:
+                    sim = gr._commit_diff(unborn, mode, pathspec, unborn, adds)[0]
+                except RuntimeError as exc:
+                    sim = "모사 실패: %s" % exc
+            copy = os.path.join(sandbox, "unborn-copy")
+            shutil.rmtree(copy, True)
+            shutil.copytree(unborn, copy)
+            for argv in argvs:
+                git(copy, *argv)
+            with _patched(os, "environ", env):
+                real = gr._collect_diff(copy, empty_tree, "HEAD", False, True)[0]
+            yield (None if sim == real else
+                   "커밋 모사 [첫 커밋 · %s]: 모사가 실제 첫 커밋과 다르다: %s" % (command, sim[:120]))
+
+        # ⛔ [26.09.17 교차 리뷰 HIGH · 실측 재현] 경로를 명령줄로 펼치면 인자 길이 상한에 걸린다 — Windows 는
+        #   32,767자라 수백 파일이면 넘는다. 리눅스 CI 에서는 상한이 커서 안 보이므로 **가장 긴 명령줄**을 잰다.
+        many = os.path.join(sandbox, "many")
+        os.makedirs(os.path.join(many, "d"))
+        git(many, "init", "-q")
+        long_name = "file_with_a_fairly_long_name_to_measure_the_command_line_%04d.py"
+        for i in range(600):
+            with io.open(os.path.join(many, "d", long_name % i), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+        git(many, "add", ".")
+        git(many, "commit", "-qm", "init")
+        for i in range(600):
+            with io.open(os.path.join(many, "d", long_name % i), "w", encoding="utf-8") as fh:
+                fh.write("x = 2\n")
+        longest = [0]
+        real_git = gr._git
+
+        def measuring(args, *rest, **kw):
+            longest[0] = max(longest[0], sum(len(a) + 1 for a in args))
+            return real_git(args, *rest, **kw)
+
+        with _patched(os, "environ", env), _patched(gr, "_git", measuring):
+            files = gr._commit_diff(many, "only", ["d"], many)[1]
+        yield (None if len(files) == 600 and longest[0] < 8000 else
+               "경로 지정 모사가 파일 목록을 명령줄로 펼친다(가장 긴 명령줄 %d자 · 파일 %d개): "
+               "Windows 명령줄 상한(32,767자)에 걸린다" % (longest[0], len(files)))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_path_commit(gr):
+    """두 세션이 작업 트리를 공유하는 경로 지정 커밋 — `--paths` 리뷰가 게이트를 연다(1.7.0).
+
+    ⛔ [다른 프로젝트 운영 보고] 1.6.x 게이트는 `git commit -- 경로` 를 형태만 보고 막았다. 그 저장소는
+      두 세션이 트리를 공유할 때 남의 스테이징을 건드리지 않으려고 그 방식을 규칙으로 쓰고 있었다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_paths_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+
+        def git(*args):
+            return subprocess.run(["git"] + list(args), cwd=repo, env=env, capture_output=True,
+                                  timeout=60, check=False)
+
+        def write(name, text):
+            with io.open(os.path.join(repo, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        git("init", "-q")
+        write("a.py", "a = 1\n")
+        write("b.py", "b = 1\n")
+        git("add", ".")
+        git("commit", "-qm", "init")
+        git("config", "gemini-review.gate", "true")
+        write("a.py", "a = 2\n")                 # 세션 A: 스테이징하지 않는다
+        write("b.py", "b = 2\n")
+        git("add", "b.py")                       # 세션 B: 자기 파일을 스테이징했다
+
+        proc = subprocess.run([sys.executable, "-c", _CHILD_GATE_REVIEW, os.path.abspath(_TARGET),
+                               "approve", "--paths", "a.py"],
+                              cwd=repo, env=env, capture_output=True, timeout=120, check=False)
+        yield (None if proc.returncode == 0 else
+               "--paths 리뷰가 exit %d (기대 0): %s"
+               % (proc.returncode, proc.stdout.decode("utf-8", "replace")[-200:]))
+        staged = git("diff", "--cached", "--name-only").stdout.decode("utf-8").split()
+        yield (None if staged == ["b.py"] else
+               "--paths 리뷰가 스테이징을 바꿨다: %r (기대 ['b.py'])" % staged)
+        gate = [sys.executable, _GATE_PY]
+        for label, command, want in (
+                ("리뷰한 경로 지정 커밋", "git commit -m x -- a.py", 0),
+                ("경로 없이 쓴 같은 경로 지정", "git commit -m x a.py", 0),
+                ("남의 스테이징을 담는 커밋", "git commit -m x", 2),
+                ("리뷰하지 않은 경로를 더한 커밋", "git commit -m x -- a.py b.py", 2)):
+            rc, err = _gate_call(gate, repo, command, env)
+            yield (None if rc == want else
+                   "게이트 경로 지정 [%s]: exit %d (기대 %d): %s" % (label, rc, want, err.strip()[:160]))
+        rc, err = _gate_call(gate, repo, "git commit -m x -- a.py b.py", env)
+        yield (None if "--paths a.py b.py" in err else
+               "경로 지정 커밋을 막으면서 `--paths` 리뷰를 안내하지 않았다: %s" % err.strip()[:160])
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_gate_fallback_record(gr):
+    """Gemini 리뷰가 **수행되지 않았을 때만** 대체 리뷰 기록이 게이트를 연다(1.7.0).
+
+    ⛔ [다른 프로젝트 운영 보고] 사흘 연속 Gemini 가 수행되지 않았고(쿼터 → 권한 거부 → 무응답), 운영
+      규칙("계층 장애면 대체 리뷰")대로 리뷰를 마쳐도 결과 파일이 없어 커밋할 수 없었다.
+    ⚠ 반대 방향도 지킨다 — Gemini 에게 묻지도 않고 건너뛰거나, Gemini 의 지적을 대체 리뷰로 덮지 못한다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_gate_fb_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+
+        def git(*args):
+            return subprocess.run(["git"] + list(args), cwd=repo, env=env, capture_output=True,
+                                  timeout=60, check=False)
+
+        def write(text):
+            with io.open(os.path.join(repo, "a.py"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        def review(verdict, *extra):
+            return subprocess.run([sys.executable, "-c", _CHILD_GATE_REVIEW,
+                                   os.path.abspath(_TARGET), verdict, "--staged"] + list(extra),
+                                  cwd=repo, env=env, capture_output=True, timeout=120,
+                                  check=False).returncode
+
+        def record(*override):
+            argv = list(override) or ["--staged", "--record-fallback", "--reviewer", "테스트 다렌즈",
+                                      "--summary", "지적 없음"]
+            proc = subprocess.run([sys.executable, os.path.abspath(_TARGET)] + argv, cwd=repo,
+                                  env=env, capture_output=True, timeout=120, check=False)
+            return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+        gate = [sys.executable, _GATE_PY]
+        git("init", "-q")
+        write("a = 1\n")
+        git("add", "a.py")
+        git("commit", "-qm", "init")
+        git("config", "gemini-review.gate", "true")
+        write("a = 2\n")
+        git("add", "a.py")
+
+        for label, argv in (
+                ("요약 없음", ["--staged", "--record-fallback", "--reviewer", "x"]),
+                ("범위 없음", ["--record-fallback", "--reviewer", "x", "--summary", "y"]),
+                ("--paths 와 --staged 함께", ["--staged", "--paths", "a.py"]),
+                ("기록 없이 --reviewer", ["--staged", "--reviewer", "x"])):
+            rc, _out = record(*argv)
+            yield None if rc == 2 else "인자 검사 [%s]: exit %d (기대 2)" % (label, rc)
+
+        rc, out = record()
+        yield (None if rc == 2 and "시도한 기록이 없다" in out else
+               "대체 리뷰 기록 [Gemini 시도 없음]: exit %d (기대 2 · 거부): %s" % (rc, out[-160:]))
+        rc = review("quota")
+        yield None if rc == 4 else "쿼터로 수행되지 않은 리뷰가 exit %d (기대 4)" % rc
+        rc, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc == 2 and "--record-fallback" in err else
+               "게이트 [수행되지 않음]: exit %d · 대체 리뷰 기록 안내 없음: %s" % (rc, err.strip()[:200]))
+        rc, out = record()
+        yield (None if rc == 0 else
+               "대체 리뷰 기록 [수행되지 않은 뒤]: exit %d (기대 0): %s" % (rc, out[-200:]))
+        rc, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc == 0 else
+               "게이트 [대체 리뷰 기록 뒤]: exit %d (기대 0): %s" % (rc, err.strip()[:160]))
+
+        results = os.path.join(sandbox, "state", "gemini-review")
+        metas = []
+        for name in sorted(os.listdir(results)) if os.path.isdir(results) else []:
+            meta = _read_json(os.path.join(results, name)).get("_meta") or {}
+            if meta.get("mode") == "fallback_reviewed":
+                metas.append(meta)
+        yield (None if len(metas) == 1 and metas[0].get("passed") is False else
+               "대체 리뷰 기록이 주 모델 판정처럼 남았다(passed 가 false 여야 한다): %r"
+               % [(m.get("mode"), m.get("passed")) for m in metas])
+
+        git("config", "gemini-review.gateFallback", "false")
+        rc, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc == 2 and "인정하지 않는다" in err else
+               "게이트 [대체 리뷰를 끈 저장소]: exit %d (기대 2): %s" % (rc, err.strip()[:160]))
+        git("config", "--unset", "gemini-review.gateFallback")
+
+        write("a = 3\n")
+        git("add", "a.py")
+        rc = review("request_changes", "--ignore-quota-cache")
+        yield None if rc == 5 else "request_changes 리뷰가 exit %d (기대 5)" % rc
+        rc, out = record()
+        yield (None if rc == 2 and "덮을 수 없다" in out else
+               "대체 리뷰 기록 [Gemini 가 지적을 낸 뒤]: exit %d (기대 2 · 거부): %s" % (rc, out[-160:]))
+        rc, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield None if rc == 2 else "게이트 [지적 뒤 기록 거부]: exit %d (기대 2)" % rc
     finally:
         _rmtree_sandbox(sandbox, sandbox)
 
@@ -3513,6 +3847,9 @@ _BEHAVIOR_CHECKS = (
     _check_every_check_is_registered,
     _check_gate_parsing,
     _check_gate_end_to_end,
+    _check_commit_simulation_matches_git,
+    _check_gate_path_commit,
+    _check_gate_fallback_record,
     _check_gate_scopes_results_to_repo,
     _check_gate_unknown_target_is_strict,
     _check_gate_fails_closed,

@@ -3314,9 +3314,11 @@ def _check_commit_simulation_matches_git(gr):
             yield (None if fh.read() == index_before else
                    "커밋 모사가 **진짜 인덱스**를 바꿨다: 작업 트리를 공유하는 다른 세션의 스테이징이 망가진다")
 
-        for (command, argvs), sim in zip(_COMMIT_SIM_CASES, simulated):
-            copy = os.path.join(sandbox, "copy")
-            shutil.rmtree(copy, True)
+        # ⛔ [26.09.17 Windows CI 실측] 사본 폴더를 **재사용하지 않는다.** Windows 에서 git 의 object 파일은
+        #   읽기 전용이라 `rmtree(…, ignore_errors)` 가 조용히 실패하고, 다음 `copytree` 가 `FileExistsError`
+        #   로 죽었다. 리눅스에서는 재현되지 않는다. 사례마다 새 이름을 쓰고 정리는 샌드박스에 맡긴다.
+        for n, ((command, argvs), sim) in enumerate(zip(_COMMIT_SIM_CASES, simulated)):
+            copy = os.path.join(sandbox, "copy-%02d" % n)
             shutil.copytree(repo, copy)
             failed = [argv for argv in argvs if git(copy, *argv).returncode != 0]
             if failed:
@@ -3337,18 +3339,17 @@ def _check_commit_simulation_matches_git(gr):
             with io.open(os.path.join(unborn, name + ".py"), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write("%s = 1\n" % name)
         git(unborn, "add", "a.py")
-        for command, argvs, mode, pathspec, adds in (
+        for n, (command, argvs, mode, pathspec, adds) in enumerate((
                 ("git commit -m x", [["commit", "-qm", "x"]], "index", [], []),
                 ("git add b.py && git commit -m x", [["add", "b.py"], ["commit", "-qm", "x"]],
                  "index", [], [(unborn, ["b.py"])]),
-                ("git commit -m x -- a.py", [["commit", "-qm", "x", "--", "a.py"]], "only", ["a.py"], [])):
+                ("git commit -m x -- a.py", [["commit", "-qm", "x", "--", "a.py"]], "only", ["a.py"], []))):
             with _patched(os, "environ", env):
                 try:
                     sim = gr._commit_diff(unborn, mode, pathspec, unborn, adds)[0]
                 except RuntimeError as exc:
                     sim = "모사 실패: %s" % exc
-            copy = os.path.join(sandbox, "unborn-copy")
-            shutil.rmtree(copy, True)
+            copy = os.path.join(sandbox, "unborn-copy-%d" % n)      # 재사용하지 않는다(위와 같은 이유)
             shutil.copytree(unborn, copy)
             for argv in argvs:
                 git(copy, *argv)

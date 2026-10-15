@@ -32,6 +32,8 @@
                                                # Gemini 가 수행되지 않았을 때 대체 리뷰 기록 (1.7.0)
 
 ⚠ 모델은 `gemini-3.1-pro-high` 고정이다 — 느리다고 flash 로 낮추지 않는다(SKILL.md).
+  단, agy 가 그 모델을 모를 때(`agy models` 에 없음)만 대체 주 모델
+  `gemini-3.8-flash-high` 로 판정한다(1.8.0 · 사용자 지시 26.10.13). `--model` 을 적으면 바꾸지 않는다.
   **판정은 주 모델만 낸다.** 진단 모델(`--probe-model`)은 빈 응답일 때 한 줄 생존
   확인에만 쓴다(1.4.0).
 
@@ -229,11 +231,21 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
+# [1.8.0] **대체 주 모델.** 사용자 지시(26.10.13 확인): "pro-high 가 agy models 에 없는 동안에는
+#   gemini-3.8-flash-high 를 쓴다." 그래서 agy 가 기본 모델을 **모른다고 답할 때만**
+#   (`model_unavailable`) 이 모델로 바꿔 판정을 받는다(`_standin_model`).
+#   ⛔ 빈 응답 · 시간 초과 · 쿼터로는 바꾸지 않는다 — 그것은 "느리다고 낮추기" 이고 지시가 막는다.
+#   ⚠ 바꾸는 판단을 `agy models` 목록으로 미리 하지 않는다. 목록 조회는 실측 4초라 모든 리뷰에
+#     붙으면 비용이 되고, agy 의 거부 응답은 0초에 같은 사실을 알려 준다. pro-high 가 돌아오면
+#     첫 호출이 성공하므로 저절로 pro-high 로 돌아간다.
+_STANDIN_MODEL = "gemini-3.8-flash-high"
 # ⛔ [1.4.0] **진단 전용**이다 — 이 모델로 리뷰를 요청하지 않는다(`_recover_empty_response`).
-_DEFAULT_PROBE_MODEL = "gemini-3.6-flash-high"
+#   [1.8.0] `gemini-3.6-flash-high` 는 agy 목록에서 빠졌다(26.10.15 `agy models` 실측). 대체
+#   주 모델과 **다른** 모델이어야 생존 확인이 의미가 있다 — 같은 계열의 medium 을 쓴다.
+_DEFAULT_PROBE_MODEL = "gemini-3.8-flash-medium"
 _CONTEXT_FILE = ".gemini-review.md"
 
 # [26.09.10] **도구 계층 생존 확인.** 빈 응답이 났을 때 원인이 둘 중 어느
@@ -853,6 +865,8 @@ def _main(argv, ctx: dict) -> int:
     if args.stats:
         return _run_stats(args)
     _apply_deprecated_flags(args)
+    # [1.8.0] 사용자가 `--model` 을 적었으면 대체 주 모델로 바꾸지 않는다(`_standin_model`).
+    args.model_explicit = bool(_named_in_argv(argv, ("--model",)))
     # 중단 · 내부 오류 기록(`main`)도 판정 모델을 남기게 한다 — 인자 해석을 마친 뒤의 모든 결과에 있다.
     ctx["model"] = args.model
 
@@ -860,7 +874,7 @@ def _main(argv, ctx: dict) -> int:
     # ⛔ [1.5.0 Eng H1] 새 `_meta` 키는 **상태에 담아 `finish` 안에서 한 번** 대입한다.
     #   호출부마다 넘기면 언젠가 빠진다 — 최상위 `model` 이 같은 실수를 두 번 했고 직전
     #   커밋이 그 수정이었다.
-    state = {"scope": None, "diff_sha256": None, "diff_bytes": None}
+    state = {"scope": None, "diff_sha256": None, "diff_bytes": None, "requested_model": None}
     ctx["calls"] = calls                  # 같은 객체 — internal_error 도 호출 기록을 잃지 않는다
 
     def finish(mode: str, body: dict, rc: Optional[int] = None, **meta) -> int:
@@ -881,6 +895,9 @@ def _main(argv, ctx: dict) -> int:
         body = dict(body)
         body["model"] = meta["model"]
         meta["scope"] = state["scope"]
+        if state["requested_model"]:
+            # [1.8.0] 대체 주 모델이 판정했다 — 원래 요청한 모델을 남긴다(`_meta.model` 은 대체 모델).
+            meta["requested_model"] = state["requested_model"]
         meta["calls"] = calls
         meta["elapsed_seconds"] = round(time.time() - started, 1)
         if state["diff_sha256"]:
@@ -1083,6 +1100,14 @@ def _main(argv, ctx: dict) -> int:
     run = _invoke_schema(agy, model, args, root, schema_path, prompt)
     cause, kind, detail = _classify_run(run, structured=True)
     calls.append(_call_record("structured", model, run, cause, kind, detail))
+    standin = _standin_model(args, cause)
+    if standin:
+        _say_standin(model, standin)
+        state["requested_model"] = model
+        args.model = model = ctx["model"] = standin
+        run = _invoke_schema(agy, model, args, root, schema_path, prompt)
+        cause, kind, detail = _classify_run(run, structured=True)
+        calls.append(_call_record("structured", model, run, cause, kind, detail))
     if run.rc is not None:
         _safe_print("응답: %s · %.0f초" % (model, run.elapsed))
 
@@ -1123,6 +1148,26 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("   (종료코드 %d — 지적을 실측 검증한 뒤 반영하고 다시 돌릴 것)"
                     % rc)
     return finish("reviewed", review, rc, dropped_llm_keys=dropped or None)
+
+
+def _standin_model(args, cause: str) -> str:
+    """기본 주 모델 대신 판정할 **대체 주 모델**. 바꾸지 않으면 빈 문자열(1.8.0).
+
+    바꾸는 조건은 셋 다다: ① agy 가 모델을 모른다(`model_unavailable`) ② 사용자가 `--model` 을
+    적지 않았다 ③ 지금 모델이 기본 모델이다(대체 모델까지 없으면 한 번 더 바꾸지 않는다).
+    ⛔ `empty` · `timeout` · `quota` 로는 바꾸지 않는다 — 사용자 지시가 "빈 응답이면 재시도하지
+      모델을 낮추지 않는다" 이다. 이 함수가 그 원인에 빈 문자열을 내는 것을 테스트가 본다.
+    """
+    if cause != "model_unavailable" or getattr(args, "model_explicit", True):
+        return ""
+    return _STANDIN_MODEL if args.model == _DEFAULT_MODEL else ""
+
+
+def _say_standin(model: str, standin: str) -> None:
+    _safe_print("⚠ agy 가 주 모델 %s 를 모른다(`agy models` 에 없음) — 대체 주 모델 %s 로 판정한다."
+                % (model, standin))
+    _safe_print("   사용자 지시(26.10.13): pro-high 가 목록에 없는 동안에만 쓴다. 돌아오면 저절로 "
+                "pro-high 로 돌아간다. 결과 JSON 의 `_meta.requested_model` 에 남는다.")
 
 
 # 이 원인이면 곧바로 끝낸다(재시도 없음). 빈 응답(`empty` · `tool_denied`)만 복구를 시도한다.
@@ -1298,7 +1343,8 @@ def _failure_result(stage: str, model: str, run: "_AgyRun", cause: str, kind: st
     if cause == "model_unavailable":
         _say_not_reviewed(
             "%s: agy 가 모델 %s 를 모른다" % (stage, model), detail,
-            "`agy models` 로 이름을 확인하고 --model 로 지정할 것(flash 로 낮추지 말 것).")
+            "`agy models` 로 이름을 확인하고 --model 로 지정할 것(flash 로 낮추지 말 것). "
+            "기본 모델이 없을 때의 대체 주 모델은 --model 을 빼야 자동으로 쓴다.")
         return "model_unavailable", {
             "error": detail,
             "note": "agy 가 모델을 알지 못해 리뷰가 수행되지 않았다. 통과가 아니다."}, {}
@@ -1488,11 +1534,23 @@ def _run_check(args, calls: List[dict]) -> Tuple[int, dict]:
 def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]) -> Tuple[int, dict]:
     """`--check` 의 agy 부분 — 모델 응답 · 래퍼 필드 · 시간 초과 안내 · 모델 없음 안내."""
     # ① 주 모델이 한 줄 프롬프트에 구조화 래퍼로 답하는가 (로그인 · 모델 · 래퍼 필드)
-    run = _run_agy(agy, args.model, ["--output-format", "json",
-                                     "--print-timeout", _PROBE_TIMEOUT,
-                                     "-p", _PROBE_PROMPT], where, _PROBE_TIMEOUT, 60)
-    cause, kind, detail = _classify_run(run, structured=True)
-    calls.append(_call_record("check_model", args.model, run, cause, kind, detail))
+    def ask():
+        r = _run_agy(agy, args.model, ["--output-format", "json",
+                                       "--print-timeout", _PROBE_TIMEOUT,
+                                       "-p", _PROBE_PROMPT], where, _PROBE_TIMEOUT, 60)
+        c, k, d = _classify_run(r, structured=True)
+        calls.append(_call_record("check_model", args.model, r, c, k, d))
+        return r, c, k, d
+
+    run, cause, kind, detail = ask()
+    # [1.8.0] 실제 리뷰와 같은 규칙으로 대체 주 모델을 확인한다 — 점검이 "모델 없음(2)" 이라고
+    #   말하는데 리뷰는 대체 모델로 도는 어긋남을 막는다.
+    standin = _standin_model(args, cause)
+    if standin:
+        mark("주 모델", None, "%s 를 agy 가 모른다 — 리뷰는 대체 주 모델 %s 로 판정한다"
+             % (args.model, standin))
+        args.model = standin
+        run, cause, kind, detail = ask()
     if cause != "ok":
         mark("모델 응답", False, "%s · %s%s" % (args.model, cause, " · " + detail if detail else ""),
              EXIT_NOT_REVIEWED if cause in ("timeout", "quota", "empty") else EXIT_TOOL_ERROR)
@@ -1832,8 +1890,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # (`gemini-3.1-pro-high`/`-low`, `gemini-3.6-flash-medium` …), 모델 접미사와
     # 다른 --effort 를 주면 즉시 status=ERROR 로 죽는다 (실측: 0초, tokens 0).
     ap.add_argument("--model", default=_DEFAULT_MODEL,
-                    help="판정을 내는 모델 (기본 %s: 느리다고 낮추지 말 것). "
-                         "`agy models` 로 목록 확인" % _DEFAULT_MODEL)
+                    help="판정을 내는 모델 (기본 %s: 느리다고 낮추지 말 것). agy 가 기본 "
+                         "모델을 모를 때만 %s 로 판정한다(이 인자를 적으면 바꾸지 않는다). "
+                         "`agy models` 로 목록 확인" % (_DEFAULT_MODEL, _STANDIN_MODEL))
     # ⛔ [1.4.0 결정 1] 1.3.x 의 `--fallback-model` 은 주 모델이 빈 응답이면 **그 모델로
     #   리뷰를 다시 요청**했고 그 판정이 exit 0 이 됐다. 이제 이 모델은 판정하지 않는다 —
     #   뜻이 바뀌었으므로 이름도 바꾼다(옛 이름은 경고와 함께 1.4.x 동안 받는다).

@@ -1368,7 +1368,9 @@ def _check_agy_error_is_not_empty_response(gr):
                     _patched(gr, "_resolve_scope", lambda *a, **k: {"kind": "test"}), \
                     _patched(gr, "_collect_diff",
                              lambda *a, **k: ("diff --git a/x.py b/x.py\n+x = 1\n", ["x.py"])):
-                rc = gr.main(["--out", out])
+                # [1.8.0] `--model` 을 적어 대체 주 모델 경로를 닫는다 — 이 검사는 "agy 오류를 빈
+                #   응답으로 읽지 않는다" 만 본다. 대체 경로는 `_check_standin_model` 이 본다.
+                rc = gr.main(["--out", out, "--model", gr._DEFAULT_MODEL])
             agy_calls = [c for c in calls if c and c[0] == "agy"]
             mode = _read_json(out).get("mode")
             yield (None if rc == 2 and len(agy_calls) == 1 and mode == want_mode else
@@ -2429,7 +2431,10 @@ def _check_stats(gr):
                  ("reviewed", 0, True, 4000)]):
             meta = dict(base, mode=mode, exit_code=rc, passed=passed,
                         # 회차마다 시각이 다르다 — 루프 안의 순서가 diff 크기 추이를 만든다.
-                        written_at="2026-09-16T10:0%d:00Z" % i,
+                        # ⛔ [26.10.15] 고정 시각("2026-09-16…")은 `--since 14d` 를 지나면 기간 밖으로
+                        #   빠져 이 검사가 저절로 빨개졌다(09-30 부터). 지금 기준 상대 시각을 쓴다.
+                        written_at=(gr._utc_now() - datetime.timedelta(hours=1)
+                                    + datetime.timedelta(minutes=i)).strftime(gr._UTC_FMT),
                         diff_sha256="h%d" % i, diff_bytes=size, elapsed_seconds=100 + i,
                         scope={"kind": "staged", "repo": "/r", "branch": "main",
                                "head_sha": "abc"})
@@ -2715,6 +2720,112 @@ def _check_scope_records_resolved_shas(gr):
                "해석할 수 없는 · 옵션 꼴 ref 를 None 으로 두지 않았다: %r" % got)
     finally:
         _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_standin_model(gr):
+    """대체 주 모델: agy 가 기본 모델을 **모를 때만** `gemini-3.8-flash-high` 가 판정한다(1.8.0).
+
+    [26.10.15] `gemini-3.1-pro-high` 가 `agy models` 에서 빠져 1.7.x 의 모든 리뷰가 exit 2 였다.
+      사용자 지시: "pro-high 가 agy models 에 없는 동안에는 gemini-3.8-flash-high 를 쓴다 ·
+      빈 응답이면 재시도하고, 더 낮은 모델로는 바꾸지 않는다."
+    ⛔ 빈 응답 · 시간 초과 · 쿼터에서 모델이 바뀌면 1.3.x 의 "flash 가 판정" 결함이 되살아난다.
+      `_agy_script` 는 적어 두지 않은 호출에 approve 를 주므로, 그런 전이가 생기면 exit 0 으로 빨개진다.
+    ⚠ `--model` 없이 돌린다 — 이 경로는 사용자가 모델을 적지 않았을 때만 열린다.
+    """
+    D, F, Q = gr._DEFAULT_MODEL, gr._STANDIN_MODEL, gr._DEFAULT_PROBE_MODEL
+    R = gr._AgyRun
+    S, PR = "structured", "probe"
+    yield (None if len({D, F, Q}) == 3 else
+           "기본 · 대체 · 진단 모델이 서로 같다: %r" % [D, F, Q])
+
+    def review(verdict):
+        return R(0, stdout=_wrap(json.dumps({"verdict": verdict, "summary": "s", "findings": []})))
+
+    NOMODEL = R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG), stderr="error: " + _NOMODEL_MSG)
+    EMPTY = R(0, stdout=_wrap(""), elapsed=200.0)
+    TIMEOUT = R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE, elapsed=600.0)
+    QUOTA = R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG), stderr="error: " + _QUOTA_MSG)
+    DEAD = R(0, stdout="", stderr="[agy] print timeout after 1m0s with turn in progress; returning partial output")
+    # (이름, 추가 인자, 응답, 기대 exit, 기대 mode, 기대 호출, 기대 _meta.model, 기대 requested_model)
+    rows = [
+        ("기본 모델 없음 → 대체 approve", [], {(S, D): NOMODEL, (S, F): review("approve")},
+         0, "reviewed", [(S, D), (S, F)], F, D),
+        ("기본 모델 없음 → 대체 request_changes", [], {(S, D): NOMODEL, (S, F): review("request_changes")},
+         5, "reviewed", [(S, D), (S, F)], F, D),
+        ("대체 모델도 없음 — 한 번만 바꾼다", [], {(S, D): NOMODEL, (S, F): NOMODEL},
+         2, "model_unavailable", [(S, D), (S, F)], F, D),
+        ("대체 모델 빈 응답 → 더 낮추지 않는다", [], {(S, D): NOMODEL, (S, F): EMPTY, (PR, F): DEAD, (PR, Q): DEAD},
+         4, "tool_unavailable", [(S, D), (S, F), (PR, F), (PR, Q)], F, D),
+        ("기본 모델 빈 응답 → 바꾸지 않는다", [], {(S, D): EMPTY, (PR, D): DEAD, (PR, Q): R(0, stdout="OK\n")},
+         4, "primary_model_unavailable", [(S, D), (PR, D), (PR, Q)], D, None),
+        ("기본 모델 시간 초과 → 바꾸지 않는다", [], {(S, D): TIMEOUT}, 4, "timeout", [(S, D)], D, None),
+        ("기본 모델 쿼터 → 바꾸지 않는다", [], {(S, D): QUOTA}, 4, "quota_exhausted",
+         [(S, D), ("quota_query", D)], D, None),
+        ("--model 을 적었으면 바꾸지 않는다", ["--model", D], {(S, D): NOMODEL},
+         2, "model_unavailable", [(S, D)], D, None),
+        ("--model 약어도 명시다", ["--mod", D], {(S, D): NOMODEL},
+         2, "model_unavailable", [(S, D)], D, None),
+        ("기본 모델 정상 → 그대로", [], {(S, D): review("approve")}, 0, "reviewed", [(S, D)], D, None),
+    ]
+    for label, extra, responses, want_rc, want_mode, want_calls, want_model, want_req in rows:
+        sandbox = tempfile.mkdtemp(prefix="gr_test_standin_")
+        try:
+            out = os.path.join(sandbox, "o.json")
+            fake, log = _agy_script(gr, dict(responses))
+            env = _state_env(sandbox)
+            with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                    _fake_repo(gr, sandbox), _patched(gr, "_run_agy", fake):
+                rc = gr.main(["--out", out] + extra)
+            body = _read_json(out)
+            meta = body.get("_meta") or {}
+            problems = []
+            if rc != want_rc or meta.get("mode") != want_mode:
+                problems.append("exit %s · mode %r (기대 %d · %s)" % (rc, meta.get("mode"), want_rc, want_mode))
+            if log != want_calls:
+                problems.append("agy 호출 %r (기대 %r)" % (log, want_calls))
+            if body.get("model") != want_model or meta.get("model") != want_model:
+                problems.append("model %r · _meta.model %r (기대 %s)"
+                                % (body.get("model"), meta.get("model"), want_model))
+            if meta.get("requested_model") != want_req:
+                problems.append("_meta.requested_model %r (기대 %r)" % (meta.get("requested_model"), want_req))
+            if len(meta.get("calls") or []) != len(log):
+                problems.append("_meta.calls %d건 (호출 %d회)" % (len(meta.get("calls") or []), len(log)))
+            yield (None if not problems else "대체 주 모델 [%s]: %s" % (label, " · ".join(problems)))
+        finally:
+            _rmtree_sandbox(sandbox, sandbox)
+
+    # `--check` 도 같은 규칙이다 — 점검이 "모델 없음(2)" 인데 리뷰는 대체 모델로 도는 어긋남이 없다.
+    NO = gr._CHECK_NO_SUCH_MODEL
+    responses = {
+        (PR, D): R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG)),
+        (PR, F): R(0, stdout=_wrap("OK")),
+        ("text", F): R(0, stdout=_wrap(""), stderr="[agy] print timeout after 1s with turn in progress; returning partial output"),
+        (PR, NO): R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG)),
+    }
+    sandbox = tempfile.mkdtemp(prefix="gr_test_standin_check_")
+    try:
+        out = os.path.join(sandbox, "o.json")
+        fake, log = _agy_script(gr, responses)
+        env = _state_env(sandbox)
+        with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                _patched(gr, "_find_agy", lambda *a, **k: "agy"), \
+                _patched(gr, "_git", lambda *a, **k: "git version test"), \
+                _patched(gr, "_git_root", lambda start: sandbox), \
+                _patched(gr, "_run_agy", fake):
+            rc = gr.main(["--check", "--out", out])
+        body = _read_json(out)
+        bad = [c.get("name") for c in body.get("checks") or [] if c.get("ok") is False]
+        yield (None if rc == 0 and not bad and log[:2] == [(PR, D), (PR, F)] else
+               "--check 대체 주 모델: exit %s · 빨간 항목 %r · 호출 %r" % (rc, bad, log))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+    # 원인별 단위 규칙 — 모델 없음 외에는 빈 문자열이다.
+    args = types.SimpleNamespace(model=D, model_explicit=False)
+    wrong = [c for c in ("empty", "tool_denied", "timeout", "quota", "tool_error", "ok")
+             if gr._standin_model(args, c)]
+    yield (None if not wrong and gr._standin_model(args, "model_unavailable") == F else
+           "_standin_model 이 모델 없음 외의 원인에서 바꾼다: %r" % wrong)
 
 
 def _check_check_mode(gr):
@@ -3836,6 +3947,7 @@ _BEHAVIOR_CHECKS = (
     _check_skill_powershell_block_shape,
     _check_empty_response_names_its_cause,
     _check_result_contract_matrix,
+    _check_standin_model,
     _check_diff_bytes_and_hash,
     _check_call_usage_recorded,
     _check_quota_short_circuit,

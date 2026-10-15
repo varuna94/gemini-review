@@ -3,6 +3,22 @@
 판마다 **달라지는 점**만 적는다. 설치본 갱신은 `/plugin update gemini-review@gemini-review`
 뒤 **새 세션**이 필요하다 — 리뷰 배너 첫 줄(`Gemini 교차 리뷰 vX.Y.Z`)로 실제로 돈 판을 본다.
 
+## 1.8.0 — 대체 주 모델 `gemini-3.8-flash-high` (2026-10-15)
+
+`gemini-3.1-pro-high` 가 `agy models` 에서 빠졌다(2026-10-13 확인 · 10-15 재확인). 1.7.x 는 모든 리뷰가
+`model_unavailable`(exit 2)로 끝나, 다른 프로젝트들은 `--model` 을 손으로 붙여 flash-high 로 돌리고 있었다.
+
+- **agy 가 기본 모델을 모를 때만** 같은 리뷰를 `gemini-3.8-flash-high` 로 한 번 요청하고, 그 판정을 쓴다
+  (사용자 지시: "pro-high 가 agy models 에 없는 동안에는 gemini-3.8-flash-high 를 쓴다"). pro-high 가 목록에
+  돌아오면 첫 요청이 성공하므로 저절로 pro-high 로 돌아간다. `agy models` 를 미리 조회하지 않는다(4초).
+- 빈 응답 · 시간 초과 · 쿼터로는 바꾸지 않는다. `--model` 을 적으면 바꾸지 않는다 — 손으로 붙인
+  `--model gemini-3.8-flash-high` 는 빼야 pro-high 가 돌아왔을 때 따라간다.
+- 결과 JSON: `_meta.model` 은 판정한 대체 모델, 새 키 `_meta.requested_model` 은 원래 요청한 모델이다.
+  `_meta.calls` 에 첫 호출(`model_unavailable`)과 대체 호출이 모두 남는다.
+- `--check` 도 같은 규칙으로 대체 주 모델을 확인한다.
+- 진단 모델 기본값 `gemini-3.6-flash-high` → `gemini-3.8-flash-medium`. 옛 모델은 agy 목록에서 빠져, 빈 응답
+  진단이 "도구 계층 장애" 로 오진될 수 있었다.
+
 ## 1.7.1 — 모사 검사의 Windows 사본 폴더 (2026-09-17)
 
 **1.7.0 은 Windows CI 가 빨갛다.** 게이트 결함이 아니라 **검사**가 틀렸다. 설치되는 플러그인 코드는

@@ -50,7 +50,8 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 `--base` 는 **merge-base 기준(3-dot)** 이다. `--base main` 은 브랜치를 딴 지점
 이후의 내 변경만 본다 — 그 사이 main 에 들어온 남의 커밋은 섞이지 않는다.
 
-그 밖의 인자: `--model`(기본 `gemini-3.1-pro-high` — **flash 로 낮추지 말 것**),
+그 밖의 인자: `--model`(기본 `gemini-3.1-pro-high` — **flash 로 낮추지 말 것**. agy 가 이 모델을
+모를 때만 대체 주 모델 `gemini-3.8-flash-high` 가 판정한다 — `--model` 을 적으면 바꾸지 않는다),
 `--timeout`(기본 `10m`), `--allow-empty`(빈 스테이징을 8 대신 0 으로), `--out`(결과 JSON 저장 경로. 생략하면
 `~/.local/state/gemini-review/`, Windows 는 `%LOCALAPPDATA%\gemini-review\`),
 `--allow-sensitive`(사용자가 전송을 명시적으로 승인했을 때만),

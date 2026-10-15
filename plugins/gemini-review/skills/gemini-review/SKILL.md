@@ -1,6 +1,6 @@
 ---
 name: gemini-review
-version: 1.7.1
+version: 1.8.0
 description: Gemini 3.x 로 변경분을 교차 리뷰한다 (Antigravity CLI). 커밋 직전 독립 리뷰어로 쓴다. 같은 모델이 짠 코드를 같은 모델이 리뷰할 때 생기는 맹점을 잡는다.
 triggers:
   - gemini review
@@ -127,8 +127,25 @@ exit $LASTEXITCODE   # ⚠ 없으면 exit 5(지적 있음)가 0 으로 삼켜진
 ⚠ pro-high 가 빈 응답으로 실패하면 **모델을 낮추지 말고 재시도**한다. 느리다고
 낮추지도 않는다.
 
-⛔ **판정은 주 모델만 낸다** [1.4.0]. 진단 모델(`--probe-model`, 기본
-`gemini-3.6-flash-high`)은 주 모델이 한 줄 프롬프트에도 응답하지 않을 때 **계층 장애인지
+### 대체 주 모델 — `gemini-3.8-flash-high` [1.8.0]
+
+pro-high 가 `agy models` 에 **없는 동안에만** `gemini-3.8-flash-high` 가 판정한다
+(사용자 지시, 2026-10-13 확인 · 10-15 `agy models` 재확인). 스크립트가 알아서 바꾼다:
+agy 가 pro-high 를 모른다고 답하면(`invalid model selection`, 0초) 같은 리뷰를 대체 주
+모델로 한 번 요청한다. pro-high 가 목록에 돌아오면 첫 요청이 성공하므로 **저절로**
+pro-high 로 돌아간다.
+
+- 바꾸는 원인은 **모델 없음 하나뿐**이다. 빈 응답 · 시간 초과 · 쿼터로는 바꾸지 않는다 —
+  위의 "낮추지 말 것" 은 그대로다. 대체 주 모델이 빈 응답을 내도 **같은 모델로 재시도**하고
+  더 낮은 모델(medium · low)로 바꾸지 않는다.
+- `--model` 을 적으면 바꾸지 않는다. **대체 주 모델을 쓰려고 `--model` 을 붙이지 말 것** —
+  pro-high 가 돌아와도 계속 flash 로 돈다.
+- 화면에 `⚠ agy 가 주 모델 … 를 모른다 — 대체 주 모델 … 로 판정한다` 줄이 나오고, 결과
+  JSON 의 `_meta.model` 은 대체 모델, `_meta.requested_model` 은 원래 모델이다.
+
+⛔ **판정은 주 모델만 낸다** [1.4.0]. 대체 주 모델도 주 모델이다 — 둘 중 그 실행에서
+판정을 맡은 하나만 낸다. 진단 모델(`--probe-model`, 기본 `gemini-3.8-flash-medium`.
+1.7.x 의 `gemini-3.6-flash-high` 는 agy 목록에서 빠졌다)은 주 모델이 한 줄 프롬프트에도 응답하지 않을 때 **계층 장애인지
 주 모델만의 문제인지 가르는 데만** 쓰고, 그 모델로 리뷰를 요청하지 않는다. 1.3.x 는
 flash 로 리뷰를 다시 요청해 그 approve 가 exit 0 이었다 — 위 지시와 정면으로 어긋났다.
 화면 배너의 `판정: gemini-3.1-pro-high 만 낸다` 줄과 결과 JSON 의 `_meta.model` 로

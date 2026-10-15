@@ -32,8 +32,9 @@
                                                # Gemini 가 수행되지 않았을 때 대체 리뷰 기록 (1.7.0)
 
 ⚠ 모델은 `gemini-3.1-pro-high` 고정이다 — 느리다고 flash 로 낮추지 않는다(SKILL.md).
-  단, agy 가 그 모델을 모를 때(`agy models` 에 없음)만 대체 주 모델
-  `gemini-3.8-flash-high` 로 판정한다(1.8.0 · 사용자 지시 26.10.13). `--model` 을 적으면 바꾸지 않는다.
+  단, agy 가 그 모델을 모를 때(`agy models` 에 없음)만 대체 주 모델로 판정한다(1.8.0 · 사용자
+  지시 26.10.13). 대체 주 모델은 `agy models` 목록에서 규칙으로 고른다(1.9.0, `_pick_judge_model`).
+  `--model` 을 적으면 바꾸지 않는다.
   **판정은 주 모델만 낸다.** 진단 모델(`--probe-model`)은 빈 응답일 때 한 줄 생존
   확인에만 쓴다(1.4.0).
 
@@ -231,7 +232,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # [1.8.0] **대체 주 모델.** 사용자 지시(26.10.13 확인): "pro-high 가 agy models 에 없는 동안에는
@@ -241,7 +242,19 @@ _DEFAULT_MODEL = "gemini-3.1-pro-high"
 #   ⚠ 바꾸는 판단을 `agy models` 목록으로 미리 하지 않는다. 목록 조회는 실측 4초라 모든 리뷰에
 #     붙으면 비용이 되고, agy 의 거부 응답은 0초에 같은 사실을 알려 준다. pro-high 가 돌아오면
 #     첫 호출이 성공하므로 저절로 pro-high 로 돌아간다.
+#   [1.9.0] 이 값은 **목록을 읽지 못할 때의 마지막 대비**다. 평소에는 `agy models` 에서
+#   `_pick_judge_model` 규칙으로 고른다 — 모델 목록이 바뀔 때마다 판을 새로 내지 않기 위해서다
+#   (1.8.0 은 바로 그 이유로 나왔다).
 _STANDIN_MODEL = "gemini-3.8-flash-high"
+# [1.9.0] 판정 모델 후보: `gemini-<판>-<등급>-high` 만. 등급이 먼저, 판이 다음이다.
+#   ⛔ medium · low 는 후보가 아니다 — "더 낮은 모델로는 바꾸지 않는다"(사용자 지시).
+#   ⛔ claude · gpt 계열은 후보가 아니다 — 리뷰를 요청하는 쪽이 Claude 라 교차 리뷰가 무너진다.
+#   ⚠ 모르는 등급(예: flash-lite)은 후보가 아니다. 새 등급이 생기면 사람이 재서 여기에 넣는다.
+_JUDGE_MODEL_RE = re.compile(r"^gemini-(\d+(?:\.\d+)*)-(pro|flash)-high$")
+_JUDGE_TIER_RANK = {"pro": 2, "flash": 1}
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
+# `agy models` 는 토큰을 쓰지 않는 목록 조회다(실측 4초, 에이전트 턴 없음).
+_MODELS_TIMEOUT = 30
 # ⛔ [1.4.0] **진단 전용**이다 — 이 모델로 리뷰를 요청하지 않는다(`_recover_empty_response`).
 #   [1.8.0] `gemini-3.6-flash-high` 는 agy 목록에서 빠졌다(26.10.15 `agy models` 실측). 대체
 #   주 모델과 **다른** 모델이어야 생존 확인이 의미가 있다 — 같은 계열의 medium 을 쓴다.
@@ -867,6 +880,8 @@ def _main(argv, ctx: dict) -> int:
     _apply_deprecated_flags(args)
     # [1.8.0] 사용자가 `--model` 을 적었으면 대체 주 모델로 바꾸지 않는다(`_standin_model`).
     args.model_explicit = bool(_named_in_argv(argv, ("--model",)))
+    # [1.9.0] 진단 모델도 적었으면 목록에서 바꾸지 않는다(`_recover_empty_response`).
+    args.probe_explicit = bool(_named_in_argv(argv, ("--probe-model", "--fallback-model")))
     # 중단 · 내부 오류 기록(`main`)도 판정 모델을 남기게 한다 — 인자 해석을 마친 뒤의 모든 결과에 있다.
     ctx["model"] = args.model
 
@@ -1100,9 +1115,13 @@ def _main(argv, ctx: dict) -> int:
     run = _invoke_schema(agy, model, args, root, schema_path, prompt)
     cause, kind, detail = _classify_run(run, structured=True)
     calls.append(_call_record("structured", model, run, cause, kind, detail))
-    standin = _standin_model(args, cause)
+    standin = ""
+    if _may_substitute(args, cause):
+        standin, why = _choose_standin(agy, root, calls)
+        if not standin:
+            _safe_print("⚠ agy 가 주 모델 %s 를 모르고, 대체 주 모델도 고르지 못했다 — %s" % (model, why))
     if standin:
-        _say_standin(model, standin)
+        _say_standin(model, standin, why)
         state["requested_model"] = model
         args.model = model = ctx["model"] = standin
         run = _invoke_schema(agy, model, args, root, schema_path, prompt)
@@ -1150,24 +1169,100 @@ def _main(argv, ctx: dict) -> int:
     return finish("reviewed", review, rc, dropped_llm_keys=dropped or None)
 
 
-def _standin_model(args, cause: str) -> str:
-    """기본 주 모델 대신 판정할 **대체 주 모델**. 바꾸지 않으면 빈 문자열(1.8.0).
+def _may_substitute(args, cause: str) -> bool:
+    """기본 주 모델을 **대체 주 모델로 바꿔도 되는가**(1.8.0).
 
-    바꾸는 조건은 셋 다다: ① agy 가 모델을 모른다(`model_unavailable`) ② 사용자가 `--model` 을
-    적지 않았다 ③ 지금 모델이 기본 모델이다(대체 모델까지 없으면 한 번 더 바꾸지 않는다).
+    조건은 셋 다다: ① agy 가 모델을 모른다(`model_unavailable`) ② 사용자가 `--model` 을 적지
+    않았다 ③ 지금 모델이 기본 모델이다(대체 모델까지 없으면 한 번 더 바꾸지 않는다).
     ⛔ `empty` · `timeout` · `quota` 로는 바꾸지 않는다 — 사용자 지시가 "빈 응답이면 재시도하지
-      모델을 낮추지 않는다" 이다. 이 함수가 그 원인에 빈 문자열을 내는 것을 테스트가 본다.
+      모델을 낮추지 않는다" 이다. 이 함수가 그 원인에 False 를 내는 것을 테스트가 본다.
     """
     if cause != "model_unavailable" or getattr(args, "model_explicit", True):
-        return ""
-    return _STANDIN_MODEL if args.model == _DEFAULT_MODEL else ""
+        return False
+    return args.model == _DEFAULT_MODEL
 
 
-def _say_standin(model: str, standin: str) -> None:
+def _parse_model_list(text: str) -> List[str]:
+    """`agy models` 출력의 모델 id 목록. 줄마다 `id<TAB>설명` 이다(agy 1.2.x 실측).
+
+    ⚠ `Fetching available models...` 안내는 stderr 로 나가지만, 섞여 와도 id 꼴이 아니라 걸러진다.
+    """
+    ids = []
+    for ln in (text or "").splitlines():
+        tok = ln.split("\t", 1)[0].strip() if "\t" in ln else ""
+        if tok and _MODEL_ID_RE.match(tok) and tok not in ids:
+            ids.append(tok)
+    return ids
+
+
+def _judge_rank(model_id: str) -> Optional[Tuple[int, Tuple[int, ...]]]:
+    """판정 모델 후보의 순위 `(등급, 판)`. 후보가 아니면 None. 판은 **숫자로** 비교한다(3.10 > 3.9)."""
+    m = _JUDGE_MODEL_RE.match(model_id or "")
+    if not m:
+        return None
+    return _JUDGE_TIER_RANK[m.group(2)], tuple(int(x) for x in m.group(1).split("."))
+
+
+def _pick_judge_model(ids: List[str], exclude: str = "") -> str:
+    """목록에서 판정 모델을 고른다 — 등급이 높고, 같은 등급이면 판이 높은 `-high` 모델. 없으면 ""."""
+    ranked = [(_judge_rank(i), i) for i in ids if i != exclude and _judge_rank(i) is not None]
+    return max(ranked)[1] if ranked else ""
+
+
+def _pick_probe_model(ids: List[str], main_model: str) -> str:
+    """목록에서 진단 모델을 고른다 — 주 모델이 아닌 gemini 모델, flash · 높은 판 · medium 순. 없으면 ""."""
+    effort = {"medium": 3, "high": 2, "low": 1}
+
+    def key(i):
+        m = re.match(r"^gemini-(\d+(?:\.\d+)*)-([a-z0-9-]+?)-(high|medium|low)$", i)
+        if not m:
+            return None
+        return ("flash" in m.group(2), tuple(int(x) for x in m.group(1).split(".")),
+                effort[m.group(3)])
+
+    ranked = [(key(i), i) for i in ids if i != main_model and key(i) is not None]
+    return max(ranked)[1] if ranked else ""
+
+
+def _list_models(agy: str, cwd: str, calls: List[dict]) -> Optional[List[str]]:
+    """`agy models` 의 모델 id 목록. 읽지 못하면 None — 호출은 `_meta.calls` 에 `models` 로 남는다.
+
+    ⚠ `--model` 은 아무 이름이나 받는다(없는 모델명으로도 목록이 나온다, 26.10.15 실측) —
+      `_run_agy` 한 곳을 거치려고 기본 모델명을 넘긴다.
+    """
+    run = _run_agy(agy, _DEFAULT_MODEL, ["models"], cwd, "%ds" % _MODELS_TIMEOUT,
+                   _MODELS_TIMEOUT, margin=5)
+    ids = _parse_model_list(run.stdout) if run.rc == 0 else []
+    calls.append(_call_record("models", "", run, "ok" if ids else "tool_error", "",
+                              "" if ids else (_first_line(run.stderr) or _first_line(run.stdout)
+                                              or "목록이 비었다")))
+    return ids or None
+
+
+def _choose_standin(agy: str, cwd: str, calls: List[dict],
+                    ids: Optional[List[str]] = None) -> Tuple[str, str]:
+    """대체 주 모델과 그 근거. 고르지 못하면 `("", 근거)`(1.9.0).
+
+    ⚠ 목록을 읽지 못하면 내장 값(`_STANDIN_MODEL`)을 쓴다 — agy 의 목록 출력이 바뀌어도 1.8.0
+      만큼은 동작한다. 목록은 읽었는데 후보가 없으면 **고르지 않는다**(낮은 모델로 내려가지 않는다).
+    """
+    if ids is None:
+        ids = _list_models(agy, cwd, calls)
+    if ids is None:
+        return _STANDIN_MODEL, "`agy models` 를 읽지 못해 내장 대체 모델을 쓴다"
+    pick = _pick_judge_model(ids, exclude=_DEFAULT_MODEL)
+    if pick:
+        return pick, "`agy models` 에서 등급 · 판이 가장 높은 -high 모델을 골랐다"
+    return "", ("목록에 판정에 쓸 gemini-*-pro-high · gemini-*-flash-high 모델이 없다(%s)"
+                % ", ".join(ids[:12]))
+
+
+def _say_standin(model: str, standin: str, why: str) -> None:
     _safe_print("⚠ agy 가 주 모델 %s 를 모른다(`agy models` 에 없음) — 대체 주 모델 %s 로 판정한다."
                 % (model, standin))
-    _safe_print("   사용자 지시(26.10.13): pro-high 가 목록에 없는 동안에만 쓴다. 돌아오면 저절로 "
-                "pro-high 로 돌아간다. 결과 JSON 의 `_meta.requested_model` 에 남는다.")
+    _safe_print("   근거: %s." % why)
+    _safe_print("   사용자 지시(26.10.13): 기본 모델이 목록에 없는 동안에만 쓴다. 돌아오면 저절로 "
+                "기본 모델로 돌아간다. 결과 JSON 의 `_meta.requested_model` 에 남는다.")
 
 
 # 이 원인이면 곧바로 끝낸다(재시도 없음). 빈 응답(`empty` · `tool_denied`)만 복구를 시도한다.
@@ -1418,6 +1513,18 @@ def _recover_empty_response(agy: str, model: str, args, root: str, diff_path: st
         alive2, prun2 = _probe_alive(agy, probe_model, root)
         c2, k2, d2 = _probe_cause(alive2, prun2)
         calls.append(_call_record("probe", probe_model, prun2, c2, k2, d2))
+        if c2 == "model_unavailable" and not getattr(args, "probe_explicit", True):
+            # [1.9.0] 진단 모델이 목록에서 빠졌다 — "두 모델 모두 무응답(계층 장애)" 으로 오진하지
+            #   않도록 목록에서 다른 gemini 모델을 골라 한 번 더 찌른다. 판정은 여전히 내지 않는다.
+            ids = _list_models(agy, root, calls) or []
+            alt = _pick_probe_model(ids, model)
+            if alt and alt != probe_model:
+                _safe_print("   진단 모델 %s 를 agy 가 모른다 — 목록에서 고른 %s 로 다시 확인한다."
+                            % (probe_model, alt))
+                probe_model = alt
+                alive2, prun2 = _probe_alive(agy, probe_model, root)
+                c2, k2, d2 = _probe_cause(alive2, prun2)
+                calls.append(_call_record("probe", probe_model, prun2, c2, k2, d2))
         if alive2:
             _say_not_reviewed(
                 "주 모델 %s 만 응답하지 않는다 (진단 모델 %s 는 %.0f초에 응답)"
@@ -1542,15 +1649,30 @@ def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]
         calls.append(_call_record("check_model", args.model, r, c, k, d))
         return r, c, k, d
 
+    # ⓪ [1.9.0] 모델 목록 — 기본 모델이 있는가, 없으면 무엇으로 대체하는가, 더 높은 모델이 생겼는가.
+    #   목록 출력 형식이 바뀌면 대체 주 모델 선택이 내장 값으로 떨어진다 — 고칠 것은 스크립트다(2).
+    ids = _list_models(agy, where, calls)
+    if ids is None:
+        mark("모델 목록", False, "`agy models` 를 읽지 못했다 — 기본 모델이 없을 때 내장 대체 모델(%s)만 "
+             "쓸 수 있다" % _STANDIN_MODEL)
+    else:
+        judges = [i for i in ids if _judge_rank(i) is not None]
+        mark("모델 목록", True, "판정 후보 %s" % (", ".join(judges) or "없음"))
+        _check_model_list_notes(args, ids, mark)
+
     run, cause, kind, detail = ask()
     # [1.8.0] 실제 리뷰와 같은 규칙으로 대체 주 모델을 확인한다 — 점검이 "모델 없음(2)" 이라고
     #   말하는데 리뷰는 대체 모델로 도는 어긋남을 막는다.
-    standin = _standin_model(args, cause)
-    if standin:
-        mark("주 모델", None, "%s 를 agy 가 모른다 — 리뷰는 대체 주 모델 %s 로 판정한다"
-             % (args.model, standin))
-        args.model = standin
-        run, cause, kind, detail = ask()
+    if _may_substitute(args, cause):
+        standin, why = _choose_standin(agy, where, calls, ids)
+        if standin:
+            mark("주 모델", None, "%s 를 agy 가 모른다 — 리뷰는 대체 주 모델 %s 로 판정한다(%s)"
+                 % (args.model, standin, why))
+            args.model = standin
+            run, cause, kind, detail = ask()
+        else:
+            mark("주 모델", False, "%s 를 agy 가 모르고 대체 주 모델도 없다 — %s" % (args.model, why))
+            return done()
     if cause != "ok":
         mark("모델 응답", False, "%s · %s%s" % (args.model, cause, " · " + detail if detail else ""),
              EXIT_NOT_REVIEWED if cause in ("timeout", "quota", "empty") else EXIT_TOOL_ERROR)
@@ -1623,6 +1745,42 @@ _CHECK_SLOW_PROMPT = "Write the integers from 1 to 400, one per line, with no ot
 _CHECK_NO_SUCH_MODEL = "gemini-review-check-no-such-model"
 
 
+def _check_model_list_notes(args, ids: List[str], mark) -> None:
+    """`--check` 의 목록 참고 줄 — 주 모델 유무 · 더 높은 판정 모델 · 진단 모델 유무(1.9.0).
+
+    ⛔ 더 높은 모델이 보여도 **바꾸지 않는다.** SKILL.md 원칙: "pro 등급의 새 버전이 나오면 같은
+      방식으로 재서 교체한다." 알려서 사람이 재게 한다. 자동으로 바꾸는 것은 기본 모델이 없을 때뿐이다.
+    """
+    # ⚠ 실제 리뷰가 쓸 주 모델 — 아래 진단 모델 안내도 이 모델을 기준으로 해야 실행과 같은 말을 한다.
+    main_model = args.model
+    if args.model in ids:
+        mark("주 모델 목록", None, "%s 가 목록에 있다" % args.model)
+    elif _may_substitute(args, "model_unavailable"):
+        standin = _pick_judge_model(ids, exclude=_DEFAULT_MODEL)
+        main_model = standin or args.model
+        mark("주 모델 목록", None, "%s 가 목록에 없다 — 리뷰는 %s 로 판정한다"
+             % (args.model, standin or "(대체 후보 없음 — exit 2)"))
+    else:
+        mark("주 모델 목록", None, "%s 가 목록에 없다(--model 로 적었으므로 바꾸지 않는다)" % args.model)
+    # [1.9.0 교차리뷰 MEDIUM] "새 모델" 은 **기본 모델 상수**를 바꿀 때가 됐는지 알리는 줄이다.
+    #   `args.model` 과 비교하면 `--model` 로 flash 를 적었을 때 기본 모델 pro-high 를 "새 모델" 로 부른다.
+    best = _pick_judge_model(ids)
+    if best and best != _DEFAULT_MODEL and _judge_rank(best) > _judge_rank(_DEFAULT_MODEL):
+        mark("새 모델", None, "%s 가 기본 모델 %s 보다 등급 · 판이 높다 — 자동으로 바꾸지 않는다. "
+             "정답을 아는 diff 로 재 보고 기본 모델 교체를 검토할 것" % (best, _DEFAULT_MODEL))
+    probe = (args.probe_model or "").strip()
+    if probe and not args.no_probe_fallback and probe not in ids:
+        # [1.9.0 교차리뷰 MEDIUM] 실제 실행(`_recover_empty_response`)과 같은 조건이다 — 적은 진단
+        #   모델은 바꾸지 않는다.
+        if getattr(args, "probe_explicit", True):
+            mark("진단 모델", None, "%s 가 목록에 없다(--probe-model 로 적었으므로 바꾸지 않는다 — 빈 응답 "
+                 "진단이 계층 장애로 오진될 수 있다)" % probe)
+        else:
+            alt = _pick_probe_model(ids, main_model)
+            mark("진단 모델", None, "%s 가 목록에 없다 — 빈 응답 진단은 %s 로 한다"
+                 % (probe, alt or "(대체 후보 없음)"))
+
+
 def _resolve_probe_model(args) -> str:
     """진단 모델. 끄면 빈 문자열. 주 모델과 같으면 다른 모델로 바꾼다(같으면 확인이 무의미하다)."""
     probe = "" if args.no_probe_fallback else (args.probe_model or "").strip()
@@ -1645,7 +1803,10 @@ def _probe_cause(alive: bool, run: "_AgyRun") -> Tuple[str, str, str]:
 
 
 # 텍스트 출력이라 래퍼가 없는 단계. 나머지는 `--output-format json` 이라 래퍼가 있다.
-_TEXT_OUTPUT_STAGES = frozenset(("probe", "text"))
+_TEXT_OUTPUT_STAGES = frozenset(("probe", "text", "models"))
+# `--stats` 의 토큰 집계에서 빼는 단계 — 에이전트 턴이 없거나(조회) 무시할 만한(한 줄 확인) 호출이다.
+#   ⚠ `text` 는 빼지 않는다. 리뷰 토큰을 썼는데 래퍼가 없어 **알 길이 없다** 는 것이 "토큰 불완전" 이다.
+_NO_TOKEN_STAGES = frozenset(("quota_query", "probe", "models"))
 
 # agy 1.2.3 실측(2026-09-16). **알던 키가 사라지면** 집계가 조용히 값을 잃으므로 `--check` 가
 #   실패로 올린다. 모르는 키가 생기는 것은 무해하므로 참고로만 적는다.
@@ -2390,7 +2551,9 @@ def _stats_read(path: str) -> Optional[dict]:
         for call in calls:
             if not isinstance(call, dict):
                 continue
-            if call.get("stage") in ("quota_query", "probe"):
+            # [1.9.0 교차리뷰 HIGH] `models`(목록 조회)도 토큰이 없다 — 빼지 않으면 대체 주 모델로
+            #   통과한 정상 리뷰가 전부 "토큰 불완전" 으로 집계된다. 토큰 없는 단계는 표 한 곳에서 본다.
+            if call.get("stage") in _NO_TOKEN_STAGES:
                 continue                 # 토큰이 없거나 무시할 만하다
             values = call.get("usage")
             if not isinstance(values, dict):

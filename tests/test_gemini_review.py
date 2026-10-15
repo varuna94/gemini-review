@@ -393,6 +393,8 @@ def _check_agy_calls_are_plan_mode(gr):
             "agy", "m", args, ".", "changes.diff", ["a.py"], "")),
         ("_run_check", lambda: gr._run_check(
             types.SimpleNamespace(model="m", timeout="10m"), [])),
+        # [1.9.0] 모델 목록 조회 — 토큰을 쓰지 않지만 agy 를 띄우는 자리다.
+        ("_list_models", lambda: gr._list_models("agy", ".", [])),
     )
     for name, invoke in sites:
         calls = []
@@ -402,7 +404,8 @@ def _check_agy_calls_are_plan_mode(gr):
                 _patched(gr, "_git", lambda *a, **k: "git version test"), \
                 _patched(gr, "_git_root", lambda start: "."):
             invoke()
-        want = 3 if name == "_run_check" else 1
+        # [1.9.0] `_run_check` 는 모델 목록 · 주 모델 · 시간 초과 안내 · 모델 없음 안내 넷을 부른다.
+        want = 4 if name == "_run_check" else 1
         if len(calls) != want:
             yield "%s 가 agy 를 %d번 불렀다 (기대 %d번)" % (name, len(calls), want)
             continue
@@ -654,6 +657,15 @@ def _quota_blocked_payload(reset="2099-01-01T00:00:00Z"):
         {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0, "reset_time": reset}]}])
 
 
+# [1.9.0] `agy models` 실측 출력(26.10.15, agy 1.2.x). 안내 줄은 stderr 로 나간다.
+_MODELS_LIST = ("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
+                "gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\n"
+                "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+                "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n"
+                "claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n"
+                "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
+
+
 def _agy_script(gr, responses):
     """`gr._run_agy` 자리에 넣을 가짜. 반환 `(가짜 함수, 호출 기록 [(단계, 모델)])`.
 
@@ -670,6 +682,9 @@ def _agy_script(gr, responses):
             stage = "structured"
         elif "/quota" in extra:
             stage = "quota_query"        # [1.5.0] 쿼터 조회 — 토큰을 쓰지 않는 읽기 전용 명령
+        elif list(extra[:1]) == ["models"]:
+            stage = "models"             # [1.9.0] 모델 목록 — 모델명과 무관하게 한 갈래다
+            model = ""
         elif gr._PROBE_PROMPT in extra:
             stage = "probe"
         else:
@@ -685,6 +700,8 @@ def _agy_script(gr, responses):
                  # [1.5.0] 쿼터 조회의 기본은 **여유 있음**이다 — 적어 두지 않은 행이
                  #   실수로 단락되면 그 행이 검사하려던 경로를 타지 않는다.
                  "quota_query": gr._AgyRun(0, stdout=_quota_payload()),
+                 # [1.9.0] 실측(26.10.15) 모양 — 기본 모델이 빠지고 3.8 flash 만 있다.
+                 "models": gr._AgyRun(0, stdout=_MODELS_LIST),
                  "text": gr._AgyRun(0, stdout="판정: approve\n요약: 기대 밖 호출")}[stage]
         if isinstance(r, BaseException):
             raise r
@@ -2734,7 +2751,8 @@ def _check_standin_model(gr):
     """
     D, F, Q = gr._DEFAULT_MODEL, gr._STANDIN_MODEL, gr._DEFAULT_PROBE_MODEL
     R = gr._AgyRun
-    S, PR = "structured", "probe"
+    S, PR, M = "structured", "probe", "models"
+    LM = (M, "")                         # [1.9.0] 대체 주 모델은 목록에서 고른다
     yield (None if len({D, F, Q}) == 3 else
            "기본 · 대체 · 진단 모델이 서로 같다: %r" % [D, F, Q])
 
@@ -2749,13 +2767,13 @@ def _check_standin_model(gr):
     # (이름, 추가 인자, 응답, 기대 exit, 기대 mode, 기대 호출, 기대 _meta.model, 기대 requested_model)
     rows = [
         ("기본 모델 없음 → 대체 approve", [], {(S, D): NOMODEL, (S, F): review("approve")},
-         0, "reviewed", [(S, D), (S, F)], F, D),
+         0, "reviewed", [(S, D), LM, (S, F)], F, D),
         ("기본 모델 없음 → 대체 request_changes", [], {(S, D): NOMODEL, (S, F): review("request_changes")},
-         5, "reviewed", [(S, D), (S, F)], F, D),
+         5, "reviewed", [(S, D), LM, (S, F)], F, D),
         ("대체 모델도 없음 — 한 번만 바꾼다", [], {(S, D): NOMODEL, (S, F): NOMODEL},
-         2, "model_unavailable", [(S, D), (S, F)], F, D),
+         2, "model_unavailable", [(S, D), LM, (S, F)], F, D),
         ("대체 모델 빈 응답 → 더 낮추지 않는다", [], {(S, D): NOMODEL, (S, F): EMPTY, (PR, F): DEAD, (PR, Q): DEAD},
-         4, "tool_unavailable", [(S, D), (S, F), (PR, F), (PR, Q)], F, D),
+         4, "tool_unavailable", [(S, D), LM, (S, F), (PR, F), (PR, Q)], F, D),
         ("기본 모델 빈 응답 → 바꾸지 않는다", [], {(S, D): EMPTY, (PR, D): DEAD, (PR, Q): R(0, stdout="OK\n")},
          4, "primary_model_unavailable", [(S, D), (PR, D), (PR, Q)], D, None),
         ("기본 모델 시간 초과 → 바꾸지 않는다", [], {(S, D): TIMEOUT}, 4, "timeout", [(S, D)], D, None),
@@ -2766,6 +2784,24 @@ def _check_standin_model(gr):
         ("--model 약어도 명시다", ["--mod", D], {(S, D): NOMODEL},
          2, "model_unavailable", [(S, D)], D, None),
         ("기본 모델 정상 → 그대로", [], {(S, D): review("approve")}, 0, "reviewed", [(S, D)], D, None),
+        # [1.9.0] 목록 기반 선택 — 판을 새로 내지 않고 새 모델 목록을 따라간다.
+        ("목록에 새 pro → pro 가 판정", [],
+         {(S, D): NOMODEL, LM: R(0, stdout=_MODELS_LIST + "gemini-3.9-pro-high\tGemini 3.9 Pro (High)\n"),
+          (S, "gemini-3.9-pro-high"): review("approve")},
+         0, "reviewed", [(S, D), LM, (S, "gemini-3.9-pro-high")], "gemini-3.9-pro-high", D),
+        ("목록을 읽지 못함 → 내장 대체 모델", [],
+         {(S, D): NOMODEL, LM: R(1, stderr="error: boom"), (S, F): review("approve")},
+         0, "reviewed", [(S, D), LM, (S, F)], F, D),
+        ("목록에 -high 후보 없음 → 낮추지 않고 끝낸다", [],
+         {(S, D): NOMODEL, LM: R(0, stdout="gemini-3.8-flash-medium\tx\nclaude-opus-5-5-high\tx\n")},
+         2, "model_unavailable", [(S, D), LM], D, None),
+        ("진단 모델이 목록에서 빠짐 → 목록에서 골라 다시 확인", [],
+         {(S, D): EMPTY, (PR, D): DEAD, (PR, Q): NOMODEL, (PR, F): R(0, stdout="OK\n"),
+          LM: R(0, stdout="gemini-3.8-flash-high\tx\ngemini-3.8-flash-low\tx\n")},
+         4, "primary_model_unavailable", [(S, D), (PR, D), (PR, Q), LM, (PR, F)], D, None),
+        ("진단 모델을 적었으면 목록에서 바꾸지 않는다", ["--probe-model", Q],
+         {(S, D): EMPTY, (PR, D): DEAD, (PR, Q): NOMODEL},
+         4, "tool_unavailable", [(S, D), (PR, D), (PR, Q)], D, None),
     ]
     for label, extra, responses, want_rc, want_mode, want_calls, want_model, want_req in rows:
         sandbox = tempfile.mkdtemp(prefix="gr_test_standin_")
@@ -2815,17 +2851,98 @@ def _check_standin_model(gr):
             rc = gr.main(["--check", "--out", out])
         body = _read_json(out)
         bad = [c.get("name") for c in body.get("checks") or [] if c.get("ok") is False]
-        yield (None if rc == 0 and not bad and log[:2] == [(PR, D), (PR, F)] else
+        yield (None if rc == 0 and not bad and log[:3] == [LM, (PR, D), (PR, F)] else
                "--check 대체 주 모델: exit %s · 빨간 항목 %r · 호출 %r" % (rc, bad, log))
     finally:
         _rmtree_sandbox(sandbox, sandbox)
 
-    # 원인별 단위 규칙 — 모델 없음 외에는 빈 문자열이다.
+    # 원인별 단위 규칙 — 모델 없음 외에는 바꾸지 않는다.
     args = types.SimpleNamespace(model=D, model_explicit=False)
     wrong = [c for c in ("empty", "tool_denied", "timeout", "quota", "tool_error", "ok")
-             if gr._standin_model(args, c)]
-    yield (None if not wrong and gr._standin_model(args, "model_unavailable") == F else
-           "_standin_model 이 모델 없음 외의 원인에서 바꾼다: %r" % wrong)
+             if gr._may_substitute(args, c)]
+    yield (None if not wrong and gr._may_substitute(args, "model_unavailable") else
+           "_may_substitute 가 모델 없음 외의 원인에서 바꾼다: %r" % wrong)
+
+
+def _check_model_list_rules(gr):
+    """`agy models` 해석과 판정 · 진단 모델 선택 규칙(1.9.0).
+
+    ⛔ 판정 후보는 `gemini-<판>-(pro|flash)-high` 뿐이다. medium · low 로 내려가면 "더 낮은 모델로는
+      바꾸지 않는다" 를, claude · gpt 로 가면 교차 리뷰의 전제를 어긴다.
+    ⚠ 판은 숫자로 비교한다 — 문자열로 비교하면 3.10 이 3.9 보다 낮아진다.
+    """
+    ids = gr._parse_model_list("Fetching available models...\n" + _MODELS_LIST)
+    yield (None if ids[:3] == ["gemini-3.8-flash-high", "gemini-3.8-flash-medium",
+                               "gemini-3.8-flash-low"] and "Fetching" not in " ".join(ids) else
+           "_parse_model_list 가 실측 출력을 잘못 읽었다: %r" % ids)
+    cases = [
+        ("실측 목록", ids, "gemini-3.8-flash-high"),
+        ("pro 가 flash 보다 먼저", ids + ["gemini-3.9-pro-high", "gemini-4.0-flash-high"], "gemini-3.9-pro-high"),
+        ("판은 숫자로", ["gemini-3.9-flash-high", "gemini-3.10-flash-high"], "gemini-3.10-flash-high"),
+        ("medium · low 는 후보가 아니다", ["gemini-3.8-flash-medium", "gemini-3.9-pro-low"], ""),
+        ("claude · gpt 는 후보가 아니다", ["claude-opus-5-5-high", "gpt-oss-120b-high"], ""),
+        ("모르는 등급은 후보가 아니다", ["gemini-4.0-flash-lite-high"], ""),
+    ]
+    for label, given, want in cases:
+        got = gr._pick_judge_model(given)
+        yield (None if got == want else "_pick_judge_model [%s] → %r (기대 %r)" % (label, got, want))
+    got = gr._pick_judge_model(ids + [gr._DEFAULT_MODEL], exclude=gr._DEFAULT_MODEL)
+    yield (None if got == "gemini-3.8-flash-high" else "_pick_judge_model 이 exclude 를 무시했다: %r" % got)
+    got = gr._pick_probe_model(ids, "gemini-3.8-flash-high")
+    yield (None if got == "gemini-3.8-flash-medium" else
+           "_pick_probe_model 이 주 모델과 다른 gemini 모델을 고르지 못했다: %r" % got)
+    yield (None if gr._pick_probe_model(["claude-opus-5-5-high"], "x") == "" else
+           "_pick_probe_model 이 gemini 가 아닌 모델을 골랐다")
+
+
+def _check_model_list_wiring(gr):
+    """목록 조회(1.9.0)가 붙은 뒤에도 `--stats` · `--check` 안내가 실제 실행과 같은 말을 한다.
+
+    ⛔ [26.10.15 교차리뷰 — 실측 확인] ① `--stats` 가 `models` 단계를 토큰 집계에서 빼지 않아, 대체
+      주 모델로 통과한 정상 리뷰가 전부 "토큰 불완전" 이었다. ② `--check` 가 `--probe-model` 명시를
+      보지 않아, 실제로는 바꾸지 않는 진단 모델을 "다른 모델로 진단한다" 고 안내했다. ③ "새 모델" 이
+      기본 모델이 아니라 `--model` 값과 비교해, flash 를 적으면 pro-high 를 "새 모델" 로 불렀다.
+      ④ (같이 찾음) 진단 모델 안내가 대체 주 모델이 아니라 원래 주 모델을 빼고 골랐다.
+    """
+    D, F = gr._DEFAULT_MODEL, gr._STANDIN_MODEL
+    sandbox = tempfile.mkdtemp(prefix="gr_test_listwire_")
+    try:
+        path = os.path.join(sandbox, "gemini_review_20261015_120000_1.json")
+        with io.open(path, "w", encoding="utf-8") as fh:
+            json.dump({"_meta": {"mode": "reviewed", "exit_code": 0, "passed": True,
+                                 "written_at": gr._utc_now_str(), "calls": [
+                {"stage": "structured", "model": D, "cause": "model_unavailable",
+                 "usage": {"input_tokens": 0, "output_tokens": 0}},
+                {"stage": "models", "model": "", "cause": "ok", "usage_unavailable": "text_output"},
+                {"stage": "structured", "model": F, "cause": "ok",
+                 "usage": {"input_tokens": 100, "output_tokens": 10}}]}}, fh)
+        row = gr._stats_read(path)
+        yield (None if row and row["usage_incomplete"] is False and row["usage"].get("input_tokens") == 100 else
+               "--stats 가 모델 목록 조회 때문에 정상 리뷰를 토큰 불완전으로 읽었다: %r" % (row,))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+    def notes(ids, **kw):
+        a = dict(model=D, model_explicit=False, probe_model=gr._DEFAULT_PROBE_MODEL,
+                 probe_explicit=False, no_probe_fallback=False)
+        a.update(kw)
+        got = []
+        gr._check_model_list_notes(types.SimpleNamespace(**a), ids,
+                                   lambda name, ok, detail, *r: got.append((name, detail)))
+        return dict(got)
+
+    got = notes([D, F], model=F, model_explicit=True)
+    yield (None if "새 모델" not in got else
+           "--model 로 flash 를 적자 기본 모델을 '새 모델' 로 불렀다: %r" % got.get("새 모델"))
+    got = notes([D, "gemini-3.9-pro-high"])
+    yield (None if D in got.get("새 모델", "") and "gemini-3.9-pro-high" in got.get("새 모델", "") else
+           "기본 모델보다 높은 모델을 '새 모델' 로 알리지 않았다: %r" % got)
+    got = notes([F, "gemini-3.8-flash-low"], probe_model="gone-model", probe_explicit=True)
+    yield (None if "바꾸지 않는다" in got.get("진단 모델", "") else
+           "--probe-model 을 적었는데 --check 가 다른 진단 모델을 쓴다고 안내했다: %r" % got.get("진단 모델"))
+    got = notes([F, "gemini-3.8-flash-low"], probe_model="gone-model")
+    yield (None if "gemini-3.8-flash-low" in got.get("진단 모델", "") else
+           "진단 모델 안내가 대체 주 모델(%s)을 빼고 고르지 않았다: %r" % (F, got.get("진단 모델")))
 
 
 def _check_check_mode(gr):
@@ -2847,19 +2964,22 @@ def _check_check_mode(gr):
     #   ⚠ [변이 검사로 보강] 종료 코드만 보면 "래퍼가 바뀜" 을 "모델 응답 이상" 으로 적어도 2 라
     #     통과했다 — **어느 항목**이 빨개졌는지까지 본다.
     rows = [
-        ("모두 정상", {}, "agy", 0, 3, []),
-        ("시간 초과 안내문이 바뀜", {("text", P): R(0, stdout=_wrap(""), stderr="timed out")}, "agy", 2, 3,
+        # [1.9.0] 호출 수에는 맨 앞의 모델 목록 조회(`agy models`) 1회가 들어 있다.
+        ("모두 정상", {}, "agy", 0, 4, []),
+        ("시간 초과 안내문이 바뀜", {("text", P): R(0, stdout=_wrap(""), stderr="timed out")}, "agy", 2, 4,
          ["시간 초과 안내"]),
         ("모델 없음 문구가 바뀜", {("probe", NO): R(1, stdout=_wrap("", status="ERROR", error="unknown thing"))},
-         "agy", 2, 3, ["모델 없음 안내"]),
+         "agy", 2, 4, ["모델 없음 안내"]),
         ("래퍼 필드가 바뀜", {("probe", P): R(0, stdout=json.dumps({"state": "SUCCESS", "result": "OK"}))},
-         "agy", 2, 3, ["출력 래퍼"]),
-        ("주 모델 무응답", {("probe", P): R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE)}, "agy", 4, 1,
+         "agy", 2, 4, ["출력 래퍼"]),
+        ("주 모델 무응답", {("probe", P): R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE)}, "agy", 4, 2,
          ["모델 응답"]),
-        ("쿼터", {("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG))}, "agy", 4, 1,
+        ("쿼터", {("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG))}, "agy", 4, 2,
          ["모델 응답"]),
-        ("인증 오류", {("probe", P): R(1, stdout="Error: authentication required.")}, "agy", 2, 1,
+        ("인증 오류", {("probe", P): R(1, stdout="Error: authentication required.")}, "agy", 2, 2,
          ["모델 응답"]),
+        ("모델 목록 형식이 바뀜", {("models", ""): R(0, stdout='{"models": []}')}, "agy", 2, 4,
+         ["모델 목록"]),
         ("agy 없음", {}, None, 2, 0, ["agy"]),
     ]
     for label, override, agy, want_rc, want_calls, want_bad in rows:
@@ -2870,10 +2990,10 @@ def _check_check_mode(gr):
             fake, log = _agy_script(gr, responses)
             extras, cwds = [], []
 
-            def spy(agy_, model, extra, cwd, timeout_spec, default_secs):
+            def spy(agy_, model, extra, cwd, timeout_spec, default_secs, margin=None):
                 extras.append(list(extra))
                 cwds.append(cwd)
-                return fake(agy_, model, extra, cwd, timeout_spec, default_secs)
+                return fake(agy_, model, extra, cwd, timeout_spec, default_secs, margin)
 
             out = os.path.join(sandbox, "o.json")
             env = _state_env(sandbox)
@@ -3948,6 +4068,8 @@ _BEHAVIOR_CHECKS = (
     _check_empty_response_names_its_cause,
     _check_result_contract_matrix,
     _check_standin_model,
+    _check_model_list_rules,
+    _check_model_list_wiring,
     _check_diff_bytes_and_hash,
     _check_call_usage_recorded,
     _check_quota_short_circuit,

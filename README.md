@@ -41,7 +41,8 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 | 최근 3개 커밋 | `--base HEAD~3` |
 | 브랜치 전체 (PR 전) | `--base main` |
 | 경로 지정 커밋 직전 (`git commit -- 경로`) | `--paths 경로…` |
-| Gemini 가 수행되지 않아 대체 리뷰를 마친 뒤 | `--staged --record-fallback --reviewer 이름 --summary 요약` |
+| Gemini 가 수행되지 않아(exit 4) 대체 리뷰를 준비 | `--staged --prepare-fallback` |
+| 준비한 대체 리뷰를 마친 뒤 기록 | `--staged --record-fallback --reviewer 이름 --summary 요약` |
 | 설치 · 로그인 점검 (코드를 보내지 않는다) | `--check` |
 
 처음 설치했으면 `/gemini-review --check` 를 먼저 돌린다. agy · 로그인 · 모델 응답과 agy 출력
@@ -61,6 +62,27 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 ⚠ `--out` 으로 저장소 안에 결과를 쓰면 **저장소 절대 경로**(`_meta.scope.repo`)와 리뷰 대상
 코드가 그 파일에 담긴다. 그 경로를 gitignore 할 것.
 
+### Gemini 가 수행되지 않을 때 — Claude 렌즈 서브에이전트 [1.10.0]
+
+쿼터 소진이면 곧바로, 그 밖의 exit 4(시간 초과 · 무응답 · 빈 응답)면 같은 모델로 2회까지 재시도한
+뒤에 넘어간다. 플러그인에 든 읽기 전용 서브에이전트(`Read, Grep, Glob` 만) 네 개가 관점을 나눠 리뷰한다.
+
+| 서브에이전트 | 관점 |
+|---|---|
+| `gemini-review:lens-general` | 일반 — 정확성 · 회귀 · 저장소의 반복 실패 계열 |
+| `gemini-review:lens-adversarial` | 적대적 — 변경이 내세우는 주장을 반례로 깨뜨린다 |
+| `gemini-review:lens-wiring` | 배선 — 새 값 · 가드 · 검사가 실제로 소비 · 실행되는가(silent-dead) |
+| `gemini-review:lens-security` | 보안 — 비밀 · 주입 · 신뢰 경계 · fail-open |
+
+1. 같은 범위 인자에 `--prepare-fallback` — 같은 내용의 최근 Gemini 시도가 exit 4 인지 보고, 리뷰 ·
+   게이트와 같은 바이트의 diff 를 `<git 폴더>/gemini-review/` 에 쓴 뒤 렌즈 프롬프트를 찍는다.
+2. 렌즈 넷을 병렬로 띄운다(작성 의도는 프롬프트에 넣지 않는다). 지적을 실측 검증해 반영한다.
+3. 내용이 바뀌면 Gemini 리뷰부터 다시, 바뀌지 않았으면 `--record-fallback` 으로 기록한다. 준비한 diff 와
+   sha256 이 다르면 기록하지 않는다.
+
+Claude 끼리의 리뷰는 교차 리뷰가 아니다 — 기록은 판정이 아니다(`_meta.passed` false). 자세한 절차는
+스킬 문서(SKILL.md 「대체 리뷰」)에 있다.
+
 ## 결과를 읽는 법
 
 ⚠ **배너가 보이지 않으면 리뷰는 수행되지 않은 것이다.** 종료 코드만 보고
@@ -72,9 +94,9 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 
 | 종료 코드 | 뜻 |
 |---|---|
-| `0` | 통과 (주 모델의 `approve` · `approve_with_comments`). `--record-fallback` 은 기록함 — 판정이 아니다 |
+| `0` | 통과 (주 모델의 `approve` · `approve_with_comments`). `--prepare-fallback` 은 준비함 · `--record-fallback` 은 기록함 — 판정이 아니다 |
 | `1` | 파싱 실패 · 내부 오류 |
-| `2` | 실행 실패 — git · `agy` 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` 에 못 씀, 대체 리뷰 기록 거부 |
+| `2` | 실행 실패 — git · `agy` 를 못 찾음, agy 가 실패를 알림(모델명 · 인증), `--out` · 대체 리뷰 기록에 못 씀, 대체 리뷰 준비 · 기록 거부 |
 | `3` | 민감 경로가 diff 에 있어 중단 |
 | `4` | **리뷰가 안 된 것이다** — 시간 초과 · 쿼터 소진 · 모델 무응답 · 빈 응답. '지적 없음'으로 읽지 말 것 |
 | `5` | `request_changes` |
@@ -82,9 +104,9 @@ Claude Code 세션에서 `/gemini-review` 를 부르면 된다. 범위는 인자
 | `8` | `--staged` · `--paths` 인데 커밋할 변경이 없다 — 리뷰가 안 된 것이다 |
 | `130` · `143` | 중단(Ctrl+C · 종료 신호) — 리뷰가 안 된 것이다 |
 
-**이 표에 없는 코드는 통과가 아니다.** exit 4 는 화면의 `원인:` · `해결:` 줄을 보고 몇 분
-두고 2회까지 다시 돌리고, 그래도 안 되면 "리뷰가 수행되지 않았다" 고 보고한다(가능하면
-다른 계열 리뷰로 대체).
+**이 표에 없는 코드는 통과가 아니다.** exit 4 는 "리뷰가 수행되지 않았다" 고 보고하고 화면의
+`원인:` · `해결:` · `대체 리뷰:` 줄대로 한다 — 쿼터면 곧바로, 그 밖의 원인이면 몇 분 두고 2회까지
+다시 돌린 뒤에 위의 렌즈 서브에이전트 대체 리뷰로 넘어간다.
 
 **판정은 주 모델만 낸다.** 주 모델이 응답하지 않을 때 진단 모델(`--probe-model`)은 "주
 모델만 죽었나, 도구가 죽었나" 를 가르는 데만 쓴다 — 그 모델로 리뷰를 받지 않는다.
@@ -157,10 +179,13 @@ git config gemini-review.gateFallback false           # 이 저장소에서 대�
   않고, 인덱스의 **임시 사본**에서 git 과 같은 규칙으로 담을 내용을 만든다(진짜 인덱스는 건드리지
   않는다). 실제로 커밋한 뒤의 diff 와 바이트까지 같음을 검사가 고정한다. 경로 지정 커밋은
   `--paths 경로…` 로 리뷰한다 — 두 세션이 작업 트리를 공유할 때 남의 스테이징을 건드리지 않는다.
-- **Gemini 가 수행되지 않을 때 [1.7.0]:** 같은 내용의 가장 최근 Gemini 시도가 exit 4(시간 초과 · 쿼터 ·
-  무응답)이면, 운영 규칙이 정한 대체 리뷰를 마친 뒤 `--record-fallback --reviewer … --summary …` 로
-  기록할 수 있고 게이트가 그 기록을 인정한다. Gemini 에게 묻지 않았거나 Gemini 가 지적을 냈으면 기록을
-  거부한다. 기록은 주 모델 판정이 아니다(`_meta.passed` false). 인정하지 않으려면 위의 `gateFallback false`.
+- **Gemini 가 수행되지 않을 때 [1.7.0 · 1.10.0]:** 같은 내용의 가장 최근 Gemini 시도가 exit 4(시간 초과 ·
+  쿼터 · 무응답)이면, `--prepare-fallback` 으로 준비한 렌즈 서브에이전트 리뷰를 마친 뒤
+  `--record-fallback --reviewer … --summary …` 로 기록할 수 있고 게이트가 그 기록을 인정한다. Gemini 에게
+  묻지 않았거나 같은 내용에 Gemini 가 응답(지적 · 텍스트 원문)을 낸 적이 있으면, 또는 같은 내용으로 준비한 diff 가 없으면 기록을
+  거부한다. 기록은 주 모델 판정이 아니다(`_meta.passed` false). 게이트는 준비 시각(`_meta.prepared_at`)이 없는
+  옛 기록(1.9.0 이하)을 인정하지 않는다. 인정하지 않으려면 위의 `gateFallback false` — 그 저장소에서는 준비 ·
+  기록도 거부된다.
 - **막는 꼴:** 모사하지 않는 인덱스 명령(`git reset` · `git rm` · `git stash` 등)을 커밋 앞에 이은 것,
   대화형 커밋(`--patch`), 저장소를 확정할 수 없는 명령(`cd $REPO` · `GIT_DIR` 등), 해석하지 못한
   명령, 파이썬을 못 찾은 경우, 게이트 내부 오류.

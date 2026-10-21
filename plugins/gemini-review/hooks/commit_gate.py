@@ -849,11 +849,20 @@ def _check_review(where, plan, adds):
     if match.get("passed") is True and mode == "reviewed" and code == 0:
         return EXIT_ALLOW, ""
     if mode == "fallback_reviewed" and code == 0:
-        if fallback_state(where) == "on":
-            return EXIT_ALLOW, ""
-        return EXIT_BLOCK, _message(
-            "같은 내용의 대체 리뷰 기록이 있지만 이 저장소는 대체 리뷰를 인정하지 않는다(운영자 설정).",
-            "Gemini 리뷰가 수행될 때까지 기다리거나, 커밋하지 못한 사실을 사용자에게 보고한다.")
+        # [1.10.0 2회차 렌즈 low] 운영자가 끈 저장소면 "준비부터 다시" 를 권하지 않는다(준비도 거부한다).
+        if fallback_state(where) != "on":
+            return EXIT_BLOCK, _message(
+                "같은 내용의 대체 리뷰 기록이 있지만 이 저장소는 대체 리뷰를 인정하지 않는다(운영자 설정).",
+                "Gemini 리뷰가 수행될 때까지 기다리거나, 커밋하지 못한 사실을 사용자에게 보고한다.")
+        if not match.get("prepared_at"):
+            # [1.10.0 대체 리뷰 보안 렌즈 low] 준비 없이 남긴 기록(1.9.0 이하 스크립트 · 갱신 전 세션)은
+            #   렌즈가 그 바이트를 봤다는 보장이 없다. 결과 폴더는 판이 달라도 함께 쓴다.
+            return EXIT_BLOCK, _message(
+                "같은 내용의 대체 리뷰 기록이 준비 없이 남았다(1.9.0 이하) — 대체 리뷰가 본 내용이 이 커밋과 "
+                "같다는 보장이 없다.",
+                "같은 범위 인자에 `--prepare-fallback` 을 붙여 준비하고, 렌즈 서브에이전트 리뷰를 마친 뒤 "
+                "`--record-fallback` 으로 다시 기록한다.")
+        return EXIT_ALLOW, ""
     if mode == "reviewed":
         why = "같은 변경의 최근 리뷰가 통과가 아니다(exit %s · 지적 있음)." % code
         fix = "지적을 실측으로 검증해 반영하고 다시 리뷰한다. " + fix
@@ -862,12 +871,23 @@ def _check_review(where, plan, adds):
         fix = "차단 목록을 사용자에게 보여 주고 판단을 받는다."
     elif code == 4:
         why = "같은 변경의 최근 리뷰가 수행되지 않았다(exit 4 · %s)." % mode
-        fix = "화면의 원인 · 해결 줄대로 같은 모델로 재시도한다. " + fix
-        if fallback_state(where) == "on":
+        quota = mode == "quota_exhausted"
+        fix = ("쿼터 차단이다 — 재설정 시각 뒤 같은 모델로 다시 돌린다. " if quota else
+               "화면의 원인 · 해결 줄대로 같은 모델로 재시도한다. ") + fix
+        # [1.10.0 2회차 렌즈 low] 같은 바이트에 Gemini 응답(지적 · 텍스트 원문)이 있으면 준비가 거부한다 —
+        #   막다른 길을 권하지 않는다.
+        flagged = gr._flagged_response(gr._attempts(root, sha, limit=_RESULT_SCAN_CAP))
+        if flagged is not None:
+            fix += (" 같은 내용에 Gemini 가 판정을 냈다(%s · exit %s) — 대체 리뷰로 덮을 수 없다. 반영해 "
+                    "다시 리뷰하거나 Gemini 통과를 기다린다." % (flagged.get("mode"), flagged.get("exit_code")))
+        elif fallback_state(where) == "on":
             # [1.7.0] 수행되지 않은 날에도 커밋할 길 — 운영 규칙이 허용한 대체 리뷰를 **실제로** 마친 뒤에만.
-            fix += (" 재시도해도 수행되지 않고 운영 규칙이 대체 리뷰를 허용하면, 대체 리뷰를 실제로 "
-                    "마치고 지적을 반영한 뒤 같은 범위 인자에 `--record-fallback --reviewer 이름 "
-                    "--summary 요약` 을 붙여 기록한다.")
+            # [1.10.0] 대체 리뷰는 준비한 diff 로 렌즈 서브에이전트가 한다. 쿼터면 재설정을 기다리지 않는다.
+            fix += (" %s 같은 범위 인자에 `--prepare-fallback` 을 붙여 준비하고, 렌즈 서브에이전트 "
+                    "리뷰(SKILL.md 「대체 리뷰」)를 실제로 마치고 지적을 반영한 뒤 `--record-fallback "
+                    "--reviewer 이름 --summary 요약` 을 붙여 기록한다."
+                    % ("기다리지 않으려면" if quota else
+                       "재시도해도 수행되지 않고 운영 규칙이 대체 리뷰를 허용하면,"))
     else:
         why = "같은 변경의 최근 리뷰가 통과가 아니다(%s · exit %s)." % (mode, code)
     return EXIT_BLOCK, _message(why, fix)

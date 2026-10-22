@@ -235,7 +235,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # [1.8.0] **대체 주 모델.** 사용자 지시(26.10.13 확인): "pro-high 가 agy models 에 없는 동안에는
@@ -255,6 +255,9 @@ _STANDIN_MODEL = "gemini-3.8-flash-high"
 #   ⚠ 모르는 등급(예: flash-lite)은 후보가 아니다. 새 등급이 생기면 사람이 재서 여기에 넣는다.
 _JUDGE_MODEL_RE = re.compile(r"^gemini-(\d+(?:\.\d+)*)-(pro|flash)-high$")
 _JUDGE_TIER_RANK = {"pro": 2, "flash": 1}
+# [1.10.1] `--check` 가 알리는 "새 계열" — gemini `-high` 인데 위 규칙에 맞지 않는 모델(예: gemini-4-argon-high).
+#   [2회차 적대적 렌즈 low] 판 번호가 앞에 오지 않는 이름(gemini-ultra-high 등)도 잡는다.
+_UNKNOWN_GEMINI_HIGH_RE = re.compile(r"^gemini-[a-z0-9.\-]+-high$")
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*$")
 # `agy models` 는 토큰을 쓰지 않는 목록 조회다(실측 4초, 에이전트 턴 없음).
 _MODELS_TIMEOUT = 30
@@ -805,10 +808,13 @@ def main(argv=None) -> int:
                     "note": "스크립트 내부 오류로 끝났다 — 리뷰가 수행되지 않았다. 통과가 아니다."}
             if ctx["model"]:
                 body["model"] = ctx["model"]
-            _write_out(ctx["out"], _result("internal_error", body, EXIT_PARSE_FAILED,
-                                           model=ctx["model"], calls=ctx["calls"] or None,
-                                           diff_sha256=ctx["diff_sha256"]),
-                       quiet=bool(ctx["out"]))
+            payload = _result("internal_error", body, EXIT_PARSE_FAILED, model=ctx["model"],
+                              calls=ctx["calls"] or None, diff_sha256=ctx["diff_sha256"])
+            if _write_out(ctx["out"], payload, quiet=bool(ctx["out"])) and ctx["out"]:
+                # [1.10.1 대체 리뷰 배선 렌즈 low] `finish` 와 같은 계약 — `--out` 이어도 결과 폴더에 사본을 남긴다.
+                #   [2회차 적대적 렌즈 low] 남기지 못하면 `finish` 처럼 알린다.
+                if not _copy_to_result_dir(payload):
+                    _safe_print(_COPY_FAILED_NOTE)
         except Exception:
             pass
         return EXIT_PARSE_FAILED
@@ -935,8 +941,14 @@ def _main(argv, ctx: dict) -> int:
             _say_fallback_hint(mode, args, state["root"], state["diff_sha256"])
         # ⛔ [1.10.0 대체 리뷰 일반 · 적대적 렌즈 low] 대체 리뷰 기록은 **결과 파일이 곧 기록**이다. 기본 결과
         #   폴더에 못 써도 0 이면 "기록함" 으로 읽히고, 준비한 diff 까지 지워 다시 기록할 수도 없었다.
-        if (_write_out(args.out, _result(mode, body, rc, **meta)) is None
-                and (args.out or mode == "fallback_reviewed")):
+        payload = _result(mode, body, rc, **meta)
+        written = _write_out(args.out, payload)
+        # ⛔ [1.10.1] `--out` 결과도 결과 폴더에 사본을 남긴다. 게이트 · 대체 리뷰 판단(응답 이력) · `--stats` 는
+        #   결과 폴더만 본다 — 1.10.0 까지는 `--out` 으로 받은 Gemini 지적(exit 5)이 이력에 없어, 그 뒤 쿼터면
+        #   대체 리뷰가 그 지적을 덮을 수 있었다(1.10.0 3회차 적대적 렌즈 low).
+        if args.out and written is not None and not _copy_to_result_dir(payload):
+            _safe_print(_COPY_FAILED_NOTE)
+        if written is None and (args.out or mode == "fallback_reviewed"):
             _safe_print("⛔ 결과를 쓰지 못했다 — 종료코드 %d 대신 2 로 끝낸다." % rc)
             return EXIT_TOOL_ERROR
         return rc
@@ -1370,8 +1382,8 @@ _FALLBACK_AGENT = "gemini-review:lens-%s"
 # 준비한 diff 를 두는 곳 — **리뷰 대상 저장소의 git 폴더 안**이다(`git rev-parse --git-path`).
 #   ⚠ 공유 임시 폴더에 두지 않는다. diff 는 저장소 코드 전문이라 잔류 사고(2회) 계열이 된다.
 #   git 폴더는 그 코드가 원래 있는 곳이고, 보통 작업 폴더 안이라 서브에이전트의 Read 가 닿는다.
-#   ⚠ 연결 워크트리 · 서브모듈에서는 작업 폴더 밖(`<본 저장소>/.git/worktrees/…` · `.git/modules/…`)이다 — 그때
-#     Read 가 권한을 물을 수 있다(3회차 렌즈 질문, 실측하지 않았다 · TODOS).
+#   ⚠ 연결 워크트리 · 서브모듈에서는 작업 폴더 밖(`<본 저장소>/.git/worktrees/…` · `.git/modules/…`)이다 — default
+#     권한 모드면 렌즈의 Read 가 거부된다(1.10.1 실측). 준비가 `_folders_outside_session` 으로 `/add-dir` 를 안내한다.
 _FALLBACK_SUBDIR = "gemini-review"
 _FALLBACK_STALE_SECONDS = 24 * 3600
 
@@ -1504,7 +1516,7 @@ def _say_fallback_hint(mode: str, args, root: Optional[str], sha: Optional[str] 
     쿼터는 재설정까지 몇 시간일 수 있어 기다리지 않고 곧바로 대체한다(사용자 지시 26.10.21). 그 밖의
     원인은 같은 모델로 재시도할 여지가 있어 재시도 규칙을 먼저 채운다.
     ⚠ 준비가 거부할 길을 권하지 않는다 — 운영자가 끈 저장소 · 같은 바이트에 Gemini 응답이 있음 · 렌즈 정의가
-      없는 설치본(준비와 같은 판단)과, `--out` 으로 돈 결과(준비는 결과 폴더만 본다)다.
+      없는 설치본(준비와 같은 판단)이다. `--out` 으로 돈 결과도 결과 폴더에 사본이 남으므로 준비가 본다(1.10.1).
     """
     no = None
     off = _trust_refusal() or (_operator_refusal(root) if root else None)
@@ -1525,8 +1537,6 @@ def _say_fallback_hint(mode: str, args, root: Optional[str], sha: Optional[str] 
     _safe_print("   대체 리뷰: %s `%s --prepare-fallback` 으로 준비하고 렌즈 서브에이전트로 리뷰한다"
                 % (when, _scope_argv(args)))
     _safe_print("             (SKILL.md 「대체 리뷰」 · 기록은 주 모델 판정이 아니다).")
-    if args.out:
-        _safe_print("             ⚠ --out 으로 쓴 결과는 준비가 보지 않는다 — --out 없이 리뷰를 다시 돌린 뒤 준비한다.")
 
 
 def _prepare_fallback(args, root: str, files: List[str], diff_bytes: bytes, state: dict) -> int:
@@ -1587,6 +1597,15 @@ def _prepare_fallback(args, root: str, files: List[str], diff_bytes: bytes, stat
     _safe_print("Gemini 시도: %s (exit %s · %s)"
                 % (attempt.get("mode"), attempt.get("exit_code"), attempt.get("written_at")))
     _safe_print("diff: %s (리뷰 · 게이트와 같은 바이트)" % path)
+    outside = _folders_outside_session(root, path)
+    if outside:
+        # ⛔ [1.10.1] 실측(26.10.22, Claude Code 2.1.306 `claude -p`): 권한 모드 default 에서 렌즈의 Read 가 작업 폴더
+        #   밖을 거부했다 — auto 모드와 `--add-dir <폴더>` 에서는 읽었다. diff 가 거부되면 diff_read false 로 끝나고,
+        #   맥락 파일 · 저장소 파일만 거부되면 diff_read true 인 채 맥락 없는 리뷰가 된다(조용한 실패).
+        _safe_print("⚠ 렌즈가 읽을 폴더가 작업 폴더 밖이다(연결 워크트리 · 서브모듈 · 저장소의 하위 폴더에서 실행) — "
+                    "권한 모드에 따라 렌즈의 Read 가 거부된다.")
+        _safe_print("  렌즈를 띄우기 전에 사용자에게 요청한다: %s"
+                    % " · ".join("`/add-dir %s`" % d for d in outside))
     _safe_print("맥락: %s" % (ctx or "범용 (프로젝트 파일 없음)"))
     _safe_print("⚠ Claude 렌즈는 교차 리뷰(다른 모델)가 아니다. 기록은 주 모델 판정이 아니다(_meta.passed false).")
     _safe_print("=" * 74)
@@ -1620,6 +1639,27 @@ def _prepare_fallback(args, root: str, files: List[str], diff_bytes: bytes, stat
     else:
         _safe_print("      범위 리뷰는 기록 단계가 없다 — 결과를 사용자에게 보고한다.")
     return EXIT_PASSED
+
+
+def _folders_outside_session(root: str, diff_path: str) -> List[str]:
+    """렌즈가 읽어야 하는데 작업 폴더 밖인 폴더 — `/add-dir` 로 더할 것(1.10.1). 없으면 빈 목록.
+
+    렌즈는 준비 diff 와 저장소 루트(맥락 파일 · 호출부 · 정의)를 읽는다. 루트를 더하면 본 저장소의
+    `.git/gemini-review` 도 덮이므로, diff 폴더는 루트 밖일 때(연결 워크트리 · 서브모듈)만 따로 더한다.
+    ⛔ [1.10.1 대체 리뷰 2회차 적대적 렌즈 medium] 처음엔 diff 폴더만 안내했다. 하위 폴더에서 연 세션은 그대로 하면
+      diff 는 읽히고 맥락 파일 · 저장소 파일은 거부돼, diff_read true 인 맥락 없는 리뷰가 기록될 수 있었다.
+    ⚠ 작업 폴더는 **실행한 폴더**(`os.getcwd()`)로 갈음한다. 세션을 연 폴더를 알려 주는 환경 변수는 Bash 에 없고,
+      Bash 는 `cd` 를 이어 가며, Claude Code 2.1.301 은 그 폴더를 기본 작업 폴더로 고쳐 알린다(26.10.22 관찰).
+    ⛔ [3회차 적대적 렌즈 low] 그래서 **하나라도 밖이면 둘 다** 안내한다. 세션은 본 저장소에서 열고 형제 폴더의 연결
+      워크트리로 `cd` 해 준비하면, 실행 폴더 기준으로는 루트가 안이라 diff 폴더만 안내됐다 — Read 권한이 세션 폴더를
+      따르면 diff 만 읽히고 맥락 파일은 거부되는 조용한 실패다. 필요 없는 `/add-dir` 는 무해하다.
+    """
+    cwd = os.path.realpath(os.getcwd())
+    folder = os.path.dirname(diff_path)
+    rroot, rfolder = os.path.realpath(root), os.path.realpath(folder)
+    if _is_within(rroot, cwd) and _is_within(rfolder, cwd):
+        return []
+    return [root] if _is_within(rfolder, rroot) else [root, folder]
 
 
 def _sweep_prepared(folder: str, keep: Optional[str], cutoff: float) -> None:
@@ -2108,6 +2148,13 @@ def _check_model_list_notes(args, ids: List[str], mark) -> None:
     if best and best != _DEFAULT_MODEL and _judge_rank(best) > _judge_rank(_DEFAULT_MODEL):
         mark("새 모델", None, "%s 가 기본 모델 %s 보다 등급 · 판이 높다 — 자동으로 바꾸지 않는다. "
              "정답을 아는 diff 로 재 보고 기본 모델 교체를 검토할 것" % (best, _DEFAULT_MODEL))
+    # ⛔ [1.10.1] 등급을 모르는 gemini `-high` 모델도 알린다. 26.10.22 목록에 `gemini-4-argon-high` 가 생겼는데
+    #   (쿼터 그룹도 따로다) 판정 후보 규칙(pro · flash)에 맞지 않아 위 줄이 침묵했다 — 목록 변화를 알리려고 둔
+    #   점검이 새 계열을 놓친다. 후보로 삼지는 않는다(사람이 재고 규칙을 고친다).
+    unknown = [i for i in ids if _UNKNOWN_GEMINI_HIGH_RE.match(i) and _judge_rank(i) is None]
+    if unknown:
+        mark("새 계열", None, "%s — 등급을 몰라 판정 후보가 아니다. 자동으로 바꾸지 않는다. "
+             "정답을 아는 diff 로 재 보고 판정 후보 규칙(_JUDGE_MODEL_RE) 갱신을 검토할 것" % ", ".join(unknown))
     probe = (args.probe_model or "").strip()
     if probe and not args.no_probe_fallback and probe not in ids:
         # [1.9.0 교차리뷰 MEDIUM] 실제 실행(`_recover_empty_response`)과 같은 조건이다 — 적은 진단
@@ -2297,6 +2344,30 @@ def _resolve_scope(root: str, args) -> dict:
     return scope
 
 
+def _result_file_name() -> str:
+    """결과 폴더에 둘 결과 파일 이름. 같은 초에 끝난 두 실행이 서로 덮지 않게 PID 를 붙인다."""
+    return "gemini_review_%s_%d.json" % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid())
+
+
+_COPY_FAILED_NOTE = ("⚠ 결과 폴더에 사본을 남기지 못했다(쓰기 실패 · 믿을 수 없는 폴더) — 게이트 · 대체 리뷰 판단 · "
+                     "--stats 가 이 결과를 보지 못한다.")
+
+
+def _copy_to_result_dir(payload: dict) -> bool:
+    """`--out` 결과의 **사본**을 결과 폴더에 남긴다(1.10.1). 남겼으면 True.
+
+    게이트 · 대체 리뷰의 응답 이력(`_attempts`) · `--stats` 는 결과 폴더만 본다.
+    ⛔ [1.10.1 대체 리뷰 일반 · 배선 · 적대적 렌즈 low] 결과 폴더를 믿을 수 없으면(링크 · 남의 소유 · Windows 의
+      공유 %TEMP%) 남기지 않는다. 처음엔 `_write_out(None, …)` 이라 `_default_result_dir` 의 임시 폴더 대체를 탔다 —
+      게이트 · `_attempts` 는 신뢰 상태가 ok 인 폴더만 읽으므로 아무도 보지 않는 사본(코드가 인용된 지적)이 실행마다
+      임시 폴더에 쌓이고, "사본을 남기지 못했다" 경고도 뜨지 않았다.
+    """
+    d, status = _state_dir(create=True)
+    if d is None or status != "ok":
+        return False
+    return _write_out(os.path.join(d, _result_file_name()), payload, quiet=True) is not None
+
+
 def _write_out(out_path: Optional[str], payload: dict,
                quiet: bool = False) -> Optional[str]:
     """결과 JSON 저장. 반환: 기록한 경로, **실패하면 None**.
@@ -2305,10 +2376,7 @@ def _write_out(out_path: Optional[str], payload: dict,
     ⚠ 실패를 어떻게 다룰지는 호출부가 정한다(명시한 `--out` 이면 exit 2).
     """
     try:
-        path = out_path or os.path.join(
-            _default_result_dir(),
-            "gemini_review_%s_%d.json"
-            % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid()))
+        path = out_path or os.path.join(_default_result_dir(), _result_file_name())
         d = os.path.dirname(os.path.abspath(path))
         os.makedirs(d, exist_ok=True)
         _write_json_atomic(path, payload)
@@ -2420,7 +2488,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", default=None,
                     help="결과 JSON 경로. 생략하면 $XDG_STATE_HOME/gemini-review/ "
                          "(보통 ~/.local/state/gemini-review/, Windows 는 "
-                         "%%LOCALAPPDATA%%\\gemini-review\\) 에 0600 으로 쌓인다")
+                         "%%LOCALAPPDATA%%\\gemini-review\\) 에 0600 으로 쌓인다. "
+                         "주어도 그 폴더에 사본이 남는다(1.10.1)")
     ap.add_argument("--allow-sensitive", action="store_true",
                     help="민감 경로가 diff 에 있어도 강행 (기본: 중단). 사용자가 목록을 보고 "
                          "명시적으로 승인한 경우에만 쓴다")
@@ -3000,7 +3069,7 @@ def _run_stats(args) -> int:
         names = []
     if not names:
         _safe_print("결과 0건 — 집계할 것이 없다 (%s)" % base)
-        _safe_print("   `--out` 으로 다른 경로에 쓴 결과는 집계에 들어가지 않는다.")
+        _safe_print("   1.10.0 까지 `--out` 으로 다른 경로에 쓴 결과는 집계에 들어가지 않는다(1.10.1 부터는 사본이 남는다).")
         return EXIT_PASSED
 
     paths = [os.path.join(base, n) for n in names]
@@ -3279,6 +3348,7 @@ def _classify_run(run: _AgyRun, structured: bool) -> Tuple[str, str, str]:
       2. agy 가 실패를 알렸다(rc≠0 · 래퍼 status=ERROR) → `quota` · `model_unavailable` ·
          `tool_error`. ⛔ stdout 이 무엇이든 실패다 [26.09.14 실측: 없는 모델명이 빈 응답으로
          읽혀 폴백 판정 exit 0 까지 갔다 · 인증 오류 평문이 파싱 실패 exit 1 이 됐다].
+         쿼터 · 모델 없음은 `_failure_signal`(래퍼 error · stderr)로만 가른다 [1.10.1].
       3. 출력 시간 초과 안내 → `timeout`(agy). ⚠ agy 는 이때 **exit 0** 이고 안내는 stderr
          로 나간다(26.09.14 실측).
       4. 응답 본문이 비었다 → `tool_denied`(stderr 에 권한 거부 안내) · `empty`.
@@ -3292,7 +3362,7 @@ def _classify_run(run: _AgyRun, structured: bool) -> Tuple[str, str, str]:
         #   1.10.0 은 쿼터면 곧바로 Claude 대체 리뷰로 넘어가 대가가 커졌다 — 래퍼의 error 와 stderr 만 본다.
         #   [2회차 렌즈 low] 완결된 래퍼(error 없음)를 넘기면 `_agy_error_detail` 이 래퍼 원문(response 포함)을
         #   돌려줬다 → error 필드만 꺼낸다.
-        detail = (_wrapper_error(run.stdout) or (run.stderr or "")).strip()
+        detail = _failure_signal(run.stdout, run.stderr, structured)
         if _looks_like_quota_error(detail):
             return "quota", "", _first_line(detail)
         return "timeout", "hard", "바깥 상한 %d초 초과로 강제 종료" % run.hard_limit
@@ -3300,12 +3370,13 @@ def _classify_run(run: _AgyRun, structured: bool) -> Tuple[str, str, str]:
         return "tool_error", "", "agy 실행 실패: %s" % (run.error or "원인 불명")
     raw, err = run.stdout, run.stderr
     if run.rc != 0 or (structured and _wrapper_status(raw) == "ERROR"):
-        detail = _agy_error_detail(raw, err)
-        if _looks_like_quota_error(detail):
-            return "quota", "", _first_line(detail)
-        if _looks_like_model_error(detail):
-            return "model_unavailable", "", _first_line(detail)
-        return "tool_error", "", _first_line(detail) or "agy 종료코드 %d" % run.rc
+        signal = _failure_signal(raw, err, structured)
+        if _looks_like_quota_error(signal):
+            return "quota", "", _first_line(signal)
+        if _looks_like_model_error(signal):
+            return "model_unavailable", "", _first_line(signal)
+        # 화면에 보일 설명은 stdout 원문까지 본다 — 인증 오류 평문이 stdout 으로 온 실측이 있다(26.09.14).
+        return "tool_error", "", _first_line(_agy_error_detail(raw, err)) or "agy 종료코드 %d" % run.rc
     if _is_print_timeout(err):
         return "timeout", "agy", _first_line(
             [ln for ln in err.splitlines() if _is_print_timeout(ln)][0])
@@ -3422,8 +3493,28 @@ def _wrapper_error(raw: str) -> str:
     return ""
 
 
+def _failure_signal(raw: str, err: str, structured: bool) -> str:
+    """원인(쿼터 · 모델 없음)을 **가르는** 문구 — 래퍼의 `error` 와 stderr 만 본다. 응답 본문은 보지 않는다.
+
+    ⛔ [1.10.1] rc≠0 · status=ERROR 갈래는 1.10.0 까지 `_agy_error_detail` 로 stdout 원문(텍스트 모드 본문 ·
+      error 없는 래퍼의 response)까지 봤다. 리뷰 문장에 'quota' 낱말이 있으면 쿼터로 읽혀, 재시도 대신 곧바로
+      Claude 대체 리뷰로 넘어가고 쿼터 차단까지 기록됐다. 하드 상한 갈래(1.10.0)와 같은 규칙으로 맞춘다.
+    실측(26.10.22, agy 1.4.4 · 쿼터 소진): 구조화 호출은 rc 3 · 래퍼 error 와 stderr 양쪽에, 텍스트 호출은
+      rc 3 · stdout 빈 채 **stderr 에만** 안내가 왔다(`error: Individual quota reached … Resets in 44h26m57s.`).
+      좁혀도 잃는 쿼터 안내가 없다.
+    ⛔ [1.10.1 대체 리뷰 2회차 보안 렌즈 low] 텍스트 호출의 stdout 은 래퍼가 아니라 **모델 응답 원문**이다. 래퍼로
+      해석하면 `{"error": "quota … Resets in 71h"}` 꼴의 응답이 쿼터 차단을 기록해 교차 리뷰를 며칠 끈다. 래퍼는
+      구조화 호출에서만 본다(모델 없음 안내도 텍스트 호출은 stderr 로만 왔다 — 26.10.22 실측).
+    """
+    wrapper = _wrapper_error(raw) if structured else ""
+    return (wrapper or (err or "")).strip()
+
+
 def _agy_error_detail(raw: str, err: str) -> str:
-    """agy 가 실패를 알린 문구. 래퍼 JSON 의 `error` 를 우선한다."""
+    """agy 가 실패를 알린 문구 — **화면 설명용**. 래퍼 JSON 의 `error` 를 우선하고, 없으면 stdout 원문까지 본다.
+
+    ⚠ 원인 판정에는 쓰지 않는다(`_failure_signal`).
+    """
     try:
         wrapper = json.loads(raw)
     except ValueError:

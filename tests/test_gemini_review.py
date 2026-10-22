@@ -664,6 +664,24 @@ _MODELS_LIST = ("gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n"
                 "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n"
                 "claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n"
                 "gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n")
+# [1.10.1] 26.10.22 `agy models` 실측(agy 1.4.4) — 등급을 모르는 새 계열 gemini-4-argon-* 이 생겼다(쿼터 그룹도 따로다).
+_MODELS_LIST_1022 = ("gemini-4-argon-medium\tGemini 4 Argon (Medium)\n"
+                     "gemini-4-argon-high\tGemini 4 Argon (High)\n"
+                     "gemini-4-argon-low\tGemini 4 Argon (Low)\n" + _MODELS_LIST)
+# [1.10.1] 쿼터 소진 실측(26.10.22, agy 1.4.4) — 빈 폴더 · 한 줄 프롬프트. 구조화 · 텍스트 모두 rc 3 · 7~8초.
+#   구조화는 래퍼 error 와 stderr 양쪽에, 텍스트는 stdout 빈 채 stderr 에만 안내가 왔다.
+_AGY144_QUOTA_LINE = ("Individual quota reached. Please upgrade your subscription to increase your limits. "
+                      "Resets in 44h26m56s.")
+_AGY144_QUOTA_STDERR = ("error: " + _AGY144_QUOTA_LINE + "\n"
+                        'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): ' + _AGY144_QUOTA_LINE
+                        + '","status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true}\n')
+# [1.10.1 대체 리뷰 렌즈 질문 → 실측] 없는 모델명 — 텍스트는 rc 1 · stdout 빈 채 stderr 에만, 구조화는 래퍼 error 와 stderr.
+_AGY144_NOMODEL_LINE = ('invalid model selection (--model "gemini-review-check-no-such-model" --effort ""): model '
+                        'gemini-review-check-no-such-model is not recognized as a known model or custom model in settings')
+_AGY144_NOMODEL_STDERR = ("error: " + _AGY144_NOMODEL_LINE + "\nAvailable models:\n  Gemini 4 Argon (Medium)\n")
+_AGY144_QUOTA_WRAPPER = json.dumps({"conversation_id": "x", "status": "ERROR", "response": "",
+                                    "error": _AGY144_QUOTA_LINE, "duration_seconds": 0, "num_turns": 1,
+                                    "usage": {"input_tokens": 0, "output_tokens": 0}})
 
 
 def _agy_script(gr, responses):
@@ -2641,6 +2659,28 @@ def _check_classify_run(gr):
          R(None, hard_timeout=True, hard_limit=720,
            stdout=_wrap("[HIGH] quota 상태 파일이 깨지면 쿼터 단락이 꺼진다")),
          True, ("timeout", "hard")),
+        # [1.10.1] rc≠0 · status=ERROR 갈래도 응답 본문으로 쿼터 · 모델 없음을 가르지 않는다(하드 상한 갈래와 같다).
+        ("rc≠0 + 텍스트 본문의 'quota' 낱말",
+         R(1, stdout="[HIGH] quota 상태 파일이 깨지면 쿼터 단락이 꺼진다"), False, ("tool_error", "")),
+        ("status ERROR + error 없는 래퍼 본문의 'quota' 낱말",
+         R(1, stdout=_wrap("[HIGH] quota 상태 파일이 깨지면 쿼터 단락이 꺼진다", status="ERROR")),
+         True, ("tool_error", "")),
+        # [1.10.1 2회차 보안 렌즈 low] 텍스트 호출의 stdout 은 모델 응답이다 — 래퍼 꼴이어도 error 를 믿지 않는다.
+        ("rc≠0 + 텍스트 본문이 래퍼 꼴인 error 'quota'",
+         R(1, stdout='{"error": "Individual quota reached. Resets in 71h0m0s."}'), False, ("tool_error", "")),
+        ("하드 상한 + 텍스트 본문이 래퍼 꼴인 error 'quota'",
+         R(None, hard_timeout=True, hard_limit=720,
+           stdout='{"error": "Individual quota reached. Resets in 71h0m0s."}'), False, ("timeout", "hard")),
+        ("rc≠0 + 텍스트 본문의 모델 없음 문구",
+         R(1, stdout="리뷰: 'invalid model selection' 안내를 읽는다"), False, ("tool_error", "")),
+        ("쿼터 실측 agy 1.4.4 구조화", R(3, stdout=_AGY144_QUOTA_WRAPPER, stderr=_AGY144_QUOTA_STDERR),
+         True, ("quota", "")),
+        ("쿼터 실측 agy 1.4.4 텍스트", R(3, stdout="", stderr=_AGY144_QUOTA_STDERR), False, ("quota", "")),
+        ("모델 없음 실측 agy 1.4.4 텍스트", R(1, stdout="", stderr=_AGY144_NOMODEL_STDERR), False,
+         ("model_unavailable", "")),
+        ("모델 없음 실측 agy 1.4.4 구조화",
+         R(1, stdout=_wrap("", status="ERROR", error=_AGY144_NOMODEL_LINE), stderr=_AGY144_NOMODEL_STDERR),
+         True, ("model_unavailable", "")),
         ("실행 실패", R(None, error="boom"), True, ("tool_error", "")),
         ("쿼터(래퍼)", R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG)), True, ("quota", "")),
         ("쿼터(텍스트 · stderr)", R(1, stderr="error: " + _QUOTA_MSG), False, ("quota", "")),
@@ -2655,6 +2695,12 @@ def _check_classify_run(gr):
         got = gr._classify_run(run, structured)
         yield (None if got[:2] == want else
                "_classify_run [%s] → %r (기대 %r)" % (label, got[:2], want))
+    # [1.10.1] 판정을 좁혀도 재설정 시각은 읽히고, 화면 설명은 stdout 원문(인증 오류 평문)까지 보여 준다.
+    got = gr._classify_run(R(3, stdout="", stderr=_AGY144_QUOTA_STDERR), False)
+    yield (None if gr._quota_reset_hint(got[2]) == "44h26m56s" else
+           "실측 쿼터 안내에서 재설정 시각을 읽지 못했다: %r" % (got,))
+    got = gr._classify_run(R(1, stdout="Error: authentication required."), False)
+    yield (None if "authentication" in got[2] else "도구 오류 설명이 stdout 원문을 잃었다: %r" % (got,))
 
 
 def _check_small_parsers(gr):
@@ -2893,6 +2939,8 @@ def _check_model_list_rules(gr):
         ("medium · low 는 후보가 아니다", ["gemini-3.8-flash-medium", "gemini-3.9-pro-low"], ""),
         ("claude · gpt 는 후보가 아니다", ["claude-opus-5-5-high", "gpt-oss-120b-high"], ""),
         ("모르는 등급은 후보가 아니다", ["gemini-4.0-flash-lite-high"], ""),
+        ("26.10.22 실측 목록 — 새 계열은 후보가 아니다", gr._parse_model_list(_MODELS_LIST_1022),
+         "gemini-3.8-flash-high"),
     ]
     for label, given, want in cases:
         got = gr._pick_judge_model(given)
@@ -2954,6 +3002,17 @@ def _check_model_list_wiring(gr):
     got = notes([F, "gemini-3.8-flash-low"], probe_model="gone-model")
     yield (None if "gemini-3.8-flash-low" in got.get("진단 모델", "") else
            "진단 모델 안내가 대체 주 모델(%s)을 빼고 고르지 않았다: %r" % (F, got.get("진단 모델")))
+    # [1.10.1] 26.10.22 목록의 gemini-4-argon-high 는 판정 후보 규칙(pro · flash)에 맞지 않아 '새 모델' 줄이
+    #   침묵했다 — 목록 변화를 알리려고 둔 점검이 새 계열을 놓쳤다.
+    got = notes(gr._parse_model_list(_MODELS_LIST_1022))
+    new = got.get("새 계열", "")
+    yield (None if "gemini-4-argon-high" in new and "argon-medium" not in new and "claude" not in new else
+           "등급을 모르는 gemini -high 모델을 '새 계열' 로 알리지 않았다: %r" % got)
+    yield (None if "새 계열" not in notes([D, F, "gemini-3.8-flash-medium"]) else
+           "아는 등급뿐인 목록에 '새 계열' 을 알렸다")
+    # [2회차 적대적 렌즈 low] 판 번호가 앞에 오지 않는 이름도 새 계열이다.
+    yield (None if "gemini-ultra-high" in notes([D, F, "gemini-ultra-high"]).get("새 계열", "") else
+           "판 번호가 앞에 오지 않는 gemini -high 모델을 '새 계열' 로 알리지 않았다")
 
 
 def _check_check_mode(gr):
@@ -3346,8 +3405,11 @@ def fake_quota(agy, model, args, root_, schema_path, prompt):
 def fake_timeout(agy, model, args, root_, schema_path, prompt):
     return gr._AgyRun(None, hard_timeout=True, hard_limit=720, elapsed=720.0)
 
+def fake_boom(agy, model, args, root_, schema_path, prompt):
+    raise RuntimeError("테스트: 내부 오류")
+
 gr._find_agy = lambda *a, **k: "agy"
-gr._invoke_schema = {"quota": fake_quota, "timeout": fake_timeout}.get(verdict, fake_invoke)
+gr._invoke_schema = {"quota": fake_quota, "timeout": fake_timeout, "boom": fake_boom}.get(verdict, fake_invoke)
 # 쿼터 조회 · 생존 확인이 **진짜 agy** 를 부르지 않게 한다(개발 기기에는 agy 가 있다).
 gr._run_agy = lambda *a, **k: gr._AgyRun(None, error="테스트: agy 를 부르지 않는다")
 sys.exit(gr.main(sys.argv[3:] or ["--staged"]))
@@ -3997,6 +4059,176 @@ def _check_gate_fallback_record(gr):
         _rmtree_sandbox(sandbox, sandbox)
 
 
+def _review_runner(cwd, env):
+    """`_CHILD_GATE_REVIEW`(가짜 agy 판정) · 실제 스크립트를 `cwd` 에서 돌리는 함수. 반환 `(종료 코드, stdout)`."""
+    def run(argv, child=True):
+        cmd = ([sys.executable, "-c", _CHILD_GATE_REVIEW, os.path.abspath(_TARGET)] if child
+               else [sys.executable, os.path.abspath(_TARGET)])
+        proc = subprocess.run(cmd + list(argv), cwd=cwd, env=env, capture_output=True, timeout=120,
+                              check=False)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace")
+    return run
+
+
+def _check_out_copies_to_result_dir(gr):
+    """`--out` 리뷰도 결과 폴더에 사본을 남겨 게이트 · 대체 리뷰 판단이 본다(1.10.1).
+
+    ⛔ [1.10.0 3회차 적대적 렌즈 low → 1.10.1] 응답 이력은 결과 폴더만 본다. `--out` 결과가 거기 없어, `--out` 으로
+      받은 Gemini 지적(exit 5) 뒤 쿼터가 나면 대체 리뷰가 그 지적을 덮을 수 있었다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_outcopy_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+        results = os.path.join(sandbox, "state", "gemini-review")
+        run = _review_runner(repo, env)
+
+        def git(*args):
+            subprocess.run(["git"] + list(args), cwd=repo, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def write(text):
+            with io.open(os.path.join(repo, "a.py"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        def copies(sha):
+            found = []
+            for n in (sorted(os.listdir(results)) if os.path.isdir(results) else []):
+                if n.startswith("gemini_review_") and n.endswith(".json"):
+                    with io.open(os.path.join(results, n), encoding="utf-8") as fh:
+                        meta = json.load(fh).get("_meta", {})
+                    if sha and meta.get("diff_sha256") == sha:
+                        found.append(meta.get("exit_code"))
+            return found
+
+        git("init", "-q")
+        write("a = 1\n")
+        git("add", "a.py")
+        git("commit", "-qm", "init")
+        git("config", "gemini-review.gate", "true")
+        # ⚠ 통과 행을 먼저 둔다 — 아래 쿼터 행이 쿼터 차단을 기록하면 뒤 리뷰는 agy 를 부르지 않고 exit 4 다.
+        write("a = 2\n")
+        git("add", "a.py")
+        rc, _text = run(["approve", "--staged", "--out", os.path.join(sandbox, "o2.json")])
+        rc2, err = _gate_call([sys.executable, _GATE_PY], repo, "git commit -m x", env)
+        yield (None if rc == 0 and rc2 == 0 else
+               "--out 으로 통과한 리뷰를 게이트가 보지 못한다: exit %d · 게이트 %d: %s"
+               % (rc, rc2, err.strip()[:200]))
+        write("a = 3\n")
+        git("add", "a.py")
+        out = os.path.join(sandbox, "o.json")
+        rc, text = run(["request_changes", "--staged", "--out", out])
+        sha = None
+        if os.path.isfile(out):
+            with io.open(out, encoding="utf-8") as fh:
+                sha = json.load(fh).get("_meta", {}).get("diff_sha256")
+        got = copies(sha)
+        yield (None if rc == 5 and got == [5] else
+               "--out 리뷰의 사본이 결과 폴더에 없다: exit %d · sha %r · 사본 %r: %s" % (rc, sha, got, text[-200:]))
+        # [1.10.1 대체 리뷰 배선 렌즈 low] 내부 오류로 끝난 실행도 `finish` 와 같은 계약이다.
+        rc, text = run(["boom", "--staged", "--out", os.path.join(sandbox, "o3.json")])
+        got = copies(sha)
+        yield (None if rc == 1 and 1 in got else
+               "internal_error 의 --out 사본이 결과 폴더에 없다: exit %d · 사본 %r: %s" % (rc, got, text[-200:]))
+        rc, _text = run(["quota", "--staged"])
+        rc2, text = run(["--staged", "--prepare-fallback"], child=False)
+        yield (None if rc == 4 and rc2 == 2 and "덮을 수 없다" in text else
+               "--out 으로 받은 지적 뒤 쿼터에 대체 리뷰를 준비했다: exit %d → %d: %s" % (rc, rc2, text[-200:]))
+        if os.name != "nt":
+            # [1.10.1 대체 리뷰 일반 · 배선 · 적대적 렌즈 low] 결과 폴더를 믿을 수 없으면(링크) 사본을 임시 폴더로
+            #   흘리지 않고 알린다 — 게이트 · `_attempts` 는 그 폴더를 읽지 않는다.
+            state2 = os.path.join(sandbox, "state2")
+            elsewhere = os.path.join(sandbox, "elsewhere")
+            tmp = os.path.join(sandbox, "tmp")
+            for d in (state2, elsewhere, tmp):
+                os.makedirs(d)
+            os.symlink(elsewhere, os.path.join(state2, "gemini-review"))
+            env2 = _state_env(sandbox, "state2")
+            env2.update((k, env[k]) for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"))
+            env2.pop("PYTHONIOENCODING", None)
+            env2["TMPDIR"] = tmp
+            run2 = _review_runner(repo, env2)
+            rc, text = run2(["approve", "--staged", "--out", os.path.join(sandbox, "o4.json")])
+            leaked = [n for n in os.listdir(tmp) if n.startswith("gemini_review_out_")] + os.listdir(elsewhere)
+            yield (None if rc == 0 and "사본을 남기지 못했다" in text and not leaked else
+                   "믿을 수 없는 결과 폴더에서 --out 사본이 새거나 경고가 없다: exit %d · 남은 것 %r: %s"
+                   % (rc, leaked, text[-240:]))
+            # [2회차 적대적 렌즈 low] 내부 오류 경로도 같은 경고를 낸다.
+            rc, text = run2(["boom", "--staged", "--out", os.path.join(sandbox, "o5.json")])
+            yield (None if rc == 1 and "사본을 남기지 못했다" in text else
+                   "internal_error 의 --out 사본을 남기지 못했는데 경고가 없다: exit %d: %s" % (rc, text[-240:]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_prepare_linked_worktree(gr):
+    """연결 워크트리에서 준비하면 렌즈의 Read 거부를 미리 알린다(1.10.1).
+
+    ⛔ [26.10.22 실측 — Claude Code 2.1.306 `claude -p`] 연결 워크트리의 준비 diff 는 `.git/worktrees/<이름>/` 에
+      놓여 작업 폴더 밖이다. 권한 모드 default 에서 렌즈의 Read 가 거부됐다(auto · `--add-dir` 은 읽었다).
+      본 저장소(작업 폴더 안 `.git/gemini-review/`)에서는 알리지 않는다 — 늘 뜨는 경고는 읽히지 않는다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_wt_")
+    try:
+        env = _gate_env(sandbox)
+        main = os.path.join(sandbox, "main")
+        linked = os.path.join(sandbox, "linked")
+        os.makedirs(main)
+
+        def git(cwd, *args):
+            subprocess.run(["git"] + list(args), cwd=cwd, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def write(cwd, text):
+            with io.open(os.path.join(cwd, "a.py"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        git(main, "init", "-q")
+        write(main, "a = 1\n")
+        git(main, "add", "a.py")
+        git(main, "commit", "-qm", "init")
+        git(main, "worktree", "add", "-q", linked)
+        sub = os.path.join(main, "sub")
+        os.makedirs(sub)
+        # [1.10.1 대체 리뷰 적대적 렌즈 low] 기준은 실행한 폴더다 — 하위 폴더에서 열면 본 저장소의 `.git/` 도 밖이다.
+        linked_dir = os.path.join(main, ".git", "worktrees", "linked", "gemini-review")
+        quoted = "⚠ 렌즈가 읽을 폴더가 작업 폴더 밖이다"
+        with io.open(os.path.join(_ROOT, "plugins", "gemini-review", "skills", "gemini-review", "SKILL.md"),
+                     encoding="utf-8") as fh:
+            skill = fh.read()
+        # [2회차 적대적 렌즈 medium] 하위 폴더는 diff 폴더가 아니라 **저장소 루트**를 더해야 맥락 파일도 읽힌다.
+        # [3회차 적대적 렌즈 low] 하나라도 밖이면 루트와 diff 폴더를 함께 안내한다(루트가 품으면 루트 하나).
+        for label, cwd, text, want in (("본 저장소", main, "a = 2\n", []),
+                                       ("연결 워크트리", linked, "a = 3\n", [linked, linked_dir]),
+                                       ("하위 폴더", sub, "a = 4\n", [main])):
+            run = _review_runner(cwd, env)
+            write(cwd, text)
+            git(cwd, "add", "a.py")
+            rc, _out = run(["quota", "--staged"])
+            rc2, out = run(["--staged", "--prepare-fallback"], child=False)
+            said = [os.path.normcase(os.path.realpath(p)) for p in re.findall(r"`/add-dir ([^`]+)`", out)]
+            want = [os.path.normcase(os.path.realpath(p)) for p in want]
+            yield (None if rc == 4 and rc2 == 0 and said == want else
+                   "%s 준비가 /add-dir 로 더할 폴더를 잘못 안내한다: exit %d → %d · 기대 %r · 안내 %r: %s"
+                   % (label, rc, rc2, want, said, out[-240:]))
+            if want:
+                # [3회차 네 렌즈 low] SKILL.md 는 이 경고 줄을 조건으로 건다 — 문서가 인용한 문구를 코드가 실제로 찍는다.
+                yield (None if quoted in out and ("`%s`" % quoted) in skill else
+                       "SKILL.md 가 인용한 준비 경고(%r)를 %s 준비가 찍지 않거나 문서에 없다: %s"
+                       % (quoted, label, out[-240:]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
 _AGENTS_DIR = os.path.join(_ROOT, "plugins", "gemini-review", "agents")
 _LENS_READ_ONLY_TOOLS = frozenset(("Read", "Grep", "Glob"))
 
@@ -4091,12 +4323,12 @@ def _check_fallback_lenses_have_agents(gr):
         yield (None if "`--staged --prepare-fallback`" in text and word in text
                and "--out" not in text else
                "대체 리뷰 안내 [%s] 에 범위 인자 · '%s' 가 없다: %s" % (mode, word, text))
-    # `--out` 으로 돈 결과는 준비가 보지 않는다 — 막다른 명령만 권하지 않는다.
+    # [1.10.1] `--out` 결과도 결과 폴더에 사본이 남아 준비가 본다 — "--out 없이 다시" 를 권하지 않는다.
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         gr._say_fallback_hint("timeout", ap.parse_args(["--staged", "--out", "r.json"]), None)
-    yield (None if "--out 없이" in buf.getvalue() else
-           "대체 리뷰 안내가 --out 결과의 막다른 길을 알리지 않는다: %s" % buf.getvalue())
+    yield (None if "`--staged --prepare-fallback`" in buf.getvalue() and "--out 없이" not in buf.getvalue() else
+           "--out 결과 뒤 대체 리뷰 안내가 낡았다: %s" % buf.getvalue())
 
     # 버린 준비가 코드 전문을 오래 남기지 않는다 — 하루 지난 것만, 준비 파일만 지운다.
     folder = tempfile.mkdtemp(prefix="gr_test_sweep_")
@@ -4428,6 +4660,8 @@ _BEHAVIOR_CHECKS = (
     _check_gate_path_commit,
     _check_gate_fallback_record,
     _check_fallback_lenses_have_agents,
+    _check_out_copies_to_result_dir,
+    _check_prepare_linked_worktree,
     _check_gate_scopes_results_to_repo,
     _check_gate_unknown_target_is_strict,
     _check_gate_fails_closed,

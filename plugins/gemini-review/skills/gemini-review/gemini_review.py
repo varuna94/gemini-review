@@ -235,7 +235,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.10.1"
+__version__ = "1.10.2"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # [1.8.0] **대체 주 모델.** 사용자 지시(26.10.13 확인): "pro-high 가 agy models 에 없는 동안에는
@@ -281,6 +281,33 @@ _PROBE_TIMEOUT = "60s"
 #   가장 큰 낭비가 된다. 그래서 **바깥에서도** 벽시계 상한을 건다. agy 가 스스로
 #   끝낼 여유를 주려고 자기 타임아웃보다 넉넉하게 둔다.
 _HARD_TIMEOUT_MARGIN = 120
+
+
+_SINCE_MAX_SECONDS = 100 * 365 * 86400
+
+
+def _since_seconds(spec: str) -> Optional[int]:
+    """`--stats --since` 기간을 초로. `d`(일) · `h` · `m` · `s` · 단위 없는 초를 읽고, 읽지 못하면 None(1.10.2).
+
+    ⛔ [1.10.2 작업 중 발견] `--since` 도움말은 1.5.0 부터 "d(일) · h(시간) 단위 (기본 14d)" 인데 `_duration_seconds` 는
+      `d` 를 읽지 못해, `--since 30d` 가 **조용히 14일**로 집계됐다(기본값 14d 와 우연히 같아 드러나지 않았다).
+      `_duration_seconds` 에 `d` 를 더하지 않는다 — 그쪽은 agy 에 그대로 넘기는 `--timeout` 도 읽는다.
+    ⛔ [1.10.2 대체 리뷰 1회차 일반 렌즈 low] 읽지 못하면 None 을 돌려 호출부가 **알리게** 한다 — 조용히 기본값으로
+      떨어지는 길이 바로 위 결함을 1.5.0 부터 숨겼다(`2w` · `30days` 도 14일이었다).
+    """
+    text = (spec or "").strip().lower()
+    mult = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+    num, unit = (text[:-1], text[-1]) if text[-1:] in mult else (text, "s")
+    try:
+        secs = float(num) * mult[unit]
+    except ValueError:
+        return None
+    # 0 · 음수 · inf · nan 과 100년이 넘는 기간은 읽지 못한 것으로 본다 — [2회차 보안 · 일반 렌즈 low] 상한을 단위를
+    #   곱하기 전 값에 걸어 `800000d` 가 날짜 하한을 넘겨 OverflowError(internal_error)로 끝났다.
+    #   [3회차 적대적 렌즈 low] 하한은 1초다 — `0.5` 가 검사를 지난 뒤 0 으로 내림돼 경고 없이 0건이 됐다.
+    if not (1 <= secs <= _SINCE_MAX_SECONDS):
+        return None
+    return int(secs)
 
 
 def _duration_seconds(spec: str, default: int) -> int:
@@ -780,7 +807,9 @@ def main(argv=None) -> int:
     # `calls` · `diff_sha256` 은 `_main` 이 채운다 — `internal_error` 는 `finish` 를 거치지
     #   않으므로(아래 except), 여기에 없으면 **토큰을 태운 회차가 집계에서 통째로 빠진다**
     #   (Eng H4 · H1). `calls` 는 같은 리스트 객체를 공유해 추가가 그대로 보인다.
-    ctx = {"out": None, "tmpdir": None, "model": None, "calls": [], "diff_sha256": None}
+    # [1.10.2] `run_id` — 같은 실행의 `--out` 파일과 결과 폴더 사본을 `--stats` 가 한 번만 세게 한다.
+    ctx = {"out": None, "tmpdir": None, "model": None, "calls": [], "diff_sha256": None,
+           "run_id": os.urandom(8).hex()}
     try:
         return _main(argv, ctx)
     except (_Interrupted, KeyboardInterrupt) as exc:
@@ -809,8 +838,10 @@ def main(argv=None) -> int:
             if ctx["model"]:
                 body["model"] = ctx["model"]
             payload = _result("internal_error", body, EXIT_PARSE_FAILED, model=ctx["model"],
-                              calls=ctx["calls"] or None, diff_sha256=ctx["diff_sha256"])
-            if _write_out(ctx["out"], payload, quiet=bool(ctx["out"])) and ctx["out"]:
+                              calls=ctx["calls"] or None, diff_sha256=ctx["diff_sha256"],
+                              run_id=ctx.get("run_id"))
+            written = _write_out(ctx["out"], payload, quiet=bool(ctx["out"]))
+            if written and ctx["out"]:
                 # [1.10.1 대체 리뷰 배선 렌즈 low] `finish` 와 같은 계약 — `--out` 이어도 결과 폴더에 사본을 남긴다.
                 #   [2회차 적대적 렌즈 low] 남기지 못하면 `finish` 처럼 알린다.
                 if not _copy_to_result_dir(payload):
@@ -932,6 +963,7 @@ def _main(argv, ctx: dict) -> int:
             # [1.8.0] 대체 주 모델이 판정했다 — 원래 요청한 모델을 남긴다(`_meta.model` 은 대체 모델).
             meta["requested_model"] = state["requested_model"]
         meta["calls"] = calls
+        meta["run_id"] = ctx.get("run_id")
         meta["elapsed_seconds"] = round(time.time() - started, 1)
         if state["diff_sha256"]:
             meta["diff_sha256"] = state["diff_sha256"]
@@ -1096,33 +1128,10 @@ def _main(argv, ctx: dict) -> int:
     #   · agy 미설치는 여전히 exit 2 다(처방이 뒤집히면 안 된다).
     #   · tmpdir 앞이어야 **보내지 않을 diff 를 디스크에 쓰지 않는다**(잔류 사고 2회 이력).
     if not args.ignore_quota_cache:
-        state_path = _quota_guard(_quota_state_path)
-        models = _quota_guard(_load_quota_state, state_path) or {}
-        hit = _quota_guard(_quota_short_circuit, agy, args.model, root,
-                           state_path, models, calls)
+        hit = _quota_cache_hit(agy, args.model, root, calls)
         if hit:
-            reset, entry, source, buckets = hit
-            streak = int(entry.get("cached_hits") or 0)
-            since = _parse_utc(entry.get("blocked_since"))
-            _say_not_reviewed(
-                "구독 사용량 한도에 걸려 있다(%s) — agy 를 부르지 않았다" % args.model,
-                "[%s 기록 당시 원문] %s" % (entry.get("recorded_at") or "?",
-                                        entry.get("detail") or "쿼터 한도"),
-                "%s 이 지난 뒤 **같은 모델로** 다시 돌릴 것. 모델을 낮추지 않는다."
-                % _fmt_until(reset))
-            # ⛔ [DX critical] 단락은 609초를 0.1초로 만든다 — 사람이 **게이트가 없다는 사실
-            #   자체를** 못 보게 된다. 누적을 화면에 적어 그 부재를 보이게 한다.
-            if streak >= _QUOTA_STREAK_WARN:
-                hours = int((_utc_now() - since).total_seconds() // 3600) if since else None
-                _safe_print("   ⚠ 이 기기에서 게이트 없이 %d회째다%s."
-                            % (streak, " · 멈춘 지 %d시간" % hours if hours else ""))
-            return finish("quota_exhausted", {
-                "error": entry.get("detail") or "쿼터 한도",
-                "retry_after": _fmt_hms(int((reset - _utc_now()).total_seconds())) or None,
-                "note": "agy 구독 사용량 한도로 리뷰가 수행되지 않았다. 통과가 아니다."},
-                quota_cached=True, quota_source=source,
-                quota_cached_streak=streak,
-                quota_buckets=[b.get("id") for b in buckets] or None)
+            mode, body, extra = _quota_cached_result(hit, args.model)
+            return finish(mode, body, **extra)
 
     # ⛔ **정리를 등록해 두고 만든다** — `mkdtemp` 만 하면 지워지지 않는다.
     #   이 결함은 **두 번째**다. 처음엔 `/tmp` 에 50개 1.5MB 가 쌓였고 그 안에
@@ -1168,6 +1177,13 @@ def _main(argv, ctx: dict) -> int:
         _say_standin(model, standin, why)
         state["requested_model"] = model
         args.model = model = ctx["model"] = standin
+        # ⛔ [1.10.2] 대체 주 모델의 쿼터 기록도 단락한다. 첫 단락(위)은 기본 모델로 검사하는데 쿼터 기록은 대체 주
+        #   모델에 남아, 쿼터가 소진된 동안에도 실행마다 대체 주 모델로 실제 요청을 보냈다(26.10.22 실측 · 1.10.1 TODOS).
+        #   기본 모델 호출(모델 없음 · 0초)과 목록 조회는 그대로 든다 — 대체 주 모델을 알려면 필요하다.
+        hit = None if args.ignore_quota_cache else _quota_cache_hit(agy, model, root, calls)
+        if hit:
+            mode, body, extra = _quota_cached_result(hit, model, standin=True)
+            return finish(mode, body, **extra)
         run = _invoke_schema(agy, model, args, root, schema_path, prompt)
         cause, kind, detail = _classify_run(run, structured=True)
         calls.append(_call_record("structured", model, run, cause, kind, detail))
@@ -1648,8 +1664,10 @@ def _folders_outside_session(root: str, diff_path: str) -> List[str]:
     `.git/gemini-review` 도 덮이므로, diff 폴더는 루트 밖일 때(연결 워크트리 · 서브모듈)만 따로 더한다.
     ⛔ [1.10.1 대체 리뷰 2회차 적대적 렌즈 medium] 처음엔 diff 폴더만 안내했다. 하위 폴더에서 연 세션은 그대로 하면
       diff 는 읽히고 맥락 파일 · 저장소 파일은 거부돼, diff_read true 인 맥락 없는 리뷰가 기록될 수 있었다.
-    ⚠ 작업 폴더는 **실행한 폴더**(`os.getcwd()`)로 갈음한다. 세션을 연 폴더를 알려 주는 환경 변수는 Bash 에 없고,
-      Bash 는 `cd` 를 이어 가며, Claude Code 2.1.301 은 그 폴더를 기본 작업 폴더로 고쳐 알린다(26.10.22 관찰).
+    ⚠ 작업 폴더는 **실행한 폴더**(`os.getcwd()`)로 갈음한다 — 세션을 연 폴더를 알려 주는 환경 변수는 Bash 에 없다.
+      [1.10.2 실측, `claude -p` default] Read 권한은 Bash 위치가 아니라 세션의 작업 폴더(+ `--add-dir`)를 따르고,
+      Bash 는 그 밖으로 `cd` 하지 못한다(차단). 그래서 실행 폴더는 늘 세션 작업 폴더 안이고, 이 판정은 필요 없는
+      `/add-dir` 를 묻는 쪽(세션 폴더의 하위 폴더에서 실행 · 무해)으로만 틀린다. 상위 폴더 `--add-dir` 도 읽혔다.
     ⛔ [3회차 적대적 렌즈 low] 그래서 **하나라도 밖이면 둘 다** 안내한다. 세션은 본 저장소에서 열고 형제 폴더의 연결
       워크트리로 `cd` 해 준비하면, 실행 폴더 기준으로는 루트가 안이라 diff 폴더만 안내됐다 — Read 권한이 세션 폴더를
       따르면 diff 만 읽히고 맥락 파일은 거부되는 조용한 실패다. 필요 없는 `/add-dir` 는 무해하다.
@@ -2056,6 +2074,7 @@ def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]
     if cause != "ok":
         mark("모델 응답", False, "%s · %s%s" % (args.model, cause, " · " + detail if detail else ""),
              EXIT_NOT_REVIEWED if cause in ("timeout", "quota", "empty") else EXIT_TOOL_ERROR)
+        _check_quota_group(agy, args.model, where, calls, mark)     # ④ 는 토큰 0 — 쿼터 소진 중에 가장 쓸모 있다
         return done()
     # ⚠ 래퍼를 **먼저** 본다. 형식이 바뀌어 `response` 를 못 찾으면 OK 판별도 틀리는데, 그것을
     #   "모델 무응답(4)" 으로 적으면 기다리라는 뜻이 된다 — 고칠 것은 이 스크립트다(2).
@@ -2116,13 +2135,56 @@ def _check_agy_surface(agy: str, args, where: str, mark, done, calls: List[dict]
          "없는 모델명을 알아봤다" if cause == "model_unavailable" else
          "없는 모델명을 %s 로 읽었다%s — agy 문구가 바뀌었을 수 있다"
          % (cause, " (" + detail + ")" if detail else ""))
+
+    # ③-b [1.10.2] 텍스트 호출(생존 확인 · 텍스트 재시도)도 없는 모델명을 알아보는가. 1.10.1 부터 텍스트 호출의 원인은
+    #   stderr 로만 가른다(`_failure_signal` · agy 1.4.4 실측: stdout 이 빈 채 stderr 에만 안내). agy 가 안내를 stdout 으로
+    #   옮기면 생존 확인의 모델 없음이 도구 오류가 돼 진단 모델 재선택이 조용히 꺼진다(반복 실패 10 계열).
+    #   ⚠ 프롬프트를 생존 확인과 다르게 둔다 — 테스트의 가짜 agy 가 이 호출을 생존 확인과 가른다.
+    run = _run_agy(agy, _CHECK_NO_SUCH_MODEL, ["--output-format", "text", "--print-timeout", "30s",
+                                               "-p", _CHECK_TEXT_PROMPT], where, "30s", 30)
+    cause, kind, detail = _classify_run(run, structured=False)
+    calls.append(_call_record("check_no_model_text", _CHECK_NO_SUCH_MODEL, run, cause, kind, detail))
+    mark("모델 없음 안내(텍스트)", cause == "model_unavailable",
+         "텍스트 출력에서도 없는 모델명을 알아봤다" if cause == "model_unavailable" else
+         "텍스트 출력에서 없는 모델명을 %s 로 읽었다%s — agy 가 안내를 stderr 밖으로 옮겼을 수 있다"
+         % (cause, " (" + detail + ")" if detail else ""))
+
+    _check_quota_group(agy, args.model, where, calls, mark)
     return done()
+
+
+def _check_quota_group(agy: str, model: str, where: str, calls: List[dict], mark) -> None:
+    """`--check` ④ — 판정 모델이 `/quota` 쿼터 그룹 하나에 대응하는가(토큰 0, 1.10.2).
+
+    [2회차 배선 렌즈 질문] 주 모델이 쿼터 · 무응답이라 점검이 일찍 끝나는 길에서도 부른다 — 그룹 대응이 쓰이는
+    때(차단 기록 · 429)가 바로 쿼터 소진 중이고, "exit 4 가 이어지면 --check" 를 권한다.
+    """
+    # ④ [1.10.2 대체 리뷰 1회차 적대적 렌즈 질문] 판정 모델이 `/quota` 그룹 하나에 대응하는가(토큰 0). 26.10.22 에
+    #   `Gemini 4 Argon` 그룹이 생기자 대응이 조용히 None 이 돼 쿼터 확인이 저장된 추정값으로만 돌았다 — 그룹 이름 ·
+    #   설명이 다시 바뀌면 같은 증상이 돌아오므로 여기서 알린다. 조회 자체를 못 하면 참고만 한다.
+    groups = _quota_query(agy, model, where, calls)
+    if groups is None:
+        # [2회차 일반 렌즈 low] agy 가 답했는데(rc 0) 모양을 읽지 못한 것은 형식 변화다 — 일시 오류와 갈라 빨간불로 올린다.
+        answered = bool(calls) and calls[-1].get("stage") == "quota_query" and calls[-1].get("cause") == "ok"
+        mark("쿼터 그룹", False if answered else None,
+             "`/quota` 가 답했는데 형식을 읽지 못했다 — agy 판이 바뀌어 쿼터 확인이 저장된 추정값으로만 돈다"
+             if answered else "`/quota` 를 읽지 못했다(agy 오류) — 쿼터 확인은 저장된 추정값으로만 돈다")
+    else:
+        group = _quota_group_for_model(groups, model)
+        names = [str(g.get("name")) for g in groups if isinstance(g, dict)]
+        mark("쿼터 그룹", group is not None,
+             "%s → %s" % (model, group.get("name")) if group is not None else
+             "%s 를 쿼터 그룹 하나에 대응시키지 못했다(그룹: %s) — 쿼터 확인은 저장된 추정값으로만 돈다(막지 않는 "
+             "쪽이라 안전하다). 고칠 것은 스크립트의 대응 규칙(_quota_group_for_model)이다"
+             % (model, ", ".join(names) or "없음"))
 
 
 # 1초 안에 끝나지 않을 만큼 출력이 긴 요청 — 시간 초과 안내문을 일부러 부른다(코드는 보내지 않는다).
 _CHECK_SLOW_PROMPT = "Write the integers from 1 to 400, one per line, with no other text."
 # agy 가 모를 것이 분명한 모델명. 이름 자체가 점검용임을 드러낸다.
 _CHECK_NO_SUCH_MODEL = "gemini-review-check-no-such-model"
+# [1.10.2] ③-b 텍스트 모드 점검의 프롬프트 — 없는 모델이라 모델에 닿지 않는다(토큰 0).
+_CHECK_TEXT_PROMPT = "Reply with the single word OK (text output check)."
 
 
 def _check_model_list_notes(args, ids: List[str], mark) -> None:
@@ -2190,7 +2252,7 @@ def _probe_cause(alive: bool, run: "_AgyRun") -> Tuple[str, str, str]:
 
 
 # 텍스트 출력이라 래퍼가 없는 단계. 나머지는 `--output-format json` 이라 래퍼가 있다.
-_TEXT_OUTPUT_STAGES = frozenset(("probe", "text", "models"))
+_TEXT_OUTPUT_STAGES = frozenset(("probe", "text", "models", "check_no_model_text"))
 # `--stats` 의 토큰 집계에서 빼는 단계 — 에이전트 턴이 없거나(조회) 무시할 만한(한 줄 확인) 호출이다.
 #   ⚠ `text` 는 빼지 않는다. 리뷰 토큰을 썼는데 래퍼가 없어 **알 길이 없다** 는 것이 "토큰 불완전" 이다.
 _NO_TOKEN_STAGES = frozenset(("quota_query", "probe", "models"))
@@ -2349,6 +2411,8 @@ def _result_file_name() -> str:
     return "gemini_review_%s_%d.json" % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid())
 
 
+# [1.10.2] 결과 폴더의 보존 기한(일). 이보다 오래된 결과 파일은 새 결과를 쓸 때 지운다(`_sweep_old_results`).
+_RESULT_RETENTION_DAYS = 90
 _COPY_FAILED_NOTE = ("⚠ 결과 폴더에 사본을 남기지 못했다(쓰기 실패 · 믿을 수 없는 폴더) — 게이트 · 대체 리뷰 판단 · "
                      "--stats 가 이 결과를 보지 못한다.")
 
@@ -2361,11 +2425,53 @@ def _copy_to_result_dir(payload: dict) -> bool:
       공유 %TEMP%) 남기지 않는다. 처음엔 `_write_out(None, …)` 이라 `_default_result_dir` 의 임시 폴더 대체를 탔다 —
       게이트 · `_attempts` 는 신뢰 상태가 ok 인 폴더만 읽으므로 아무도 보지 않는 사본(코드가 인용된 지적)이 실행마다
       임시 폴더에 쌓이고, "사본을 남기지 못했다" 경고도 뜨지 않았다.
+    ⛔ [1.10.2 대체 리뷰 1회차 일반 렌즈 low] `--out` 이 이미 결과 폴더 안의 결과 파일이어도 **사본을 남긴다.** 처음엔
+      건너뛰었는데(`--stats` 중복 집계를 막으려고), 같은 `--out` 이름을 다시 쓰면 앞 실행의 Gemini 지적(exit 5)이
+      덮여 응답 이력에서 사라졌다. 중복 집계는 `--stats` 가 `_meta.run_id` 로 거른다.
     """
     d, status = _state_dir(create=True)
     if d is None or status != "ok":
         return False
-    return _write_out(os.path.join(d, _result_file_name()), payload, quiet=True) is not None
+    if _write_out(os.path.join(d, _result_file_name()), payload, quiet=True) is None:
+        return False
+    # `--out` 을 주면 `_write_out(args.out, …)` 은 정리하지 않는다 — 이 자리가 그 실행의 유일한 정리 경로다.
+    _sweep_old_results()
+    return True
+
+
+def _is_result_name(name: str) -> bool:
+    """결과 폴더에서 게이트 · 응답 이력 · `--stats` 가 읽는 결과 파일 이름인가."""
+    return name.startswith("gemini_review_") and name.endswith(".json")
+
+
+def _sweep_old_results() -> None:
+    """결과 폴더에서 보존 기한(`_RESULT_RETENTION_DAYS`)이 지난 결과 파일을 지운다(1.10.2).
+
+    ⛔ [1.10.1 2회차 보안 렌즈 질문 → 1.10.2] 결과 파일에는 코드가 인용된 지적이 담기는데 정리 코드가 없어 무기한
+      쌓였다. 1.10.1 부터는 `--out` 결과도 사본이 남는다. 결과를 쓸 때마다 오래된 것을 지운다.
+    ⚠ 신뢰 상태가 ok 인 결과 폴더만 만진다(링크 · 남의 소유면 손대지 않는다). 쿼터 상태 파일 · 준비 diff 는 대상이
+      아니다(이름이 다르다). `--stats --since` 가 기한보다 길면 그 앞은 집계되지 않는다(`_run_stats` 가 알린다).
+    ⚠ [1.10.2 대체 리뷰 1회차 보안 렌즈 low] 대체 리뷰 거부의 근거(같은 diff 에 Gemini 가 낸 지적 · 텍스트 리뷰)도
+      결과 파일이라 90일이 지나면 지워진다 — 같은 스테이징을 90일 넘게 그대로 두면 그 지적은 더는 대체 리뷰를 막지
+      않는다. 지적을 정리에서 빼면 코드가 인용된 지적이 다시 무기한 남으므로 기한을 문서에 밝히는 쪽을 골랐다.
+    """
+    d, status = _state_dir(create=False)
+    if d is None or status != "ok":
+        return
+    cutoff = time.time() - _RESULT_RETENTION_DAYS * 86400
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        if not _is_result_name(n):
+            continue
+        p = os.path.join(d, n)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.unlink(p)
+        except OSError:
+            pass
 
 
 def _write_out(out_path: Optional[str], payload: dict,
@@ -2384,6 +2490,8 @@ def _write_out(out_path: Optional[str], payload: dict,
         if not quiet:
             _safe_print("결과 저장 실패: %s" % exc)
         return None
+    if out_path is None:
+        _sweep_old_results()             # [1.10.2] 결과 폴더 보존 기한
     if not quiet:
         _safe_print("")
         _safe_print("결과 저장: %s" % path)
@@ -2418,8 +2526,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action=_PrintVersion)
     ap.add_argument("--check", action="store_true",
                     help="코드를 보내지 않고 python · git · agy · 로그인 · 모델 응답과 agy 출력 "
-                         "형식(시간 초과 · 모델 없음 안내)을 점검한다. 0 정상 · 2 설치 · 인증 · "
-                         "형식 문제 · 4 무응답 · 쿼터")
+                         "형식(시간 초과 · 모델 없음 안내 · 텍스트 출력 · 쿼터 그룹)을 점검한다. "
+                         "0 정상 · 2 설치 · 인증 · 형식 문제 · 4 무응답 · 쿼터")
     ap.add_argument("--base", default="HEAD~1",
                     help="비교 기준 (기본 HEAD~1). merge-base 기준 3-dot 이다")
     ap.add_argument("--head", default="HEAD", help="비교 끝 (기본 HEAD)")
@@ -2770,12 +2878,34 @@ def _quota_group_for_model(groups: List[dict], model: str) -> Optional[dict]:
     모델 id 의 첫 토큰(`gemini-3.1-pro-high` → `gemini`)을 그룹 이름에서 찾는다.
     ⚠ 0개거나 2개 이상이면 None 을 돌려 **막지 않는다.** 비대칭이 분명하다 — 잘못 막으면
       그 기기의 커밋 게이트가 사라지고, 못 막으면 609초를 한 번 더 태울 뿐이다.
+    ⛔ [1.10.2 실측] 26.10.22 부터 `Gemini 4 Argon` 그룹이 따로 생겨 `gemini` 가 두 그룹에 걸렸다 — 대응이 None 이 돼
+      `/quota` 확인이 **조용히 꺼지고** 저장된 추정값만 쓰였다(`_meta.quota_source: cached`). 둘 이상이면 모델 id 의
+      나머지 낱말(판 · 등급 접미사 제외: flash · pro · argon)로 좁힌다 — 그룹 **이름**에 있으면 그 그룹, 아니면 그룹
+      **설명**의 "gemini flash" · "gemini pro" 꼴(실측 설명: "Models within this group: Gemini Flash, Gemini Pro").
+      낱말 하나만 찾지 않는 것은 Argon 그룹 설명에도 "paid Pro plans" 가 있기 때문이다.
     """
-    token = (model or "").strip().lower().split("-")[0]
+    parts = (model or "").strip().lower().split("-")
+    token = parts[0]
     if not token:
         return None
     hits = [g for g in groups
             if isinstance(g, dict) and token in str(g.get("name", "")).lower()]
+    words = [w for w in parts[1:] if w and not w[0].isdigit() and w not in ("high", "medium", "low")]
+
+    def says(g, w):
+        text = (str(g.get("name", "")) + " " + str(g.get("description", ""))).lower()
+        return re.search(r"\b%s\b" % re.escape(w), text) is not None
+
+    if len(hits) == 1 and words and not any(says(hits[0], w) for w in words) and any(
+            says(g, w) for g in groups if isinstance(g, dict) and g is not hits[0] for w in words):
+        # [2회차 적대적 렌즈 low] 계열 토큰이 그룹 하나에만 걸려도, 모델 낱말(flash 등)이 그 그룹엔 없고 **다른 그룹에**
+        #   있으면 엉뚱한 그룹이다(예: "Flash and Pro models" · "Gemini 4 Argon" 이면 flash 가 Argon 에 붙었다).
+        return None
+    if len(hits) > 1:
+        by_name = [g for g in hits if any(re.search(r"\b%s\b" % re.escape(w), str(g.get("name", "")).lower())
+                                          for w in words)]
+        hits = by_name or [g for g in hits
+                           if any("%s %s" % (token, w) in str(g.get("description", "")).lower() for w in words)]
     return hits[0] if len(hits) == 1 else None
 
 
@@ -2875,6 +3005,43 @@ def _quota_short_circuit(agy: str, model: str, cwd: str, state_path: Optional[st
     models[model] = entry
     _save_quota_state(state_path, models)
     return cached_reset, entry, "cached", []
+
+
+def _quota_cache_hit(agy: str, model: str, cwd: str, calls: List[dict]):
+    """`model` 에 기록된 쿼터 차단이 아직 유효하면 `_quota_short_circuit` 의 결과, 아니면 None(1.10.2)."""
+    state_path = _quota_guard(_quota_state_path)
+    models = _quota_guard(_load_quota_state, state_path) or {}
+    return _quota_guard(_quota_short_circuit, agy, model, cwd, state_path, models, calls)
+
+
+def _quota_cached_result(hit, model: str, standin: bool = False) -> Tuple[str, dict, dict]:
+    """기록된 쿼터 차단으로 리뷰를 요청하지 않고 끝낼 때의 `(mode, body, _meta 필드)`. 화면 안내도 여기서 한다.
+
+    `standin` 이면 대체 주 모델 단락이다 — 그때는 기본 모델 확인 · 목록 조회를 이미 했으므로 "agy 를 부르지 않았다"
+    가 사실이 아니다(1.10.2 대체 리뷰 1회차 적대적 렌즈 질문).
+    """
+    reset, entry, source, buckets = hit
+    streak = int(entry.get("cached_hits") or 0)
+    since = _parse_utc(entry.get("blocked_since"))
+    _say_not_reviewed(
+        ("구독 사용량 한도에 걸려 있다(%s) — 대체 주 모델로 리뷰를 요청하지 않았다" if standin else
+         "구독 사용량 한도에 걸려 있다(%s) — agy 를 부르지 않았다") % model,
+        "[%s 기록 당시 원문] %s" % (entry.get("recorded_at") or "?",
+                                entry.get("detail") or "쿼터 한도"),
+        "%s 이 지난 뒤 **같은 모델로** 다시 돌릴 것. 모델을 낮추지 않는다."
+        % _fmt_until(reset))
+    # ⛔ [DX critical] 단락은 609초를 0.1초로 만든다 — 사람이 **게이트가 없다는 사실
+    #   자체를** 못 보게 된다. 누적을 화면에 적어 그 부재를 보이게 한다.
+    if streak >= _QUOTA_STREAK_WARN:
+        hours = int((_utc_now() - since).total_seconds() // 3600) if since else None
+        _safe_print("   ⚠ 이 기기에서 게이트 없이 %d회째다%s."
+                    % (streak, " · 멈춘 지 %d시간" % hours if hours else ""))
+    return "quota_exhausted", {
+        "error": entry.get("detail") or "쿼터 한도",
+        "retry_after": _fmt_hms(int((reset - _utc_now()).total_seconds())) or None,
+        "note": "agy 구독 사용량 한도로 리뷰가 수행되지 않았다. 통과가 아니다."}, dict(
+        quota_cached=True, quota_source=source, quota_cached_streak=streak,
+        quota_buckets=[b.get("id") for b in buckets] or None)
 
 
 def _record_quota_block(agy: str, model: str, cwd: str, detail: str,
@@ -2991,6 +3158,8 @@ def _stats_read(path: str) -> Optional[dict]:
             or scope.get("head_sha"),
             "diff_sha256": meta.get("diff_sha256"),
             "diff_bytes": meta.get("diff_bytes"),
+            # [3회차 보안 렌즈 low] 문자열일 때만 받는다 — 리스트 하나가 집합 조회에서 TypeError 로 `--stats` 를 죽였다.
+            "run_id": meta.get("run_id") if isinstance(meta.get("run_id"), str) else None,
             "quota_cached": bool(meta.get("quota_cached")),
             "findings": len(body.get("findings") or []) if isinstance(
                 body.get("findings"), list) else 0,
@@ -3061,7 +3230,15 @@ def _run_stats(args) -> int:
             _safe_print("   --stats-dir 로 폴더를 직접 지정하거나 폴더 권한을 확인할 것.")
             return EXIT_TOOL_ERROR
 
-    since = _utc_now() - timedelta(seconds=_duration_seconds(args.since, 14 * 86400))
+    window = _since_seconds(args.since)
+    if window is None:
+        _safe_print("⚠ --since %r 를 읽지 못해 기본 14일로 집계한다(d · h · m · s 단위)." % args.since)
+        window = 14 * 86400
+    since = _utc_now() - timedelta(seconds=window)
+    if not args.stats_dir and window > _RESULT_RETENTION_DAYS * 86400:
+        # [1.10.2] 결과 폴더는 보존 기한이 지난 결과를 지운다(`_sweep_old_results`) — 0건을 "리뷰가 없었다" 로 읽지 않게.
+        _safe_print("⚠ 결과 폴더는 %d일이 지난 결과를 지운다 — 그보다 앞선 기간은 집계되지 않는다."
+                    % _RESULT_RETENTION_DAYS)
     try:
         names = [n for n in os.listdir(base)
                  if n.startswith("gemini_review_") and n.endswith(".json")]
@@ -3080,11 +3257,17 @@ def _run_stats(args) -> int:
         paths = paths[:_STATS_FILE_CAP]
 
     rows, unreadable = [], 0
+    seen_runs = set()
     for path in paths:
         row = _stats_read(path)
         if row is None:
             unreadable += 1
             continue
+        # [1.10.2] `--out` 이 결과 폴더 안이면 그 파일과 사본이 같은 실행이다 — `_meta.run_id` 로 한 번만 센다.
+        if row.get("run_id"):
+            if row["run_id"] in seen_runs:
+                continue
+            seen_runs.add(row["run_id"])
         if row["written_at"] is None or row["written_at"] >= since:
             rows.append(row)
 

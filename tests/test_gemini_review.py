@@ -405,7 +405,8 @@ def _check_agy_calls_are_plan_mode(gr):
                 _patched(gr, "_git_root", lambda start: "."):
             invoke()
         # [1.9.0] `_run_check` 는 모델 목록 · 주 모델 · 시간 초과 안내 · 모델 없음 안내 넷을 부른다.
-        want = 4 if name == "_run_check" else 1
+        #   [1.10.2] 텍스트 출력의 모델 없음 안내(③-b) · 쿼터 그룹 조회(④)가 더해져 여섯이다.
+        want = 6 if name == "_run_check" else 1
         if len(calls) != want:
             yield "%s 가 agy 를 %d번 불렀다 (기대 %d번)" % (name, len(calls), want)
             continue
@@ -2715,6 +2716,17 @@ def _check_small_parsers(gr):
         yield (None if got == want else "_duration_seconds(%r) → %r (기대 %r)" % (spec, got, want))
     yield (None if gr._quota_reset_hint(_QUOTA_MSG) == "23m10s" and gr._quota_reset_hint("quota") == "" else
            "쿼터 재설정 시각을 못 읽는다: %r" % gr._quota_reset_hint(_QUOTA_MSG))
+    # [1.10.2] `--stats --since` 는 도움말대로 d(일)를 읽는다 — 1.5.0 부터 `30d` 가 조용히 14일이었다.
+    #   [1.10.2 대체 리뷰 1회차 일반 렌즈 low] 읽지 못하면 None — 호출부가 알린다(조용히 14일로 떨어지지 않는다).
+    #   [2회차 보안 · 일반 렌즈 low] 상한은 환산한 초에 건다 — `800000d` 가 OverflowError 로 죽지 않고, 단위 없는 큰 초는
+    #   1.10.1 처럼 읽는다.
+    for spec, want in (("30d", 30 * 86400), ("14d", 14 * 86400), ("1.5d", 129600), ("48h", 172800),
+                       ("90m", 5400), ("600", 600), ("20000000", 20000000), ("36500d", 36500 * 86400),
+                       ("800000d", None), ("0.5", None), ("0.000001d", None),
+                       ("abc", None), ("2w", None), ("30days", None),
+                       ("0d", None), ("-3d", None), ("infd", None), ("nand", None), ("", None)):
+        got = gr._since_seconds(spec)
+        yield None if got == want else "--since 기간 _since_seconds(%r) → %r (기대 %r)" % (spec, got, want)
 
 
 def _check_help_survives_cp949(gr):
@@ -2894,6 +2906,7 @@ def _check_standin_model(gr):
         (PR, F): R(0, stdout=_wrap("OK")),
         ("text", F): R(0, stdout=_wrap(""), stderr="[agy] print timeout after 1s with turn in progress; returning partial output"),
         (PR, NO): R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG)),
+        ("text", NO): R(1, stdout="", stderr=_AGY144_NOMODEL_STDERR),
     }
     sandbox = tempfile.mkdtemp(prefix="gr_test_standin_check_")
     try:
@@ -2919,6 +2932,172 @@ def _check_standin_model(gr):
              if gr._may_substitute(args, c)]
     yield (None if not wrong and gr._may_substitute(args, "model_unavailable") else
            "_may_substitute 가 모델 없음 외의 원인에서 바꾼다: %r" % wrong)
+
+
+def _check_standin_quota_short_circuit(gr):
+    """대체 주 모델에 쿼터 차단이 기록돼 있으면 그 모델로 요청하지 않는다(1.10.2).
+
+    ⛔ [26.10.22 실측 · 1.10.1 TODOS] 쿼터 기록은 대체 주 모델(flash)에 남는데 단락은 기본 모델(pro)로만 검사해,
+      쿼터가 소진된 동안에도 실행마다 flash 로 실제 요청을 보냈다(`_meta.quota_cached` 없음).
+    """
+    D, F = gr._DEFAULT_MODEL, gr._STANDIN_MODEL
+    R = gr._AgyRun
+    S, LM = "structured", ("models", "")
+    NOMODEL = R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG), stderr="error: " + _NOMODEL_MSG)
+    entry = {"reset_at": "2099-01-01T00:00:00Z", "recorded_at": "2020-01-01T00:00:00Z",
+             "source": "quota_query", "detail": "한도"}
+    for label, extra, want_log, want_rc in (
+            ("기록 있음 → 대체 주 모델로 요청하지 않는다", [], [(S, D), LM, ("quota_query", F)], 4),
+            ("--ignore-quota-cache 면 요청한다", ["--ignore-quota-cache"], [(S, D), LM, (S, F)], 0)):
+        sandbox = tempfile.mkdtemp(prefix="gr_test_standin_quota_")
+        try:
+            out = os.path.join(sandbox, "o.json")
+            env = _state_env(sandbox)
+            # [2회차 적대적 렌즈 질문] 26.10.22 실측 모양(3그룹 · Gemini Models 주간 버킷 0)으로 /quota 가 차단을 확인한다.
+            fake, log = _agy_script(gr, {(S, D): NOMODEL, ("quota_query", F): R(0, stdout=_quota_payload([
+                {"name": "Gemini Models", "description": "Models within this group: Gemini Flash, Gemini Pro",
+                 "buckets": [{"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0,
+                              "reset_time": "2099-01-01T00:00:00Z"},
+                             {"id": "gemini-5h", "window": "5h", "remaining_fraction": 1}]},
+                {"name": "Claude and GPT models", "description": "Models within this group: Claude Opus",
+                 "buckets": [{"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.5,
+                              "reset_time": "2099-01-01T00:00:00Z"}]},
+                {"name": "Gemini 4 Argon", "description": "For paid Pro plans, Argon quota is separate.",
+                 "buckets": [{"id": "gemini-argon-wtu-weekly", "window": "weekly", "remaining_fraction": 1,
+                              "reset_time": "2099-01-01T00:00:00Z"}]}]))})
+            buf = io.StringIO()
+            with _contained(gr, sandbox), _quiet(), contextlib.redirect_stdout(buf), \
+                    _patched(os, "environ", env), _fake_repo(gr, sandbox), _patched(gr, "_run_agy", fake):
+                os.makedirs(os.path.join(sandbox, "state", "gemini-review"), mode=0o700, exist_ok=True)
+                gr._save_quota_state(gr._quota_state_path(), {F: dict(entry)})
+                rc = gr.main(["--out", out] + extra)
+            meta = _read_json(out).get("_meta") or {}
+            problems = []
+            if rc != want_rc:
+                problems.append("exit %s (기대 %d)" % (rc, want_rc))
+            if log != want_log:
+                problems.append("agy 호출 %r (기대 %r)" % (log, want_log))
+            # [1.10.2 1회차 적대적 렌즈 질문] 이 경로는 기본 모델 · 목록을 이미 불렀다 — "agy 를 부르지 않았다" 가 아니다.
+            if want_rc == 4 and "대체 주 모델로 리뷰를 요청하지 않았다" not in buf.getvalue():
+                problems.append("단락 문구가 대체 주 모델 경로를 말하지 않는다")
+            if want_rc == 4 and not (meta.get("quota_cached") and meta.get("model") == F
+                                     and meta.get("requested_model") == D
+                                     and meta.get("quota_source") == "quota_query"):
+                problems.append("quota_cached %r · model %r · requested_model %r · quota_source %r"
+                                % (meta.get("quota_cached"), meta.get("model"), meta.get("requested_model"),
+                                   meta.get("quota_source")))
+            yield (None if not problems else "대체 주 모델 쿼터 단락 [%s]: %s" % (label, " · ".join(problems)))
+        finally:
+            _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_quota_group_mapping(gr):
+    """`/quota` 그룹 대응이 Argon 그룹이 생긴 뒤에도 하나로 정해진다(1.10.2 · 26.10.22 실측 모양)."""
+    def group(name, desc):
+        return {"name": name, "description": desc, "buckets": []}
+    measured = [group("Gemini Models", "Models within this group: Gemini Flash, Gemini Pro"),
+                group("Claude and GPT models", "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS"),
+                group("Gemini 4 Argon", "For paid Pro plans, Argon quota is separate. Higher Argon quota "
+                                        "(included as part of the larger Gemini quota bucket) is available on Ultra plans.")]
+    legacy = measured[:2]
+    for label, groups, model, want in (
+            ("실측 · flash", measured, "gemini-3.8-flash-high", "Gemini Models"),
+            ("실측 · pro(Argon 설명의 'Pro plans' 에 끌리지 않는다)", measured, "gemini-3.1-pro-high", "Gemini Models"),
+            ("실측 · argon", measured, "gemini-4-argon-high", "Gemini 4 Argon"),
+            ("실측 · claude", measured, "claude-opus-5-5-high", "Claude and GPT models"),
+            ("옛 두 그룹 · flash", legacy, "gemini-3.8-flash-high", "Gemini Models"),
+            ("모르는 계열 → 막지 않는다", measured, "gemini-ultra-high", None),
+            # [2회차 적대적 렌즈 low] 계열 토큰이 한 그룹에만 걸려도, 모델 낱말이 다른 그룹에 있으면 붙이지 않는다.
+            ("이름이 바뀌어 엉뚱한 그룹 하나에만 걸림",
+             [group("Flash and Pro models", ""), measured[2]], "gemini-3.8-flash-high", None),
+            ("설명 없는 옛 모양 · 낱말이 어디에도 없음 → 그대로", [group("Gemini Models", "")],
+             "gemini-3.8-flash-high", "Gemini Models")):
+        got = gr._quota_group_for_model(groups, model)
+        name = got.get("name") if got else None
+        yield (None if name == want else
+               "쿼터 그룹 대응 [%s]: %r → %r (기대 %r)" % (label, model, name, want))
+
+
+def _check_result_retention(gr):
+    """결과 폴더는 보존 기한이 지난 결과 파일만 지운다(1.10.2).
+
+    ⛔ [1.10.1 2회차 보안 렌즈 질문 → 1.10.2] 결과 파일에는 코드가 인용된 지적이 담기는데 정리 코드가 없어 무기한
+      쌓였다. 지우는 것은 결과 파일 이름(gemini_review_*.json)뿐이다 — 쿼터 상태 · 다른 파일은 남는다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_retention_")
+    try:
+        env = _state_env(sandbox)
+        results = os.path.join(sandbox, "state", "gemini-review")
+        os.makedirs(results, mode=0o700)
+        old = time.time() - (gr._RESULT_RETENTION_DAYS + 5) * 86400
+        recent = time.time() - (gr._RESULT_RETENTION_DAYS - 5) * 86400
+        files = {"gemini_review_old_1.json": old, "gemini_review_recent_1.json": recent,
+                 "quota-state.json": old, "notes.json": old}
+        for name, mtime in files.items():
+            with io.open(os.path.join(results, name), "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            os.utime(os.path.join(results, name), (mtime, mtime))
+        with _quiet(), _patched(os, "environ", env):
+            # 결과를 쓰는 경로가 정리를 부른다 — 함수만 있고 아무도 부르지 않는 것을 막는다.
+            written = gr._write_out(None, {"_meta": {"mode": "check"}})
+            left = sorted(os.listdir(results))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                gr.main(["--stats", "--since", "%dd" % (gr._RESULT_RETENTION_DAYS + 30)])
+            long_note = buf.getvalue()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                gr.main(["--stats", "--since", "14d"])
+            short_note = buf.getvalue()
+        want_left = {"gemini_review_recent_1.json", "quota-state.json", "notes.json",
+                     os.path.basename(written or "")}
+        yield (None if written and set(left) == want_left else
+               "결과를 쓸 때 보존 기한이 지난 결과만 지우지 않았다: 남은 것 %r (기대 %r)"
+               % (left, sorted(want_left)))
+        yield (None if "일이 지난 결과를 지운다" in long_note and "일이 지난 결과를 지운다" not in short_note else
+               "--stats 가 보존 기한보다 긴 기간을 요청받고도 알리지 않는다(또는 늘 알린다)")
+        # [3회차 보안 렌즈 low] run_id 가 문자열이 아닌 결과 파일 하나로 `--stats` 가 죽지 않는다.
+        odd = os.path.join(results, "gemini_review_odd_1.json")
+        with io.open(odd, "w", encoding="utf-8") as fh:
+            json.dump({"_meta": {"mode": "reviewed", "exit_code": 0, "run_id": ["x"],
+                                 "written_at": gr._utc_now_str()}}, fh)
+        buf = io.StringIO()
+        with _patched(os, "environ", env), contextlib.redirect_stdout(buf):
+            odd_rc = gr.main(["--stats"])
+        yield (None if odd_rc == 0 else
+               "run_id 가 문자열이 아닌 결과 파일 하나가 --stats 를 죽였다: exit %s · %s" % (odd_rc, buf.getvalue()[-200:]))
+        os.unlink(odd)
+        buf = io.StringIO()
+        with _patched(os, "environ", env), contextlib.redirect_stdout(buf):
+            gr.main(["--stats", "--since", "2w"])
+        yield (None if "읽지 못해" in buf.getvalue() else
+               "--since 를 읽지 못했는데(2w) 알리지 않고 14일로 집계했다: %s" % buf.getvalue()[:200])
+        # [1.10.2 대체 리뷰 1회차 배선 렌즈 low] `--out` 을 주는 실행은 사본을 남길 때만 정리한다 — 그 자리를 고정한다.
+        stale = os.path.join(results, "gemini_review_old_3.json")
+        with io.open(stale, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        os.utime(stale, (old, old))
+        with _quiet(), _patched(os, "environ", env):
+            copied = gr._copy_to_result_dir({"_meta": {"mode": "check"}})
+        yield (None if copied and not os.path.exists(stale) else
+               "사본을 남길 때 보존 기한이 지난 결과를 지우지 않았다(--out 만 쓰는 실행은 정리되지 않는다)")
+        if os.name != "nt":
+            # 믿을 수 없는 결과 폴더(링크)는 건드리지 않는다.
+            elsewhere = os.path.join(sandbox, "elsewhere")
+            os.makedirs(elsewhere)
+            victim = os.path.join(elsewhere, "gemini_review_old_2.json")
+            with io.open(victim, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            os.utime(victim, (old, old))
+            state2 = os.path.join(sandbox, "state2")
+            os.makedirs(state2)
+            os.symlink(elsewhere, os.path.join(state2, "gemini-review"))
+            with _quiet(), _patched(os, "environ", _state_env(sandbox, "state2")):
+                gr._sweep_old_results()
+            yield (None if os.path.exists(victim) else
+                   "보존 기한 정리가 믿을 수 없는 결과 폴더(링크) 너머의 파일을 지웠다")
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
 
 
 def _check_model_list_rules(gr):
@@ -3022,33 +3201,53 @@ def _check_check_mode(gr):
       문구가 달라지면 시간 초과가 빈 응답으로, 모델명 오류가 도구 오류로 **조용히** 오진된다.
       점검이 그것을 알아보는지 본다. 실물 확인(26.09.15, agy 1.2.2): 세 가지 모두 정상, 21초.
     """
-    P = "m-main"
+    # [1.10.2 2회차 배선 렌즈 질문] 실제 gemini 꼴 이름 — ④ 쿼터 그룹 대응이 우연한 부분 문자열로 통과하지 않게.
+    P = "gemini-test-pro-high"
     R = gr._AgyRun
     NO = gr._CHECK_NO_SUCH_MODEL
     GOOD = {
         ("probe", P): R(0, stdout=_wrap("OK")),
         ("text", P): R(0, stdout=_wrap(""), stderr="[agy] print timeout after 1s with turn in progress; returning partial output"),
         ("probe", NO): R(1, stdout=_wrap("", status="ERROR", error=_NOMODEL_MSG)),
+        # [1.10.2] ③-b 텍스트 모드 점검 — 실측(agy 1.4.4) 모양: stdout 이 빈 채 stderr 에만 안내.
+        ("text", NO): R(1, stdout="", stderr=_AGY144_NOMODEL_STDERR),
     }
     # (이름, 응답 덮어쓰기, agy 경로, 기대 exit, 기대 agy 호출 수, 빨개져야 할 점검 항목)
     #   ⚠ [변이 검사로 보강] 종료 코드만 보면 "래퍼가 바뀜" 을 "모델 응답 이상" 으로 적어도 2 라
     #     통과했다 — **어느 항목**이 빨개졌는지까지 본다.
     rows = [
         # [1.9.0] 호출 수에는 맨 앞의 모델 목록 조회(`agy models`) 1회가 들어 있다.
-        ("모두 정상", {}, "agy", 0, 4, []),
-        ("시간 초과 안내문이 바뀜", {("text", P): R(0, stdout=_wrap(""), stderr="timed out")}, "agy", 2, 4,
+        #   [1.10.2] 끝까지 가는 행은 ③-b 텍스트 모드 점검 · ④ 쿼터 그룹 조회가 더해져 6회다.
+        ("모두 정상", {}, "agy", 0, 6, []),
+        ("시간 초과 안내문이 바뀜", {("text", P): R(0, stdout=_wrap(""), stderr="timed out")}, "agy", 2, 6,
          ["시간 초과 안내"]),
         ("모델 없음 문구가 바뀜", {("probe", NO): R(1, stdout=_wrap("", status="ERROR", error="unknown thing"))},
-         "agy", 2, 4, ["모델 없음 안내"]),
+         "agy", 2, 6, ["모델 없음 안내"]),
+        # [1.10.2] 텍스트 호출의 원인은 stderr 로만 가른다 — 안내가 stdout 으로 옮겨 가면 빨개져야 한다.
+        ("텍스트 모델 없음 안내가 stdout 으로 옮김", {("text", NO): R(1, stdout=_AGY144_NOMODEL_LINE)},
+         "agy", 2, 6, ["모델 없음 안내(텍스트)"]),
+        # [1.10.2] `/quota` 그룹 이름 · 설명이 바뀌어 판정 모델을 하나에 대응시키지 못하면 빨개져야 한다.
+        ("쿼터 그룹 대응이 깨짐", {("quota_query", P): R(0, stdout=_quota_payload([
+            {"name": "Models A", "buckets": []}, {"name": "Models B", "buckets": []}]))},
+         "agy", 2, 6, ["쿼터 그룹"]),
+        # [2회차 일반 렌즈 low] 답했는데 모양이 다르면 형식 변화(2), 답하지 못했으면 참고(0)다.
+        ("쿼터 응답 형식이 바뀜", {("quota_query", P): R(0, stdout='{"command": {"name": "other"}}')},
+         "agy", 2, 6, ["쿼터 그룹"]),
+        ("쿼터 조회 일시 오류", {("quota_query", P): R(1, stderr="error: boom")}, "agy", 0, 6, []),
         ("래퍼 필드가 바뀜", {("probe", P): R(0, stdout=json.dumps({"state": "SUCCESS", "result": "OK"}))},
-         "agy", 2, 4, ["출력 래퍼"]),
-        ("주 모델 무응답", {("probe", P): R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE)}, "agy", 4, 2,
+         "agy", 2, 6, ["출력 래퍼"]),
+        # [1.10.2 2회차 배선 렌즈 질문] 일찍 끝나는 행도 ④ 쿼터 그룹 조회 1회가 더해져 3회다.
+        ("주 모델 무응답", {("probe", P): R(0, stdout=_wrap(""), stderr=_TIMEOUT_NOTICE)}, "agy", 4, 3,
          ["모델 응답"]),
-        ("쿼터", {("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG))}, "agy", 4, 2,
+        ("쿼터", {("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG))}, "agy", 4, 3,
          ["모델 응답"]),
-        ("인증 오류", {("probe", P): R(1, stdout="Error: authentication required.")}, "agy", 2, 2,
+        ("쿼터 중에도 쿼터 그룹 대응을 본다", {
+            ("probe", P): R(1, stdout=_wrap("", status="ERROR", error=_QUOTA_MSG)),
+            ("quota_query", P): R(0, stdout=_quota_payload([{"name": "Models A", "buckets": []}]))},
+         "agy", 2, 3, ["모델 응답", "쿼터 그룹"]),
+        ("인증 오류", {("probe", P): R(1, stdout="Error: authentication required.")}, "agy", 2, 3,
          ["모델 응답"]),
-        ("모델 목록 형식이 바뀜", {("models", ""): R(0, stdout='{"models": []}')}, "agy", 2, 4,
+        ("모델 목록 형식이 바뀜", {("models", ""): R(0, stdout='{"models": []}')}, "agy", 2, 6,
          ["모델 목록"]),
         ("agy 없음", {}, None, 2, 0, ["agy"]),
     ]
@@ -4166,6 +4365,49 @@ def _check_out_copies_to_result_dir(gr):
         _rmtree_sandbox(sandbox, sandbox)
 
 
+def _check_out_inside_result_dir(gr):
+    """`--out` 이 결과 폴더 안의 결과 파일이어도 사본을 남기고, `--stats` 는 같은 실행을 한 번만 센다(1.10.2).
+
+    ⛔ [1.10.2 대체 리뷰 1회차 일반 렌즈 low] 처음엔 이 경우 사본을 건너뛰었다. 그러면 같은 `--out` 이름을 다시 쓸 때
+      앞 실행의 Gemini 지적(exit 5)이 덮여 응답 이력에서 사라지고, 그 뒤 쿼터면 대체 리뷰가 지적을 덮을 수 있었다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_outinside_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+        results = os.path.join(sandbox, "state", "gemini-review")
+        inside = os.path.join(results, "gemini_review_manual.json")
+        run = _review_runner(repo, env)
+        for args in (["init", "-q"], ["config", "gemini-review.gate", "true"]):
+            subprocess.run(["git"] + args, cwd=repo, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with io.open(os.path.join(repo, "a.py"), "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("a = 1\n")
+        subprocess.run(["git", "add", "a.py"], cwd=repo, env=env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def stats():
+            return run(["--stats"], child=False)[1]
+
+        rc, text = run(["request_changes", "--staged", "--out", inside])
+        rounds = re.search(r"회차 (\d+)", stats())
+        yield (None if rc == 5 and rounds and rounds.group(1) == "1" else
+               "--stats 가 같은 실행을 두 번 센다(결과 폴더 안 --out 과 그 사본): exit %d · %r"
+               % (rc, rounds.group(0) if rounds else None))
+        rc, _text = run(["quota", "--staged", "--out", inside])     # 같은 이름을 다시 쓴다 — 앞 결과가 덮인다
+        rc2, text = run(["--staged", "--prepare-fallback"], child=False)
+        yield (None if rc == 4 and rc2 == 2 and "덮을 수 없다" in text else
+               "결과 폴더 안 --out 을 다시 쓰자 앞 실행의 Gemini 지적이 응답 이력에서 사라졌다: exit %d → %d: %s"
+               % (rc, rc2, text[-200:]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
 def _check_prepare_linked_worktree(gr):
     """연결 워크트리에서 준비하면 렌즈의 Read 거부를 미리 알린다(1.10.1).
 
@@ -4661,6 +4903,10 @@ _BEHAVIOR_CHECKS = (
     _check_gate_fallback_record,
     _check_fallback_lenses_have_agents,
     _check_out_copies_to_result_dir,
+    _check_out_inside_result_dir,
+    _check_standin_quota_short_circuit,
+    _check_quota_group_mapping,
+    _check_result_retention,
     _check_prepare_linked_worktree,
     _check_gate_scopes_results_to_repo,
     _check_gate_unknown_target_is_strict,

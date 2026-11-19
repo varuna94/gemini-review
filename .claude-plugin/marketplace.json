@@ -5,14 +5,14 @@
     "url": "https://github.com/varuna94"
   },
   "metadata": {
-    "description": "커밋 직전 Gemini 로 변경분을 교차 리뷰하는 Claude Code 플러그인",
+    "description": "커밋 직전 Claude 렌즈 서브에이전트로 변경분을 리뷰하는 Claude Code 플러그인 (Gemini 교차 리뷰는 선택)",
     "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "gemini-review",
       "source": "./plugins/gemini-review",
-      "description": "커밋 직전 Gemini 3.x 로 변경분을 교차 리뷰한다 (Antigravity CLI). 같은 모델이 짠 코드를 같은 모델이 리뷰할 때 생기는 맹점을 잡는다."
+      "description": "커밋 직전 변경분을 Claude 렌즈 서브에이전트 여러 개(일반 · 적대적 · 배선 · 보안 + 코드 변경 시 테스트 · 호환성 · 상태)로 리뷰한다. Gemini 를 확인하지 않는다 — Gemini 3.x 교차 리뷰(Antigravity CLI)는 요청할 때만 쓴다."
     }
   ]
 }

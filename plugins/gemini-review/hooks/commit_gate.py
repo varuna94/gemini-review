@@ -20,6 +20,9 @@ Claude 가 Bash 도구로 `git commit` 을 실행하려 할 때, **스테이징�
 ⚠ [1.7.0] 커밋 형태를 막지 않고 **커밋이 담을 내용을 모사**해 해시를 잰다(`gemini_review._commit_diff`).
   1.6.x 는 `add && commit` · 경로 지정 커밋을 형태만 보고 막아, 두 세션이 작업 트리를 공유할 때 쓰는
   경로 지정 커밋이 아예 불가능했다(다른 프로젝트 운영 보고).
+⚠ [1.11.0] 기본 리뷰는 Claude 렌즈 리뷰다. 게이트는 같은 내용의 **렌즈 리뷰 기록**(`lens_reviewed`, 1.10.x 의
+  `fallback_reviewed` 포함)과 **Gemini 통과 판정**을 모두 인정한다. 막을 때 안내도 렌즈 리뷰 절차다 — 운영자가 렌즈
+  기록을 인정하지 않는 저장소(`gemini-review.gateFallback false`)만 Gemini 리뷰를 안내한다.
 """
 
 import importlib.util
@@ -38,6 +41,17 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REVIEW_SCRIPT = os.path.join(_HERE, os.pardir, "skills", "gemini-review", "gemini_review.py")
 _GIT_TIMEOUT = 20
 _RESULT_SCAN_CAP = 500          # mtime 최신순으로 이만큼만 읽는다 — 커밋마다 도는 경로다
+# [1.11.0] 렌즈 리뷰 기록 mode — `gemini_review._LENS_RECORD_MODES` 와 같다(테스트가 본다). 1.10.x 는 `fallback_reviewed`.
+_LENS_RECORD_MODES = ("lens_reviewed", "fallback_reviewed")
+# [1.11.0 1회차 상태 · 배선 · 적대적 렌즈] 아무것도 리뷰하지 않은 결과 — 쿼터 · 시간 초과 · 무응답 · 민감 경로 중단 · 실행
+#   실패 · 내부 오류 · 중단 · 진행 중 · 점검 · 변경 없음. 이것들은 같은 내용의 앞선 판정 · 기록을 가리지 않는다(렌즈 기록 뒤
+#   사용자가 요청한 Gemini 가 쿼터로 끝나면 커밋이 막혀 렌즈를 다시 돌려야 했다).
+#   ⛔ [3회차 보안 · 적대적 렌즈 low] **알려진 비수행 목록**으로 적는다 — 판정을 허용 목록으로 적으면 다음 판이 더한 새 판정
+#     mode 를 이 판의 hook 이 건너뛰어 옛 렌즈 기록으로 커밋을 연다. 모르는 mode 는 판정으로 친다(통과가 아니면 막는다).
+_UNPERFORMED_MODES = (
+    "timeout", "quota_exhausted", "primary_model_unavailable", "tool_unavailable", "review_unavailable",
+    "sensitive_blocked", "tool_error", "model_unavailable", "internal_error", "interrupted", "not_run",
+    "in_progress", "check", "no_changes", "fallback_refused")
 _MAX_NESTING = 4                # bash -c · eval 재귀 한도
 
 # 커밋보다 **앞에** 같은 명령에 있어도 되는 git 하위 명령 — 인덱스를 바꾸지 않는다.
@@ -676,10 +690,10 @@ def gate_state(where):
 
 
 def fallback_state(where):
-    """대체 리뷰 기록(`fallback_reviewed`)을 게이트가 인정하는가. 반환 "on" · "off".
+    """렌즈 리뷰 기록(`lens_reviewed` · 1.10.x 의 `fallback_reviewed`)을 게이트가 인정하는가. 반환 "on" · "off".
 
-    기본은 인정한다 — 대체 리뷰는 같은 내용의 Gemini 시도가 **수행되지 않았을 때만** 기록되기
-    때문이다(`gemini_review._record_fallback`). 운영자가 `gemini-review.gateFallback false` 로 끈다.
+    기본은 인정한다 — 렌즈 리뷰가 기본 리뷰다(1.11.0). 운영자가 `gemini-review.gateFallback false` 로 끈다
+    (이름은 1.7.0 의 "대체 리뷰" 에서 왔다). 끈 저장소는 Gemini 통과 판정만 커밋을 연다.
     ⛔ 값을 읽지 못하거나 불리언이 아니면 **인정하지 않는다**(fail-closed).
     """
     cwd = where if where and os.path.isdir(where) else os.path.expanduser("~")
@@ -795,17 +809,31 @@ def evaluate(command, cwd):
     return _check_review(where, plan, adds)
 
 
-def _review_hint(plan, adds):
-    """막을 때 `해결:` 줄 — 커밋 형태마다 **같은 내용을 리뷰하는 방법**이 다르다."""
+def _review_hint(plan, adds, lens=True):
+    """막을 때 `해결:` 줄 — 커밋 형태마다 **같은 내용을 리뷰하는 방법**이 다르다.
+
+    [1.11.0] 기본은 렌즈 리뷰 절차다(`--lens` 로 준비 → 렌즈 서브에이전트 → `--record-lens` 로 기록). 운영자가 렌즈
+      기록을 인정하지 않는 저장소(`lens=False`)만 Gemini 리뷰를 안내한다 — 막다른 길을 권하지 않는다.
+    """
     if plan["mode"] == "only":
-        return ("/gemini-review 를 `--paths %s` 로 돌려 exit 0 을 받은 뒤, 작업 트리를 바꾸지 않고 "
-                "같은 명령을 다시 실행한다." % " ".join(plan["pathspec"]))
-    first = ""
-    if adds or plan["mode"] in ("all", "include"):
-        first = ("커밋이 담을 내용을 먼저 스테이징하고(앞의 `git add` 를 따로 실행하거나 `-a` · `-i` "
-                 "대신 `git add`), ")
-    return (first + "/gemini-review 를 --staged 로 돌려 exit 0 을 받은 뒤, 스테이징을 바꾸지 않고 "
-            "같은 명령을 다시 실행한다.")
+        # [1.11.0 2회차 보안 렌즈 low] 복사용 명령이다 — 공백 · `$(…)` 가 든 경로를 스크립트 안내(`_scope_argv`)처럼 인용한다.
+        word = _load_review()._shell_word
+        scope, keep, first = "--paths %s" % " ".join(word(p) for p in plan["pathspec"]), "작업 트리를", ""
+    else:
+        scope, keep, first = "--staged", "스테이징을", ""
+        if adds or plan["mode"] in ("all", "include"):
+            first = ("커밋이 담을 내용을 먼저 스테이징하고(앞의 `git add` 를 따로 실행하거나 `-a` · `-i` "
+                     "대신 `git add`), ")
+    if lens:
+        how = ("/gemini-review 로 렌즈 리뷰를 마친다 — `%s --lens` 로 준비하고, 렌즈 서브에이전트의 지적을 "
+               "검증 · 반영한 뒤 `%s --record-lens --reviewer 이름 --summary 요약` 으로 기록한다"
+               % (scope, scope))
+    else:
+        # [2회차 보안 렌즈 질문] 이 저장소는 운영자가 렌즈 기록을 끈(또는 설정을 읽지 못한) 곳이다. Gemini 는 diff 를 Google 로
+        #   보내므로 Claude 가 스스로 돌리지 않는다 — 사용자에게 먼저 확인한다.
+        how = ("이 저장소는 렌즈 기록을 인정하지 않는다 — 사용자에게 알리고, 사용자가 Gemini 리뷰(diff 가 Google 로 "
+               "전송된다)를 원하면 /gemini-review 의 Gemini 리뷰(`--lens` 없이)를 `%s` 로 돌려 exit 0 을 받는다" % scope)
+    return "%s%s. 그 뒤 %s 바꾸지 않고 같은 명령을 다시 실행한다." % (first, how, keep)
 
 
 def _check_review(where, plan, adds):
@@ -834,10 +862,14 @@ def _check_review(where, plan, adds):
             "결과 폴더를 믿을 수 없다(링크 · 남의 소유 · 공유 임시 폴더) — 남이 심은 통과 기록을 "
             "받아들이지 않는다.",
             "사용자에게 결과 폴더 권한을 확인해 달라고 알린다.")
-    match, latest_here = _find_result(base, sha, root)
+    match, latest_here, unperformed = _find_result(base, sha, root)
     short = sha[:12]
-    fix = _review_hint(plan, adds)
+    lens_on = fallback_state(where) == "on"
+    fix = _review_hint(plan, adds, lens_on)
     what = "경로 지정 커밋이 담을 변경" if plan["mode"] == "only" else "커밋이 담을 변경"
+    if match is None and unperformed is not None:
+        # 같은 내용의 시도는 있지만 판정 · 기록이 없다 — 그 시도가 무엇으로 끝났는지 알린다(아래 갈래).
+        match = unperformed
     if match is None:
         if latest_here is not None:
             return EXIT_BLOCK, _message(
@@ -848,56 +880,66 @@ def _check_review(where, plan, adds):
     mode, code = match.get("mode"), match.get("exit_code")
     if match.get("passed") is True and mode == "reviewed" and code == 0:
         return EXIT_ALLOW, ""
-    if mode == "fallback_reviewed" and code == 0:
+    if mode in _LENS_RECORD_MODES and code == 0:
         # [1.10.0 2회차 렌즈 low] 운영자가 끈 저장소면 "준비부터 다시" 를 권하지 않는다(준비도 거부한다).
-        if fallback_state(where) != "on":
+        # [1.11.0 4회차 상태 렌즈 low] 위에서 읽은 값을 쓴다 — 두 번 읽으면 git 시간 초과 하나로 원인과 해결 줄이 갈렸다.
+        if not lens_on:
             return EXIT_BLOCK, _message(
-                "같은 내용의 대체 리뷰 기록이 있지만 이 저장소는 대체 리뷰를 인정하지 않는다(운영자 설정).",
-                "Gemini 리뷰가 수행될 때까지 기다리거나, 커밋하지 못한 사실을 사용자에게 보고한다.")
+                "같은 내용의 렌즈 리뷰 기록이 있지만 이 저장소는 렌즈 리뷰 기록을 인정하지 않는다(운영자 설정).",
+                fix + " 리뷰를 돌릴 수 없으면 커밋하지 못한 사실을 사용자에게 보고한다.")
         if not match.get("prepared_at"):
             # [1.10.0 대체 리뷰 보안 렌즈 low] 준비 없이 남긴 기록(1.9.0 이하 스크립트 · 갱신 전 세션)은
             #   렌즈가 그 바이트를 봤다는 보장이 없다. 결과 폴더는 판이 달라도 함께 쓴다.
             return EXIT_BLOCK, _message(
-                "같은 내용의 대체 리뷰 기록이 준비 없이 남았다(1.9.0 이하) — 대체 리뷰가 본 내용이 이 커밋과 "
-                "같다는 보장이 없다.",
-                "같은 범위 인자에 `--prepare-fallback` 을 붙여 준비하고, 렌즈 서브에이전트 리뷰를 마친 뒤 "
-                "`--record-fallback` 으로 다시 기록한다.")
+                "같은 내용의 렌즈 리뷰 기록이 준비 없이 남았다(1.9.0 이하) — 렌즈가 본 내용이 이 커밋과 "
+                "같다는 보장이 없다.", fix)
+        # ⛔ [1.11.0 2회차 상태 렌즈 low] 기록할 때의 거부(같은 바이트의 Gemini 지적)를 게이트도 순서와 무관하게 다시 본다.
+        #   기록이 결과 폴더를 훑은 뒤 · 결과를 쓰기 전에 끝난 Gemini 지적은 mtime 이 기록보다 앞서 가려졌다(백그라운드 Gemini).
+        late = gr._flagged_response(gr._attempts(root, sha, limit=_RESULT_SCAN_CAP))
+        if late is not None:
+            return EXIT_BLOCK, _message(
+                "같은 내용의 렌즈 리뷰 기록이 있지만, 같은 내용에 Gemini 가 판정을 냈다(%s · exit %s) — 렌즈 리뷰로 "
+                "덮을 수 없다." % (late.get("mode"), late.get("exit_code")),
+                "지적을 실측으로 검증해 반영하고(내용이 바뀌면 렌즈 리뷰로 다시 리뷰한다), 기각했으면 근거를 남기고 같은 "
+                "내용의 Gemini 리뷰(`--lens` 없이)를 다시 통과시킨다.")
         return EXIT_ALLOW, ""
+    # [1.10.0 2회차 렌즈 low] 같은 바이트에 Gemini 응답(지적 · 텍스트 원문)이 있으면 렌즈 준비가 거부한다 —
+    #   막다른 길을 권하지 않는다. [1.11.0] 렌즈 리뷰가 기본이 된 뒤에는 모든 막힘에 걸린다.
+    flagged = (gr._flagged_response(gr._attempts(root, sha, limit=_RESULT_SCAN_CAP))
+               if lens_on else None)
+    if flagged is not None:
+        fix = ("같은 내용에 Gemini 가 판정을 냈다(%s · exit %s) — 렌즈 리뷰로 덮을 수 없다. 지적을 실측으로 "
+               "검증해 반영하고(내용이 바뀌면 렌즈 리뷰로 다시 리뷰한다), 기각했으면 근거를 남기고 같은 내용의 Gemini "
+               "리뷰(`--lens` 없이)를 다시 통과시킨다." % (flagged.get("mode"), flagged.get("exit_code")))
     if mode == "reviewed":
         why = "같은 변경의 최근 리뷰가 통과가 아니다(exit %s · 지적 있음)." % code
-        fix = "지적을 실측으로 검증해 반영하고 다시 리뷰한다. " + fix
+        if flagged is None:
+            fix = "지적을 실측으로 검증해 반영하고 다시 리뷰한다. " + fix
     elif mode == "sensitive_blocked":
-        why = "같은 변경의 최근 리뷰가 민감 경로 때문에 전송되지 않았다(exit 3)."
+        # [1.11.0 1회차 보안 렌즈 high] 렌즈 준비 · 기록도 민감 경로를 거른다 — 렌즈 리뷰로 안내하지 않고 사람의 판단을 받는다.
+        why = "같은 변경의 최근 Gemini 리뷰가 민감 경로 때문에 전송되지 않았다(exit 3)."
         fix = "차단 목록을 사용자에게 보여 주고 판단을 받는다."
     elif code == 4:
-        why = "같은 변경의 최근 리뷰가 수행되지 않았다(exit 4 · %s)." % mode
-        quota = mode == "quota_exhausted"
-        fix = ("쿼터 차단이다 — 재설정 시각 뒤 같은 모델로 다시 돌린다. " if quota else
-               "화면의 원인 · 해결 줄대로 같은 모델로 재시도한다. ") + fix
-        # [1.10.0 2회차 렌즈 low] 같은 바이트에 Gemini 응답(지적 · 텍스트 원문)이 있으면 준비가 거부한다 —
-        #   막다른 길을 권하지 않는다.
-        flagged = gr._flagged_response(gr._attempts(root, sha, limit=_RESULT_SCAN_CAP))
-        if flagged is not None:
-            fix += (" 같은 내용에 Gemini 가 판정을 냈다(%s · exit %s) — 대체 리뷰로 덮을 수 없다. 반영해 "
-                    "다시 리뷰하거나 Gemini 통과를 기다린다." % (flagged.get("mode"), flagged.get("exit_code")))
-        elif fallback_state(where) == "on":
-            # [1.7.0] 수행되지 않은 날에도 커밋할 길 — 운영 규칙이 허용한 대체 리뷰를 **실제로** 마친 뒤에만.
-            # [1.10.0] 대체 리뷰는 준비한 diff 로 렌즈 서브에이전트가 한다. 쿼터면 재설정을 기다리지 않는다.
-            fix += (" %s 같은 범위 인자에 `--prepare-fallback` 을 붙여 준비하고, 렌즈 서브에이전트 "
-                    "리뷰(SKILL.md 「대체 리뷰」)를 실제로 마치고 지적을 반영한 뒤 `--record-fallback "
-                    "--reviewer 이름 --summary 요약` 을 붙여 기록한다."
-                    % ("기다리지 않으려면" if quota else
-                       "재시도해도 수행되지 않고 운영 규칙이 대체 리뷰를 허용하면,"))
+        # [1.11.0] Gemini 를 기다리거나 재시도하지 않는다 — 렌즈 리뷰로 곧바로 간다(사용자 지시 26.11.19).
+        why = "같은 변경의 최근 Gemini 리뷰가 수행되지 않았다(exit 4 · %s)." % mode
+        if lens_on and flagged is None:
+            fix = "Gemini 를 기다리지 않는다 — " + fix
+        elif not lens_on and mode == "quota_exhausted":
+            # [1.11.0 1회차 일반 렌즈 low] 렌즈 기록을 끈 저장소는 Gemini 만 남는다 — 쿼터면 다시 돌려도 곧바로 exit 4 다.
+            fix = "쿼터 차단이다 — 재설정 시각 뒤 같은 모델로 다시 돌린다. " + fix
     else:
         why = "같은 변경의 최근 리뷰가 통과가 아니다(%s · exit %s)." % (mode, code)
     return EXIT_BLOCK, _message(why, fix)
 
 
 def _find_result(base, sha, root):
-    """반환 (해시가 같은 **가장 최근** 결과의 `_meta`, 이 저장소의 가장 최근 `_meta`).
+    """반환 (해시가 같은 **가장 최근 판정 · 기록**의 `_meta`, 이 저장소의 가장 최근 `_meta`,
+    해시가 같은 가장 최근 **수행되지 않은 시도**의 `_meta`).
 
-    ⚠ 같은 해시의 결과가 여럿이면 **가장 최근 것**이 판정한다. 통과 뒤 같은 내용을 다시 돌려
+    ⚠ 같은 해시의 판정 · 기록이 여럿이면 **가장 최근 것**이 판정한다. 통과 뒤 같은 내용을 다시 돌려
       request_changes 가 나왔다면, 옛 통과로 커밋을 열어 주지 않는다.
+    [1.11.0 1회차 상태 · 배선 · 적대적 렌즈] 아무것도 리뷰하지 않은 결과(`_UNPERFORMED_MODES`)는 앞선 판정 · 기록을 가리지
+      않는다. 셋째 값은 판정 · 기록이 없을 때 그 이유(쿼터 · 민감 경로 등)를 알리는 데만 쓴다.
     ⛔ **같은 저장소의 결과만** 본다. 결과 폴더는 모든 저장소가 함께 쓰고, 같은 변경은 저장소가
       달라도 해시가 같다(실측: 두 저장소에 같은 파일을 더하면 sha256 이 일치). 저장소마다 리뷰
       관점(`.gemini-review.md`)이 다르므로 남의 판정으로 열거나 닫지 않는다(26.09.16 교차 리뷰 CRITICAL).
@@ -906,7 +948,7 @@ def _find_result(base, sha, root):
         names = [n for n in os.listdir(base)
                  if n.startswith("gemini_review_") and n.endswith(".json")]
     except OSError:
-        return None, None
+        return None, None, None
     paths = []
     for n in names:
         p = os.path.join(base, n)
@@ -916,6 +958,7 @@ def _find_result(base, sha, root):
             continue
     paths.sort(reverse=True)
     latest_here = None
+    unperformed = None
     real_root = os.path.realpath(root)
     for _mtime, p in paths[:_RESULT_SCAN_CAP]:
         try:
@@ -930,10 +973,14 @@ def _find_result(base, sha, root):
                 and os.path.realpath(scope["repo"]) == real_root):
             continue
         if meta.get("diff_sha256") == sha:
-            return meta, latest_here
+            if meta.get("mode") not in _UNPERFORMED_MODES:
+                return meta, latest_here, unperformed
+            if unperformed is None:
+                unperformed = meta
+            continue
         if latest_here is None:
             latest_here = meta
-    return None, latest_here
+    return None, latest_here, unperformed
 
 
 def _message(cause, fix):

@@ -24,8 +24,11 @@ jobs:
         #   `datetime.fromisoformat` 이 `Z` 접미사를 거부하는 마지막 계열이라, 그 회귀가
         #   3.12 단일 CI 에서는 **영원히 빨개지지 않는다**. 우분투에서만 돌린다 —
         #   Windows 전용 검사는 이미 3.12 행이 덮는다.
+        # [26.11.19] 이 행만 러너를 ubuntu-24.04 로 고정한다. ubuntu-latest 가 26.04 로
+        #   바뀌었는데 setup-python 에 26.04 용 3.9 빌드가 없어(3.9.25 는 22.04 · 24.04 만)
+        #   설치 단계에서 죽었다 — 코드 결함이 아니다(같은 날 docker python:3.9-slim 통과).
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:

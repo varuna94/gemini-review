@@ -1,6 +1,6 @@
 {
   "name": "gemini-review",
-  "version": "1.11.0",
+  "version": "1.11.1",
   "description": "커밋 직전 변경분을 Claude 렌즈 서브에이전트 여러 개(일반 · 적대적 · 배선 · 보안 + 코드 변경 시 테스트 · 호환성 · 상태)로 리뷰한다. Gemini 를 확인하지 않는다 — Gemini 3.x 교차 리뷰(Antigravity CLI)는 요청할 때만 쓴다.",
   "author": {
     "name": "varuna94"

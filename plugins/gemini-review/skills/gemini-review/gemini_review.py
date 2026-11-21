@@ -50,7 +50,7 @@ diff 를 저장소 git 폴더에 쓰고, 변경에 맞는 렌즈 목록과 프�
   **판정은 주 모델만 낸다.** 진단 모델(`--probe-model`)은 빈 응답일 때 한 줄 생존
   확인에만 쓴다(1.4.0).
 
-종료 코드: 0 통과(주 모델의 approve · approve_with_comments) / 1 파싱 실패 · 내부 오류 /
+종료 코드: 0 통과(주 모델의 approve · approve_with_comments) / 1 파싱 실패 · 내부 오류(응답 뒤 포함) /
           2 실행 실패 / 3 민감 경로 / 4 리뷰 안 됨(시간 초과 · 쿼터 · 무응답 · 빈 응답) /
           **5 request_changes** / **6 구조화 실패** / **8 빈 스테이징** /
           **9 렌즈 리뷰 준비함(리뷰 아님)** / 130 · 143 중단(신호). 이 목록에 없는 코드는 통과가 아니다.
@@ -245,7 +245,7 @@ def _classify_path(path: str) -> str:
 # ⚠ 배포 판. `plugin.json` · SKILL.md frontmatter 와 같아야 한다(테스트가 본다).
 #   [26.09.14 DX 교차리뷰] 1.2.0 · 1.3.x 설치 캐시가 함께 있으면 무엇이 돌았는지 알 수
 #   없었다 — 배너와 `--version` 에 판과 스크립트 경로를 남긴다.
-__version__ = "1.11.0"
+__version__ = "1.11.1"
 
 _DEFAULT_MODEL = "gemini-3.1-pro-high"
 # [1.8.0] **대체 주 모델.** 사용자 지시(26.10.13 확인): "pro-high 가 agy models 에 없는 동안에는
@@ -818,8 +818,9 @@ def main(argv=None) -> int:
     #   않으므로(아래 except), 여기에 없으면 **토큰을 태운 회차가 집계에서 통째로 빠진다**
     #   (Eng H4 · H1). `calls` 는 같은 리스트 객체를 공유해 추가가 그대로 보인다.
     # [1.10.2] `run_id` — 같은 실행의 `--out` 파일과 결과 폴더 사본을 `--stats` 가 한 번만 세게 한다.
+    # [1.11.1] `response` — Gemini 의 구조화 응답을 받았고 아직 결과로 남기지 못했으면 그 원문(`_main` 이 채우고 `finish` 가 비운다).
     ctx = {"out": None, "tmpdir": None, "model": None, "calls": [], "diff_sha256": None,
-           "run_id": os.urandom(8).hex()}
+           "run_id": os.urandom(8).hex(), "response": None, "scope": None}
     try:
         return _main(argv, ctx)
     except (_Interrupted, KeyboardInterrupt) as exc:
@@ -834,33 +835,88 @@ def main(argv=None) -> int:
         # ⛔ [26.09.14 Eng 교차리뷰 → 1.4.0] 예기치 못한 예외는 traceback · exit 1 로 끝났고,
         #   `--out` 은 `in_progress` 로 남았다. exit 1 은 "파싱 실패" 와 겹쳐 원인을 가린다 →
         #   `internal_error` 로 **기록**하고 원 예외는 그대로 보여 준다.
-        traceback.print_exc()
         if ctx["tmpdir"]:
             shutil.rmtree(ctx["tmpdir"], True)
-        _safe_print("⛔ 예기치 못한 오류로 끝났다(%s) — 리뷰가 수행되지 않았다. 통과가 아니다."
-                    % exc.__class__.__name__)
-        _safe_print("   위 traceback 을 그대로 보고할 것(스크립트 결함이다).")
+        # ⛔ [1.11.1 — 1.11.0 4회차 보안 · 상태 렌즈 질문, 실측 확인] Gemini 가 **응답한 뒤** 결과를 쓰기 전에 터지면(지적
+        #   필드의 타입이 어긋난 응답에서 `_render` 의 TypeError · 짝 없는 서로게이트를 utf-8 로 못 쓰는 UnicodeEncodeError)
+        #   `internal_error` 로 남았다. 게이트는 그것을 비수행으로 쳐서 같은 내용의 앞선 렌즈 기록으로 커밋을 열었다 —
+        #   지적일 수 있는 응답이 사라진다. 응답을 받은 뒤의 예외는 판정 쪽 mode 로 남긴다(통과가 아니다 · 렌즈로 덮지 못한다).
+        lost = ctx.get("response")
+        mode = "response_lost" if lost is not None else "internal_error"
         # `--out` 이 없으면 다른 종료 경로처럼 기본 결과 폴더에 남긴다. 기록 자체가 또 실패해도
         #   원 예외의 종료 코드를 지킨다.
+        # ⛔ [1.11.1 2회차 보안 · 적대적 렌즈 low] **기록을 먼저 쓰고, 화면 출력은 그 뒤에 한다**(`_say_internal_error`).
+        #   원래 예외가 출력 자체(`| head` 로 닫힌 파이프의 BrokenPipeError)면 처리기의 첫 출력에서 같은 예외가 다시 나
+        #   처리기를 빠져나갔다 — 처음엔 traceback · 안내를 먼저 찍어 아무 기록도 남지 않았다.
+        written = None
+        copied = False
         try:
             body = {"error": "%s: %s" % (exc.__class__.__name__, str(exc)[:300]),
                     "note": "스크립트 내부 오류로 끝났다 — 리뷰가 수행되지 않았다. 통과가 아니다."}
+            if lost is not None:
+                body["note"] = ("Gemini 가 응답했지만 결과를 처리하다 내부 오류로 끝났다 — 판정을 남기지 못했다. 통과가 "
+                                "아니다. 응답 앞부분(response_excerpt)을 사람이 읽어야 한다.")
+                try:
+                    excerpt = _response_text(str(lost))
+                except Exception:            # noqa: BLE001 — 발췌가 실패해도 기록은 남긴다(1.11.1 1회차 보안 렌즈 질문)
+                    # 깊게 중첩된 텍스트 원문(`[[[[…`)은 json.loads 가 RecursionError 를 낸다 — 원문 앞부분을 그대로 싣는다.
+                    excerpt = str(lost)
+                body["response_excerpt"] = excerpt[:_RESPONSE_EXCERPT_CHARS]
             if ctx["model"]:
                 body["model"] = ctx["model"]
-            payload = _result("internal_error", body, EXIT_PARSE_FAILED, model=ctx["model"],
+            payload = _result(mode, body, EXIT_PARSE_FAILED, model=ctx["model"],
                               calls=ctx["calls"] or None, diff_sha256=ctx["diff_sha256"],
-                              run_id=ctx.get("run_id"))
-            written = _write_out(ctx["out"], payload, quiet=bool(ctx["out"]))
+                              # ⛔ [1.11.1] 범위(`scope.repo`)가 없으면 게이트 · 응답 이력이 이 결과를 어느 저장소의 것으로도
+                              #   보지 않는다 — `response_lost` 가 처음엔 그래서 보이지 않았다(새 검사가 잡았다).
+                              scope=ctx.get("scope"), run_id=ctx.get("run_id"))
+            written = _write_out(ctx["out"], payload, quiet=True)
             if written and ctx["out"]:
                 # [1.10.1 대체 리뷰 배선 렌즈 low] `finish` 와 같은 계약 — `--out` 이어도 결과 폴더에 사본을 남긴다.
                 #   [2회차 적대적 렌즈 low] 남기지 못하면 `finish` 처럼 알린다.
                 if not _copy_to_result_dir(payload):
                     _safe_print(_COPY_FAILED_NOTE)
+                else:
+                    copied = True
         except Exception:
             pass
+        # [1.11.1 3회차 상태 · 배선 · 적대적 · 일반 렌즈 low] 게이트가 보는 결과 폴더에 실제로 남았는지 — 남기지 못했으면 "남겼다 ·
+        #   덮을 수 없다" 고 말하지 않는다(그때는 게이트가 이 응답을 보지 못해 앞선 렌즈 기록으로 커밋이 열린다).
+        recorded = written is not None and (copied or not ctx["out"])
+        _say_internal_error(exc, lost, None if ctx["out"] else written, recorded)
         return EXIT_PARSE_FAILED
     finally:
         restore()
+
+
+def _say_internal_error(exc: BaseException, lost, saved: Optional[str], recorded: bool) -> None:
+    """내부 오류의 화면 안내 — `main` 이 기록을 쓴 **뒤에** 부른다(1.11.1). 출력이 실패해도 기록 · 종료 코드는 그대로다.
+
+    ⛔ [1.11.1 2회차 보안 · 적대적 렌즈 low] 원래 예외가 출력 자체(닫힌 파이프)면 여기서도 같은 예외가 난다 — 삼킨다.
+      처리기를 빠져나가면 아무 기록도 남지 않고, 게이트가 같은 내용의 앞선 렌즈 기록으로 커밋을 열었다.
+    """
+    try:
+        traceback.print_exc()
+        if lost is not None:
+            _safe_print("⛔ Gemini 가 응답했지만 결과를 처리하다 예기치 못한 오류로 끝났다(%s) — 판정을 남기지 못했다. "
+                        "통과가 아니다." % exc.__class__.__name__)
+            if recorded:
+                _safe_print("   응답 앞부분을 결과 파일(response_excerpt)에 남겼다. 같은 내용은 렌즈 리뷰 기록으로 덮을 수 없다 —")
+                _safe_print("   Gemini 리뷰를 다시 돌리거나 내용을 바꾼다. 위 traceback 을 그대로 보고할 것(스크립트 결함이다).")
+            else:
+                _safe_print("   ⚠ 그 사실도 결과 폴더에 남기지 못했다 — 게이트 · 렌즈 기록이 이 응답을 보지 못해, 같은 내용의 앞선 렌즈")
+                _safe_print("   기록이 있으면 커밋이 열린다. 커밋하지 말고 결과 폴더 · --out 경로를 확인한 뒤 Gemini 리뷰를 다시 돌린다.")
+                _safe_print("   위 traceback 을 그대로 보고할 것(스크립트 결함이다).")
+        else:
+            _safe_print("⛔ 예기치 못한 오류로 끝났다(%s) — 리뷰가 수행되지 않았다. 통과가 아니다."
+                        % exc.__class__.__name__)
+            _safe_print("   위 traceback 을 그대로 보고할 것(스크립트 결함이다).")
+            if not recorded:
+                _safe_print("   ⚠ 결과도 남기지 못했다 — 결과 폴더 · --out 경로를 확인한다.")
+        if saved:
+            _safe_print("")
+            _safe_print("결과 저장: %s" % saved)
+    except Exception:          # noqa: BLE001 — 출력 실패가 기록 · 종료 코드를 바꾸지 않는다
+        pass
 
 
 def _main(argv, ctx: dict) -> int:
@@ -913,6 +969,10 @@ def _main(argv, ctx: dict) -> int:
             clash = _named_in_argv(argv, _PREPARE_CONFLICTS)
             if clash:
                 ap.error(_PREPARE_CONFLICT_MSG % ", ".join(clash))
+        if args.discard_lens:
+            clash = _named_in_argv(argv, _DISCARD_CONFLICTS)
+            if clash:
+                ap.error(_DISCARD_CONFLICT_MSG % ", ".join(clash))
         if args.record_fallback:
             if not (args.staged or args.paths):
                 ap.error(_FALLBACK_SCOPE_MSG)
@@ -984,12 +1044,19 @@ def _main(argv, ctx: dict) -> int:
         # ⛔ [1.10.0 대체 리뷰 일반 · 적대적 렌즈 low] 대체 리뷰 기록은 **결과 파일이 곧 기록**이다. 기본 결과
         #   폴더에 못 써도 0 이면 "기록함" 으로 읽히고, 준비한 diff 까지 지워 다시 기록할 수도 없었다.
         payload = _result(mode, body, rc, **meta)
-        written = _write_out(args.out, payload)
+        # [1.11.1 3회차 상태 · 적대적 · 테스트 렌즈] "결과 저장:" 은 응답 표시를 끈 **뒤에** 찍는다(아래). 쓴 뒤 그 줄에서 닫힌
+        #   파이프가 터지면, 이미 남긴 판정(approve 포함) 뒤에 `response_lost` 가 하나 더 쌓여 게이트가 막혔다.
+        written = _write_out(args.out, payload, announce=False)
         # ⛔ [1.10.1] `--out` 결과도 결과 폴더에 사본을 남긴다. 게이트 · 대체 리뷰 판단(응답 이력) · `--stats` 는
         #   결과 폴더만 본다 — 1.10.0 까지는 `--out` 으로 받은 Gemini 지적(exit 5)이 이력에 없어, 그 뒤 쿼터면
         #   대체 리뷰가 그 지적을 덮을 수 있었다(1.10.0 3회차 적대적 렌즈 low).
         if args.out and written is not None and not _copy_to_result_dir(payload):
             _safe_print(_COPY_FAILED_NOTE)
+        if written is not None:
+            # [1.11.1] 응답이 결과로 남았다(사본까지) — 뒤의 예외는 `response_lost` 가 아니다.
+            ctx["response"] = None
+            _safe_print("")
+            _safe_print("결과 저장: %s" % written)
         if written is None and (args.out or mode in _LENS_RECORD_MODES):
             _safe_print("⛔ 결과를 쓰지 못했다 — 종료코드 %d 대신 2 로 끝낸다." % rc)
             return EXIT_TOOL_ERROR
@@ -1008,22 +1075,23 @@ def _main(argv, ctx: dict) -> int:
                                         args.two_dot)
     except RuntimeError as exc:
         _safe_print(str(exc))
-        if args.prepare_fallback:
+        if args.prepare_fallback or args.discard_lens:
             # [1.10.0 3회차 렌즈 low] 준비는 결과 파일을 쓰지 않는다 — tool_error 가 `--stats` 회차로 잡혔다.
-            _safe_print("⛔ 렌즈 리뷰를 준비하지 않았다(exit %d) — 범위를 읽지 못했다." % EXIT_TOOL_ERROR)
+            _safe_print("⛔ 렌즈 리뷰를 %s하지 않았다(exit %d) — 범위를 읽지 못했다."
+                        % ("준비" if args.prepare_fallback else "준비 diff 를 정리", EXIT_TOOL_ERROR))
             return EXIT_TOOL_ERROR
         if not args.staged and args.base == "HEAD~1":
             _safe_print("  첫 커밋만 있는 저장소라면 비교할 이전 커밋이 없다 — "
                         "`--staged` 또는 `--base <ref>` 로 범위를 지정할 것.")
         return finish("tool_error", {"note": str(exc)})
-    state["scope"] = _resolve_scope(root, args)
+    state["scope"] = ctx["scope"] = _resolve_scope(root, args)
     state["root"] = root
 
     # ⚠ [26.09.14] 저장소 루트를 안 뒤에 찾는다 — PATH 에서 저장소 안 항목을 빼려면
     #   루트가 필요하다(`_which_agy`).
     # [1.7.0] 대체 리뷰 기록은 agy 를 부르지 않는다 — agy 가 망가진 날에도 기록할 수 있어야 한다.
     #   [1.10.0] 준비도 같다. [1.11.0] 렌즈 리뷰는 agy 를 **찾지도** 않는다 — 설치되지 않은 PC 에서도 돈다.
-    no_agy = args.record_fallback or args.prepare_fallback
+    no_agy = args.record_fallback or args.prepare_fallback or args.discard_lens
     agy = None if no_agy else _find_agy(root)
     if not agy and not no_agy:
         _safe_print("agy(Antigravity CLI)를 찾지 못했다 — 리뷰가 수행되지 않았다.")
@@ -1041,6 +1109,9 @@ def _main(argv, ctx: dict) -> int:
         _safe_print("   원인: 이 범위에 변경이 없다.")
         _safe_print("   해결: 리뷰할 변경을 스테이징했는지, 범위 인자(--staged · --paths · --base)가 맞는지 확인한다.")
         return EXIT_TOOL_ERROR
+    if not diff.strip() and args.discard_lens:
+        # [1.11.1 1회차 적대적 렌즈 low] 범위가 비어도(브랜치를 병합한 뒤 등) 하루가 지난 준비를 치우고 남은 준비를 알린다.
+        return _discard_prepared(root, None)
     if not diff.strip():
         # ⛔ [1.4.0 결정 8] `--staged` 인데 스테이징이 비면 **exit 8** 이다. 1.3.x 는 0 이라,
         #   `git add` 를 빠뜨린 커밋이 "리뷰 통과" 로 읽혔다(전역 규약이 "exit 0 도 통과가
@@ -1073,6 +1144,9 @@ def _main(argv, ctx: dict) -> int:
     #   가르는 유일하게 확실한 손잡이였다 — 범위가 커지는 루프는 수정이 새 코드를 낳아
     #   스스로 연료를 만들고(H-B), 고정된 루프는 재현율이 제약이다(H-A, 실측 67%).
     state["diff_bytes"] = len(diff_bytes)
+    if args.discard_lens:
+        # 지우기는 diff 를 읽지도 보내지도 않는다 — 민감 경로 가드보다 앞에 둔다(민감 파일이 든 준비도 지울 수 있어야 한다).
+        return _discard_prepared(root, state["diff_sha256"])
     classified = [(f, _classify_path(f)) for f in files]
     blocked = [f for f, c in classified if c == "block"]
     warned = [f for f, c in classified if c == "warn"]
@@ -1209,6 +1283,11 @@ def _main(argv, ctx: dict) -> int:
         run = _invoke_schema(agy, model, args, root, schema_path, prompt)
         cause, kind, detail = _classify_run(run, structured=True)
         calls.append(_call_record("structured", model, run, cause, kind, detail))
+    if cause == "ok":
+        # ⛔ [1.11.1] 여기부터 결과를 쓸 때까지 터지면 응답이 사라진다 — `main` 이 `response_lost` 로 남긴다.
+        #   [3회차 상태 · 적대적 렌즈 low] 응답을 받았다고 확정한 **직후**, 어떤 출력보다 먼저 표시한다. 처음엔 "응답: …" 줄 ·
+        #   쿼터 해제 뒤에 표시해, 그 줄에서 닫힌 파이프가 터지면 `internal_error`(비수행)로 남았다.
+        ctx["response"] = run.stdout
     if run.rc is not None:
         _safe_print("응답: %s · %.0f초" % (model, run.elapsed))
 
@@ -1224,9 +1303,11 @@ def _main(argv, ctx: dict) -> int:
         #   증거가 아니기 때문이다.
         _quota_guard(_clear_quota_block, model)
     if cause in ("empty", "tool_denied"):
+        # ⛔ [1.11.1 1회차 일반 · 보안 · 테스트 · 배선 렌즈] 텍스트 재시도의 원문(exit 6)도 지적일 수 있는 응답이다 —
+        #   결과를 쓰기 전에 터지면 `response_lost` 로 남긴다(구조화 응답과 같다). 원문을 받는 순간 표시한다.
         mode, body, extra = _recover_empty_response(
             agy, model, args, root, diff_path, files, project_ctx,
-            run, cause, detail, calls)
+            run, cause, detail, calls, on_response=lambda text: ctx.__setitem__("response", str(text)))
         return finish(mode, body, **extra)
 
     payload = _extract_json(run.stdout)
@@ -1364,21 +1445,21 @@ _NOT_ATTEMPT_MODES = frozenset((
 _LENS_RECORD_MODES = ("lens_reviewed", "fallback_reviewed")
 
 
-def _attempts(root: str, sha: str, limit: Optional[int] = None) -> List[dict]:
-    """같은 저장소 · 같은 diff 해시의 Gemini 리뷰 **시도** `_meta` 목록 — 최근 것부터.
+def _same_diff_metas(root: str, sha: str, limit: Optional[int] = None):
+    """같은 저장소 · 같은 diff 해시의 결과 `_meta` 를 최근 것부터 낸다(1.11.1 — `_attempts` 에서 나눴다).
 
     ⚠ 결과 폴더는 저장소들이 함께 쓰고, 같은 변경은 저장소가 달라도 해시가 같다 — 저장소를 함께 본다.
     ⚠ `limit` 은 최근 파일 몇 개만 읽는다 — 커밋마다 도는 게이트가 쓴다(`commit_gate._RESULT_SCAN_CAP`).
-      결과 폴더를 믿을 수 없으면 빈 목록이다 — 거부 사유는 `_trust_refusal` 이 따로 말한다.
+      결과 폴더를 믿을 수 없으면 아무것도 내지 않는다 — 거부 사유는 `_trust_refusal` 이 따로 말한다.
     """
     base, trust = _state_dir(create=False)
     if base is None or trust != "ok":
-        return []
+        return
     try:
         names = [n for n in os.listdir(base)
                  if n.startswith("gemini_review_") and n.endswith(".json")]
     except OSError:
-        return []
+        return
     ordered = []
     for n in names:
         path = os.path.join(base, n)
@@ -1390,7 +1471,6 @@ def _attempts(root: str, sha: str, limit: Optional[int] = None) -> List[dict]:
     if limit is not None:
         ordered = ordered[:limit]
     real_root = os.path.realpath(root)
-    found = []
     for _mtime, path in ordered:
         try:
             with io.open(path, encoding="utf-8") as fh:
@@ -1403,10 +1483,36 @@ def _attempts(root: str, sha: str, limit: Optional[int] = None) -> List[dict]:
         if not (isinstance(scope.get("repo"), str)
                 and os.path.realpath(scope["repo"]) == real_root):
             continue
-        if meta.get("mode") in _NOT_ATTEMPT_MODES:
+        yield meta
+
+
+def _attempts(root: str, sha: str, limit: Optional[int] = None) -> List[dict]:
+    """같은 저장소 · 같은 diff 해시의 Gemini 리뷰 **시도** `_meta` 목록 — 최근 것부터(`_same_diff_metas`)."""
+    return [m for m in _same_diff_metas(root, sha, limit) if m.get("mode") not in _NOT_ATTEMPT_MODES]
+
+
+# [1.11.1 1회차 일반 · 배선 렌즈 질문] "이미 기록돼 있다" 는 게이트가 볼 수 있는 기록만 근거로 삼는다 — 게이트는 최근 결과
+#   파일을 이만큼만 연다(`commit_gate._RESULT_SCAN_CAP`, 둘이 같은지 테스트가 본다).
+_LENS_RECORD_SCAN_CAP = 500
+
+
+def _lens_record(root: str, sha: str) -> Optional[dict]:
+    """같은 저장소 · 같은 diff 해시의 **게이트가 인정하는** 렌즈 리뷰 기록 `_meta` — 가장 최근 것, 없으면 None(1.11.1).
+
+    기록을 다시 돌렸을 때 "이미 기록돼 있다" 를 알리는 데만 쓴다(`_record_fallback`). 준비 시각이 없는 옛 기록(1.9.0 이하)은
+    게이트가 인정하지 않으므로 치지 않는다.
+    """
+    for meta in _same_diff_metas(root, sha, limit=_LENS_RECORD_SCAN_CAP):
+        if meta.get("mode") in _UNDECIDED_MODES:
             continue
-        found.append(meta)
-    return found
+        # ⛔ [1.11.1 4회차 배선 렌즈 low] 게이트는 같은 내용의 **가장 최근** 판정 · 기록 하나로 판단한다(`commit_gate._find_result`).
+        #   그것이 인정받는 렌즈 기록일 때만 "이미 있다" 다 — 처음엔 조건에 맞는 렌즈 기록을 끝까지 찾아, 더 새 옛 판 기록(준비
+        #   시각 없음) · 모르는 판정이 있어도 0 을 내고 게이트는 막았다.
+        if (meta.get("mode") in _LENS_RECORD_MODES and meta.get("exit_code") == EXIT_PASSED
+                and meta.get("prepared_at")):
+            return meta
+        return None                     # 가장 최근 판정이 인정받는 렌즈 기록이 아니다
+    return None
 
 
 # [1.10.0] 렌즈 — `(이름, 한 줄 설명)`. 서브에이전트 정의는 플러그인 `agents/lens-<이름>.md` 이고
@@ -1472,7 +1578,9 @@ def _fallback_refusal(attempts: List[dict], action: str) -> Optional[Tuple[str, 
 
 # Gemini 가 **응답을 낸** 시도 — 구조화 판정 · 텍스트 원문(exit 6) · 특정하지 못한 JSON(exit 1). 셋 다 지적을
 #   담을 수 있다(텍스트 원문은 사람이 읽어야 하고, JSON 이 둘이면 하나가 request_changes 일 수 있다).
-_GEMINI_RESPONSE_MODES = ("reviewed", "text_fallback", "parse_failed")
+#   [1.11.1] `response_lost` — 응답을 받은 뒤 결과를 쓰기 전에 내부 오류로 끝났다(`main`). 응답이 지적이었을 수 있다.
+_GEMINI_RESPONSE_MODES = ("reviewed", "text_fallback", "parse_failed", "response_lost")
+_RESPONSE_EXCERPT_CHARS = 4000
 
 
 def _flagged_response(attempts: List[dict]) -> Optional[dict]:
@@ -1487,11 +1595,16 @@ def _flagged_response(attempts: List[dict]) -> Optional[dict]:
     return response
 
 
-def _prepared_diff_path(root: str, sha: str) -> str:
-    """준비한 diff 의 절대 경로 — `<git 폴더>/gemini-review/fallback-<sha256>.diff`."""
+def _prepared_dir(root: str) -> str:
+    """준비한 diff 를 두는 폴더 — `<git 폴더>/gemini-review`."""
     rel = _git(["rev-parse", "--git-path", _FALLBACK_SUBDIR], root).strip()
     base = rel if os.path.isabs(rel) else os.path.join(root, rel)
-    return os.path.normpath(os.path.join(base, "fallback-%s.diff" % sha))
+    return os.path.normpath(base)
+
+
+def _prepared_diff_path(root: str, sha: str) -> str:
+    """준비한 diff 의 절대 경로 — `<git 폴더>/gemini-review/fallback-<sha256>.diff`."""
+    return os.path.join(_prepared_dir(root), "fallback-%s.diff" % sha)
 
 
 def _lens_agent_dir() -> str:
@@ -1751,7 +1864,10 @@ def _prepare_fallback(args, root: str, files: List[str], diff_bytes: bytes, stat
                     % _lens_argv(args))
         _safe_print("      큰따옴표 안의 백틱 · $() 는 셸이 실행한다).")
     else:
-        _safe_print("      범위 리뷰는 기록 단계가 없다 — 결과를 사용자에게 보고한다.")
+        # [1.11.1] 범위 리뷰는 기록이 준비 diff 를 지우지 않는다 — 보고한 뒤 지우는 명령을 알린다.
+        _safe_print("      범위 리뷰는 기록 단계가 없다 — 결과를 사용자에게 보고한 뒤 `%s --discard-lens` 로"
+                    % _scope_argv(args))
+        _safe_print("      준비 diff 를 지운다.")
     _safe_print("(exit %d — 준비함. 리뷰가 아니다)" % EXIT_LENS_PREPARED)
     return EXIT_LENS_PREPARED
 
@@ -1802,6 +1918,60 @@ def _sweep_prepared(folder: str, keep: Optional[str], cutoff: float) -> None:
             pass
 
 
+def _discard_prepared(root: str, sha: Optional[str]) -> int:
+    """이 범위로 준비한 diff 를 지운다(`--discard-lens`, 1.11.1). 리뷰 · 기록을 하지 않고 결과 파일도 쓰지 않는다.
+
+    [1.11.1 — 1.11.0 4회차 상태 렌즈 질문] 범위 리뷰(`--base main --lens`)는 기록 단계가 없어, 브랜치 전체 diff(코드 전문)가
+      다음 준비까지 git 폴더에 남았다 — 다음 준비가 없으면 계속 남는다. 결과를 보고한 뒤 이것으로 지운다.
+    ⛔ [1.11.1 1회차 상태 · 일반 · 배선 · 적대적 렌즈 low] 지운 준비보다 **먼저 만든 준비**도 함께 지운다(기록 경로와 같은
+      규칙). 지적을 반영하며 다시 준비한 범위 리뷰는 회차마다 바이트가 달라, 처음엔 마지막 회차만 지우고 고치기 전 브랜치
+      전체 diff 를 남겼다. 같은 저장소에서 다른 세션이 더 먼저 준비한 것도 지워진다 — 그 세션의 기록 · 렌즈는 "준비한 diff 가
+      없다" · diff_read false 로 끝나므로(fail-closed) 다시 준비하면 된다.
+    ⚠ `sha` 는 지금 범위의 바이트다. None 이면 범위가 비었다(병합한 뒤 등). 찾지 못하면 하루가 지난 준비만 지우고, 남은 준비가
+      있으면 폴더와 개수를 알린다 — 다른 세션의 준비일 수 있어 근거 없이 지우지 않는다.
+    """
+    try:
+        folder = _prepared_dir(root)
+    except RuntimeError as exc:
+        _safe_print("⛔ 준비 diff 를 정리하지 못했다(exit %d) — git 폴더를 찾지 못했다: %s" % (EXIT_TOOL_ERROR, exc))
+        return EXIT_TOOL_ERROR
+    path = os.path.join(folder, "fallback-%s.diff" % sha) if sha else None
+    stamp = None
+    if path is not None:
+        try:
+            stamp = os.path.getmtime(path)
+            os.unlink(path)
+        except FileNotFoundError:
+            stamp = None
+        except OSError as exc:
+            _safe_print("⛔ 준비 diff 를 지우지 못했다(exit %d): %s" % (EXIT_TOOL_ERROR, exc))
+            return EXIT_TOOL_ERROR
+    # [1.11.1 2회차 적대적 렌즈 low] 기준은 지운 준비의 시각과 하루 전 가운데 **늦은 쪽**이다 — 지운 준비가 하루보다 오래됐으면
+    #   그 시각만 기준으로 삼아, 하루가 지난 다른 준비를 남기고 "하루가 지난 것도 지웠다" 고 알렸다.
+    cutoff = time.time() - _FALLBACK_STALE_SECONDS
+    if stamp is not None:
+        cutoff = max(cutoff, stamp)
+    _sweep_prepared(folder, keep=None, cutoff=cutoff)
+    if stamp is not None:
+        _safe_print("준비한 렌즈 리뷰 diff 를 지웠다(exit %d · 리뷰도 기록도 아니다): %s" % (EXIT_PASSED, path))
+        _safe_print("   그보다 먼저 만든 준비(앞 회차 · 다른 범위 · 다른 세션 · 하루가 지난 것)도 함께 지웠다 — 기록 전이던")
+        _safe_print("   커밋 준비(--staged · --paths)도 지워졌을 수 있다. 그 기록이 \"준비한 diff 가 없다\" 면 다시 준비한다.")
+    elif sha is None:
+        _safe_print("ℹ 이 범위에 변경이 없다 — 지금 범위로 찾을 준비 diff 가 없다(exit %d · 리뷰도 기록도 아니다)."
+                    % EXIT_PASSED)
+    else:
+        _safe_print("ℹ 이 범위(sha256 %s)로 준비한 렌즈 리뷰 diff 가 없다 — 지울 것이 없다(exit %d · 리뷰도 기록도 아니다)."
+                    % (sha[:12], EXIT_PASSED))
+    try:
+        left = [n for n in os.listdir(folder) if n.startswith("fallback-") and n.endswith(".diff")]
+    except OSError:
+        left = []
+    if left:
+        _safe_print("⚠ 준비 폴더에 준비 diff %d개가 남았다: %s" % (len(left), folder))
+        _safe_print("   다른 범위 · 다른 세션의 준비일 수 있다. 하루가 지나면 다음 준비 · 정리가 지운다 — 지금 지울지는 사용자가 정한다.")
+    return EXIT_PASSED
+
+
 def _record_fallback(args, root: str, files: List[str], state: dict, finish) -> int:
     """렌즈 리뷰를 **마쳤다는 기록**을 남긴다(`--record-lens`, 1.7.0 · 1.11.0). 리뷰를 요청하지 않는다.
 
@@ -1828,6 +1998,17 @@ def _record_fallback(args, root: str, files: List[str], state: dict, finish) -> 
             prepared_at = datetime.fromtimestamp(os.path.getmtime(prepared), timezone.utc)
         except (OSError, RuntimeError):
             same = None
+        existing = _lens_record(root, sha) if same is None else None
+        if existing is not None:
+            # [1.11.1 — 1.11.0 3회차 상태 렌즈 low] 기록이 준비 diff 를 지우므로, 같은 기록을 다시 돌리면 "준비한 diff 가
+            #   없다" 로 거부됐고 해결 줄대로면 렌즈 일곱 개를 다시 띄웠다. 같은 바이트의 기록이 이미 있으면 그대로 알린다.
+            #   ⚠ 찾는 것은 **지금 바이트**의 기록이다 — 내용을 바꾼 뒤 준비 없이 기록하면 해시가 달라 여전히 거부된다.
+            _safe_print("ℹ 같은 내용(sha256 %s)의 렌즈 리뷰 기록이 이미 있다 — 다시 기록하지 않았다(exit %d)."
+                        % (sha[:12], EXIT_PASSED))
+            _safe_print("   기록: %s · 준비: %s. 준비 diff 는 그 기록을 남길 때 지워졌다."
+                        % (existing.get("written_at"), existing.get("prepared_at")))
+            _safe_print("   이번 --reviewer · --summary 는 남지 않는다. 렌즈를 다시 띄울 필요는 없다.")
+            return EXIT_PASSED
         if same is None:
             why = ("같은 내용으로 준비한 렌즈 리뷰 diff 가 없다 — 준비하지 않았거나, 준비한 뒤 내용이 바뀌었거나, "
                    "같은 저장소의 다른 세션이 기록하며 지웠다",
@@ -1873,7 +2054,9 @@ def _record_fallback(args, root: str, files: List[str], state: dict, finish) -> 
         try:
             stamp = os.path.getmtime(prepared)
             os.unlink(prepared)
-            _sweep_prepared(os.path.dirname(prepared), keep=None, cutoff=stamp)
+            # [1.11.1 2회차 적대적 렌즈 low] 기록한 준비가 하루보다 오래됐어도 하루가 지난 준비는 지운다.
+            _sweep_prepared(os.path.dirname(prepared), keep=None,
+                            cutoff=max(stamp, time.time() - _FALLBACK_STALE_SECONDS))
         except OSError:
             pass
     return rc
@@ -1955,7 +2138,7 @@ def _failure_result(stage: str, model: str, run: "_AgyRun", cause: str, kind: st
 def _recover_empty_response(agy: str, model: str, args, root: str, diff_path: str,
                             files: List[str], project_ctx: str, first: "_AgyRun",
                             first_cause: str, first_detail: str,
-                            calls: List[dict]) -> Tuple[str, dict, dict]:
+                            calls: List[dict], on_response=None) -> Tuple[str, dict, dict]:
     """구조화 응답이 **비었을 때**의 복구. 반환 `(mode, 결과 본문, _meta 추가 필드)`.
 
     ⛔ [1.4.0 결정 1] **판정은 주 모델만 낸다.** 진단 모델(`--probe-model`)은 한 줄 생존
@@ -2051,9 +2234,10 @@ def _recover_empty_response(agy: str, model: str, args, root: str, diff_path: st
     _safe_print("   생존 확인 OK (%.0f초) — 계층은 살아 있다. 주 모델로 텍스트 재시도한다 "
                 "(형식만 포기, 리뷰는 받는다)." % prun.elapsed)
     text, trun, tcause, tkind, tdetail = _retry_as_text(
-        agy, model, args, root, diff_path, files, project_ctx)
+        agy, model, args, root, diff_path, files, project_ctx, on_response=on_response)
     calls.append(_call_record("text", model, trun, tcause, tkind, tdetail))
     if text:
+        # [1.11.1] 받았다는 알림은 `_retry_as_text` 가 원문을 받은 직후에 이미 했다(그 함수의 출력보다 먼저).
         _safe_print("")
         _safe_print("-" * 74)
         _safe_print("[텍스트 모드 리뷰 — 구조화 실패로 원문 그대로]")
@@ -2508,9 +2692,17 @@ def _resolve_scope(root: str, args) -> dict:
     return scope
 
 
+_RESULT_SEQ = [0]
+
+
 def _result_file_name() -> str:
-    """결과 폴더에 둘 결과 파일 이름. 같은 초에 끝난 두 실행이 서로 덮지 않게 PID 를 붙인다."""
-    return "gemini_review_%s_%d.json" % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid())
+    """결과 폴더에 둘 결과 파일 이름. 같은 초에 끝난 두 실행이 서로 덮지 않게 PID 를 붙인다.
+
+    ⛔ [1.11.1 3회차 테스트 렌즈 질문] **같은 실행 안에서도** 순번을 붙인다. 판정을 쓴 뒤 예외가 나면 `main` 이 내부 오류
+      기록을 한 번 더 쓰는데, 같은 초면 이름이 같아 앞선 판정(approve 포함)을 덮었다. `_file_time` 은 이름의 날짜 · 시각만 본다.
+    """
+    _RESULT_SEQ[0] += 1
+    return "gemini_review_%s_%d_%d.json" % (datetime.now().strftime("%Y%m%d_%H%M%S"), os.getpid(), _RESULT_SEQ[0])
 
 
 # [1.10.2] 결과 폴더의 보존 기한(일). 이보다 오래된 결과 파일은 새 결과를 쓸 때 지운다(`_sweep_old_results`).
@@ -2577,7 +2769,7 @@ def _sweep_old_results() -> None:
 
 
 def _write_out(out_path: Optional[str], payload: dict,
-               quiet: bool = False) -> Optional[str]:
+               quiet: bool = False, announce: bool = True) -> Optional[str]:
     """결과 JSON 저장. 반환: 기록한 경로, **실패하면 None**.
 
     `quiet` 는 **시작 시점 무효화**용이다 — 저장 안내를 두 번 찍지 않는다.
@@ -2594,7 +2786,7 @@ def _write_out(out_path: Optional[str], payload: dict,
         return None
     if out_path is None:
         _sweep_old_results()             # [1.10.2] 결과 폴더 보존 기한
-    if not quiet:
+    if not quiet and announce:
         _safe_print("")
         _safe_print("결과 저장: %s" % path)
     return path
@@ -2651,11 +2843,15 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--record-lens", "--record-fallback", dest="record_fallback", action="store_true",
                     help="--lens 로 준비한 렌즈 리뷰를 **마쳤다는 기록**을 남긴다(커밋 게이트가 "
                          "인정한다). 같은 내용으로 준비한 diff 가 있어야 한다. --staged 또는 --paths 와 "
-                         "--reviewer · --summary 가 필요하다. 0 기록함 · 2 거부 · 3 민감 경로")
+                         "--reviewer · --summary 가 필요하다. 0 기록함 · 이미 기록돼 있음 · 2 거부 · 3 민감 경로")
     ap.add_argument("--reviewer", metavar="이름",
                     help="--record-lens: 렌즈 리뷰를 한 주체 (예: claude 서브에이전트 7렌즈)")
     ap.add_argument("--summary", metavar="요약",
                     help="--record-lens: 렌즈 리뷰 결과 요약 (반영한 지적 포함)")
+    # [1.11.1] 범위 리뷰(`--base`)는 기록 단계가 없어 준비 diff 가 다음 준비(하루 뒤)까지 남았다.
+    ap.add_argument("--discard-lens", action="store_true",
+                    help="--lens 로 준비한 diff 를 지운다(범위 리뷰 결과를 보고한 뒤). 같은 범위 인자를 준다. "
+                         "리뷰도 기록도 아니다. 0 지움 · 지울 것 없음 · 2 지우지 못함")
     ap.add_argument("--two-dot", action="store_true",
                     help="base..head 2-dot diff (기본은 merge-base 기준 3-dot). "
                          "브랜치 리뷰에서는 쓰지 마라 (남의 커밋이 섞인다)")
@@ -2721,7 +2917,7 @@ def _exit_code_epilog() -> str:
 _STATS_CONFLICTS = ("--staged", "--base", "--two-dot", "--out", "--allow-sensitive",
                     "--allow-empty", "--check", "--ignore-quota-cache", "--paths",
                     "--record-fallback", "--reviewer", "--summary", "--prepare-fallback",
-                    "--lens", "--record-lens")
+                    "--lens", "--record-lens", "--discard-lens")
 # [1.7.0] `--paths` 는 범위를 스스로 정한다 — 다른 범위 인자와 섞으면 어느 쪽을 리뷰했는지 모호하다.
 _PATHS_CONFLICTS = ("--staged", "--base", "--head", "--two-dot")
 _PATHS_CONFLICT_MSG = "--paths 는 범위를 스스로 정한다: 함께 쓸 수 없다: %s"
@@ -2744,6 +2940,11 @@ _PREPARE_CONFLICTS = ("--check", "--allow-empty", "--ignore-quota-cache",
                       "--model", "--timeout", "--probe-model", "--no-probe-fallback",
                       "--fallback-model", "--no-fallback")
 _PREPARE_CONFLICT_MSG = "--lens 와 함께 쓸 수 없다: %s"
+# [1.11.1] 지우기도 리뷰를 요청하지 않고 결과 파일을 쓰지 않는다. 준비 · 기록과 한 번에 쓰지 않는다.
+#   [2회차 배선 렌즈 질문] `--allow-sensitive` 는 받는다(diff 를 읽지 않으니 아무 일도 하지 않는다) — 준비 명령의 인자를 그대로
+#   옮겨 와도 거부되지 않게.
+_DISCARD_CONFLICTS = _PREPARE_CONFLICTS + ("--lens", "--prepare-fallback")
+_DISCARD_CONFLICT_MSG = "--discard-lens 와 함께 쓸 수 없다: %s"
 _FALLBACK_SCOPE_MSG = "--record-lens 는 --staged 또는 --paths 로 범위를 정해야 한다"
 _FALLBACK_FIELDS_MSG = "--record-lens 는 --reviewer 와 --summary 가 필요하다(빈 값 불가)"
 _FALLBACK_ONLY_MSG = "--reviewer · --summary 는 --record-lens 와 함께만 쓴다"
@@ -3226,7 +3427,7 @@ _STATS_FILE_CAP = 5000           # mtime 최신순. 넘으면 잘렸다는 사�
 _STATS_ROUND_MODES = frozenset((
     "reviewed", "text_fallback", "parse_failed", "timeout", "quota_exhausted",
     "tool_unavailable", "review_unavailable", "primary_model_unavailable",
-    "model_unavailable", "tool_error"))
+    "model_unavailable", "tool_error", "response_lost"))
 _STATS_VERDICT_MODES = frozenset(("reviewed",))   # 통과율의 분모
 
 
@@ -3377,10 +3578,14 @@ def _run_stats(args) -> int:
             unreadable += 1
             continue
         # [1.10.2] `--out` 이 결과 폴더 안이면 그 파일과 사본이 같은 실행이다 — `_meta.run_id` 로 한 번만 센다.
+        # ⛔ [1.11.1 4회차 배선 · 상태 · 일반 · 적대적 렌즈 low] 사본은 **내용이 같은** 두 파일이다 — run_id 와 mode · 종료 코드가
+        #   모두 같을 때만 접는다. 같은 실행이 판정을 쓴 뒤 예외로 내부 오류 기록을 따로 남기면(결과 파일 이름의 순번), run_id 만
+        #   보던 거르기가 폴더 목록 순서에 따라 판정 쪽을 버려 회차 · 통과 수에서 빠뜨렸다.
         if row.get("run_id"):
-            if row["run_id"] in seen_runs:
+            copy_key = (row["run_id"], row.get("mode"), row.get("exit_code"))
+            if copy_key in seen_runs:
                 continue
-            seen_runs.add(row["run_id"])
+            seen_runs.add(copy_key)
         if row["written_at"] is None or row["written_at"] >= since:
             rows.append(row)
 
@@ -3484,10 +3689,18 @@ def _write_json_atomic(path: str, payload: dict) -> None:
       (코드가 인용된 결과이므로 의도다).
     """
     d = os.path.dirname(os.path.abspath(path))
+    ascii_only = False
+    try:
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        # ⛔ [1.11.1] 짝 없는 서로게이트(`"\ud800"` — JSON 이스케이프로 온 응답에 있을 수 있다)는 utf-8 로 쓸 수 없다.
+        #   그대로 두면 응답을 받은 뒤 결과를 쓰다 UnicodeEncodeError 로 죽어 응답이 사라졌다. ASCII 이스케이프로 쓰면
+        #   읽었을 때 같은 값이다.
+        ascii_only = True
     fd, tmp = tempfile.mkstemp(prefix=".gemini_review_", suffix=".tmp", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=ascii_only, indent=2)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -3946,7 +4159,7 @@ def _has_agy_timeout_line(text: str) -> bool:
 
 
 def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
-                   files: List[str], project_ctx: str
+                   files: List[str], project_ctx: str, on_response=None
                    ) -> Tuple[str, _AgyRun, str, str, str]:
     """스키마 없이 텍스트로 재요청 — 형식을 포기하고 내용을 건진다.
 
@@ -3993,6 +4206,9 @@ def _retry_as_text(agy: str, model: str, args, root: str, diff_path: str,
     # [1.4.0] 두 판정은 이제 `_classify_run` 한 곳에 있다(구조화 호출과 같은 규칙).
     cause, kind, detail = _classify_run(run, structured=False)
     text = run.stdout if cause == "ok" else ""
+    if text and on_response is not None:
+        # ⛔ [1.11.1 3회차 적대적 · 테스트 렌즈] 원문을 받은 **직후**, 아래 출력보다 먼저 알린다(`main` 의 `response_lost`).
+        on_response(text)
     if cause == "ok":
         note = "응답 있음"
     elif cause == "timeout" and kind == "hard":
@@ -4144,9 +4360,11 @@ EXIT_LENS_PREPARED = 9
 # ⚠ **정본**이다. `--help` epilog 가 이 표를 찍고, README · SKILL.md · 모듈 docstring 의
 #   사본이 같은 코드 집합을 말하는지 테스트가 본다(`_check_exit_code_tables_agree`).
 _EXIT_TABLE = (
-    ("0", "통과: 주 모델의 approve · approve_with_comments (--record-lens 기록함 · 판정은 아니다)"),
-    ("1", "파싱 실패 · 내부 오류: 판정하지 않았다"),
-    ("2", "실행 실패: git · agy 없음, agy 가 실패를 알림(모델명 · 인증), --out · 렌즈 리뷰 기록에 못 씀, 렌즈 리뷰 준비 · 기록 거부"),
+    ("0", "통과: 주 모델의 approve · approve_with_comments (--record-lens 기록함 · 이미 기록돼 있음, "
+          "--discard-lens 지움 · 지울 것 없음: 판정은 아니다)"),
+    ("1", "파싱 실패 · 내부 오류 · 응답 뒤 내부 오류(response_lost): 판정하지 않았다"),
+    ("2", "실행 실패: git · agy 없음, agy 가 실패를 알림(모델명 · 인증), --out · 렌즈 리뷰 기록에 못 씀, 렌즈 리뷰 준비 · 기록 거부, "
+          "--discard-lens 실패"),
     ("3", "민감 경로: Gemini 전송 · 렌즈 준비 · 기록 중단 (사용자 승인 뒤 --allow-sensitive)"),
     ("4", "리뷰 안 됨: 시간 초과 · 쿼터 · 모델 무응답 · 빈 응답"),
     ("5", "request_changes (모르는 판정값 포함)"),
@@ -4161,6 +4379,7 @@ _EXIT_TABLE = (
 _MODE_EXIT = {
     "parse_failed": EXIT_PARSE_FAILED,
     "internal_error": EXIT_PARSE_FAILED,
+    "response_lost": EXIT_PARSE_FAILED,    # [1.11.1] 응답 뒤 내부 오류 — 판정 쪽이다(`_GEMINI_RESPONSE_MODES`)
     "tool_error": EXIT_TOOL_ERROR,
     "model_unavailable": EXIT_TOOL_ERROR,
     "sensitive_blocked": EXIT_SENSITIVE,
@@ -4176,6 +4395,11 @@ _MODE_EXIT = {
     "fallback_reviewed": EXIT_PASSED,
     "fallback_refused": EXIT_TOOL_ERROR,
 }
+# [1.11.1 4회차 배선 렌즈 low] 게이트가 같은 내용의 판정 · 기록을 고를 때 건너뛰는(아무것도 리뷰하지 않은) mode —
+#   `commit_gate._UNPERFORMED_MODES` 와 같은 집합이다(테스트가 본다). `_lens_record` 가 게이트와 같은 규칙으로 고른다.
+_UNDECIDED_MODES = frozenset(
+    (set(_MODE_EXIT) | {"no_changes", "interrupted", "not_run", "in_progress", "check"})
+    - set(_GEMINI_RESPONSE_MODES) - set(_LENS_RECORD_MODES))
 
 # LLM 응답에서 결과 파일로 옮기는 키 — 스키마에 있는 것만. 나머지(`_meta` · `model` ·
 #   `passed` …)는 코드가 쓰는 계약 키이므로 버린다(E18).
@@ -4236,28 +4460,37 @@ def _render(p: dict) -> None:
         _safe_print("요약: %s" % p["summary"])
     # `p` 는 `_looks_like_review` 를 통과한 객체뿐이라 원소가 전부 dict 임이
     # 이미 보장된다 — 여기서 다시 isinstance 필터를 걸면 dead code 다.
+    # ⛔ [1.11.1] 원소 **안의 필드 타입**은 보장되지 않는다(스키마 강제가 없는 갈래 · 모델이 어긴 응답). 심각도가 배열이면
+    #   `_SEV_ORDER.get` 이 unhashable 로, 파일이 숫자면 `loc +=` 가, 질문이 숫자면 for 가 TypeError 로 죽어 응답이
+    #   사라졌다(`main` 의 `response_lost`). 찍기는 판정을 바꾸지 않는다 — 모양이 어긋나도 그대로 보여 준다.
     findings = p.get("findings") or []
     _safe_print("")
     if not findings:
         _safe_print("지적 사항 없음.")
     else:
         _safe_print("지적 %d건 (심각도 순)" % len(findings))
-        for f in sorted(findings,
-                        key=lambda x: _SEV_ORDER.get(x.get("severity"), 9)):
-            loc = f.get("file") or ""
+        for f in sorted(findings, key=lambda x: _SEV_ORDER.get(_severity(x), 9)):
+            loc = str(f.get("file") or "")
             if f.get("line"):
-                loc += ":%s" % f["line"]
+                loc += ":%s" % (f["line"],)
             _safe_print("")
-            _safe_print("%s %s" % (_SEV_MARK.get(f.get("severity"), "[?]"),
+            _safe_print("%s %s" % (_SEV_MARK.get(_severity(f), "[?]"),
                                    f.get("title", "")))
             if loc:
                 _safe_print("  위치: %s" % loc)
-            _safe_print("  내용: %s" % f.get("detail", ""))
+            _safe_print("  내용: %s" % (f.get("detail", ""),))
             if f.get("failure_scenario"):
-                _safe_print("  실패 시나리오: %s" % f["failure_scenario"])
-    for q in (p.get("questions") or []):
+                _safe_print("  실패 시나리오: %s" % (f["failure_scenario"],))
+    questions = p.get("questions") or []
+    for q in (questions if isinstance(questions, list) else [questions]):
         _safe_print("")
-        _safe_print("질문: %s" % q)
+        _safe_print("질문: %s" % (q,))
+
+
+def _severity(finding: dict) -> Optional[str]:
+    """지적의 심각도 — 문자열이 아니면 None(`_render` 가 `[?]` 로 찍는다, 1.11.1)."""
+    sev = finding.get("severity")
+    return sev if isinstance(sev, str) else None
 
 
 if __name__ == "__main__":

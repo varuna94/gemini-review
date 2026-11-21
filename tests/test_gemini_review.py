@@ -2175,6 +2175,74 @@ def _check_result_contract_matrix(gr):
             _rmtree_sandbox(sandbox, sandbox)
 
 
+def _check_stats_keeps_distinct_records_of_one_run(gr):
+    """같은 실행이 남긴 **내용이 다른** 두 기록(판정 · 내부 오류)을 `--stats` 가 둘 다 본다(1.11.1 4회차 렌즈 low).
+
+    ⛔ `run_id` 로만 거르면 폴더 목록 순서에 따라 판정 쪽이 버려졌다. 목록 순서를 내부 오류가 먼저인 쪽으로 고정해 본다.
+    """
+    sandbox = tempfile.mkdtemp(prefix="gr_test_statsrun_")
+    try:
+        d = os.path.join(sandbox, "results")
+        os.makedirs(d)
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for name, mode, code in (("gemini_review_20991231_000000_7_1.json", "reviewed", 0),
+                                 ("gemini_review_20991231_000000_7_2.json", "internal_error", 1)):
+            with io.open(os.path.join(d, name), "w", encoding="utf-8") as fh:
+                json.dump({"mode": mode, "_meta": {"mode": mode, "exit_code": code, "passed": code == 0,
+                                                   "run_id": "r-same", "written_at": now}}, fh)
+        real_listdir = os.listdir
+
+        def internal_first(path):
+            names = real_listdir(path)
+            return sorted(names, reverse=True) if os.path.realpath(path) == os.path.realpath(d) else names
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), _patched(os, "listdir", internal_first):
+            gr.main(["--stats", "--stats-dir", d])
+        rounds = re.search(r"회차 (\d+)", buf.getvalue())
+        yield (None if rounds and rounds.group(1) == "1" else
+               "--stats 가 같은 실행의 판정을 내부 오류 기록과 함께 접어 버렸다: %r · %s"
+               % (rounds.group(0) if rounds else None, buf.getvalue()[-300:]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_text_retry_marks_response(gr):
+    """텍스트 재시도의 원문을 받은 **직후** 응답 표시가 켜진다 — 실제 `_recover_empty_response` · `_retry_as_text` 경로(1.11.1).
+
+    ⛔ [1.11.1 3회차 테스트 렌즈 medium · 적대적 렌즈 low] 다른 검사(`text_boom`)는 `_recover_empty_response` 를 통째로 가짜로
+      바꿔, 실제 함수의 알림 호출과 그 위치를 한 번도 지나지 않았다. 여기서는 진짜 경로(빈 응답 → 생존 확인 → 텍스트 원문)를
+      돌리고, 원문을 받은 뒤 첫 출력("텍스트 재시도: …" 줄)에서 닫힌 파이프를 일으킨다.
+    """
+    P, Q = "m-main", "m-probe"
+    R = gr._AgyRun
+    responses = {("structured", P): R(0, stdout=_wrap(""), elapsed=200.0), ("probe", P): R(0, stdout="OK\n"),
+                 ("text", P): R(0, stdout="판정: request_changes\n요약: 지적 있음")}
+    real_print = gr._safe_print
+
+    def picky(text):
+        if str(text).startswith("   텍스트 재시도:"):
+            raise BrokenPipeError(32, "테스트: 닫힌 파이프")
+        return real_print(text)
+
+    sandbox = tempfile.mkdtemp(prefix="gr_test_textmark_")
+    try:
+        out = os.path.join(sandbox, "o.json")
+        fake, log = _agy_script(gr, dict(responses))
+        env = _state_env(sandbox)
+        with _contained(gr, sandbox), _quiet(), _patched(os, "environ", env), \
+                _fake_repo(gr, sandbox), _patched(gr, "_run_agy", fake), _patched(gr, "_safe_print", picky):
+            rc = gr.main(["--out", out, "--model", P, "--probe-model", Q])
+        body = _read_json(out)
+        meta = body.get("_meta") or {}
+        yield (None if rc == 1 and meta.get("mode") == "response_lost" and "request_changes" in str(body.get("response_excerpt"))
+               and ("text", P) in log else
+               "텍스트 재시도 [원문을 받은 직후 끊김]: exit %s · mode %r · 호출 %r (기대 1 · response_lost · 원문 발췌)"
+               % (rc, meta.get("mode"), log))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
 def _check_diff_bytes_and_hash(gr):
     """`_meta.diff_sha256` 은 **agy 에 보낸 파일의 바이트**와 같고, 줄바꿈이 바뀌지 않는다(1.5.0 A2).
 
@@ -3609,8 +3677,91 @@ def fake_timeout(agy, model, args, root_, schema_path, prompt):
 def fake_boom(agy, model, args, root_, schema_path, prompt):
     raise RuntimeError("테스트: 내부 오류")
 
+# [1.11.1] 응답을 받은 뒤의 경로 — 필드 타입이 어긋난 지적 · 짝 없는 서로게이트 · 응답 뒤 내부 오류(`response_lost`).
+def fake_body(verdict_, **extra):
+    def invoke(agy, model, args, root_, schema_path, prompt):
+        body = {"verdict": verdict_, "summary": "t", "findings": []}
+        body.update(extra)
+        return gr._AgyRun(0, stdout=json.dumps(body))
+    return invoke
+
+def boom_render(p):
+    raise RuntimeError("테스트: 응답 뒤 내부 오류")
+
+special = {
+    "odd": fake_body("request_changes", questions=5, findings=[
+        {"severity": ["high"], "file": 7, "line": 3, "title": "t", "detail": {"k": 1}}]),
+    "surrogate": fake_body("request_changes", findings=[{"severity": "high", "title": "\ud800", "detail": "d"}]),
+    "render_boom": fake_body("request_changes"),
+}
+if verdict == "render_boom":
+    gr._render = boom_render
+if verdict == "text_boom":
+    # [1.11.1 1회차 렌즈] 텍스트 재시도가 원문을 받은 뒤 결과를 쓰기 전에 터진다. 원문은 깊게 중첩돼 발췌(json.loads)도
+    #   RecursionError 를 낸다 — 그래도 response_lost 가 남아야 한다.
+    special["text_boom"] = lambda *a, **k: gr._AgyRun(0, stdout="")
+    deep = "[" * 100000 + " request_changes"
+
+    def fake_recover(*a, **k):
+        k["on_response"](deep)            # 실제 함수처럼 원문을 받는 순간 알린다
+        return "text_fallback", {"raw_text": deep, "note": "t"}, {}
+    gr._recover_empty_response = fake_recover
+    real_result = gr._result
+
+    def boom_result(mode, body, exit_code, **meta):
+        if mode == "text_fallback":
+            raise RuntimeError("테스트: 텍스트 응답 뒤 내부 오류")
+        return real_result(mode, body, exit_code, **meta)
+    gr._result = boom_result
+if verdict == "reply_line_boom":
+    # [1.11.1 3회차 상태 · 적대적 렌즈] 응답을 받은 직후의 "응답: …" 줄에서 출력 파이프가 닫힌다.
+    special["reply_line_boom"] = fake_body("request_changes")
+    real_print = gr._safe_print
+
+    def picky(text):
+        if str(text).startswith("응답: "):
+            raise BrokenPipeError(32, "테스트: 닫힌 파이프")
+        return real_print(text)
+    gr._safe_print = picky
+if verdict == "boom_nowrite":
+    # [1.11.1 3회차 렌즈] 응답 뒤 내부 오류인데 결과 폴더에도 쓰지 못한다 — "남겼다" 고 말하지 않는다.
+    special["boom_nowrite"] = fake_body("request_changes")
+    gr._render = boom_render
+    gr._write_out = lambda *a, **k: None
+if verdict == "boom_nocopy":
+    special["boom_nocopy"] = fake_body("request_changes")
+    gr._render = boom_render
+    gr._copy_to_result_dir = lambda payload: False
+if verdict == "boom_internal_nowrite":
+    special["boom_internal_nowrite"] = fake_boom
+    gr._write_out = lambda *a, **k: None
+if verdict == "save_line_boom":
+    # [1.11.1 3회차 렌즈] 판정을 쓴 뒤 "결과 저장:" 줄에서 출력 파이프가 닫힌다 — 이미 남긴 판정을 덮거나 가리지 않는다.
+    special["save_line_boom"] = fake_body("approve")
+    real_print2 = gr._safe_print
+
+    def picky2(text):
+        if str(text).startswith("결과 저장:"):
+            raise BrokenPipeError(32, "테스트: 닫힌 파이프")
+        return real_print2(text)
+    gr._safe_print = picky2
+if verdict == "pipe_boom":
+    # [1.11.1 2회차 보안 · 적대적 렌즈] 응답을 찍다 출력 파이프가 닫힌다 — 그 뒤의 출력(traceback · 안내)도 모두 같은 예외를 낸다.
+    special["pipe_boom"] = fake_body("request_changes")
+    import traceback as _tb
+
+    def broken(*a, **k):
+        raise BrokenPipeError(32, "테스트: 닫힌 파이프")
+
+    def pipe_render(p):
+        gr._safe_print = broken
+        _tb.print_exc = broken
+        raise BrokenPipeError(32, "테스트: 닫힌 파이프")
+    gr._render = pipe_render
+
 gr._find_agy = lambda *a, **k: "agy"
-gr._invoke_schema = {"quota": fake_quota, "timeout": fake_timeout, "boom": fake_boom}.get(verdict, fake_invoke)
+gr._invoke_schema = special.get(verdict) or {"quota": fake_quota, "timeout": fake_timeout,
+                                             "boom": fake_boom}.get(verdict, fake_invoke)
 # 쿼터 조회 · 생존 확인이 **진짜 agy** 를 부르지 않게 한다(개발 기기에는 agy 가 있다).
 gr._run_agy = lambda *a, **k: gr._AgyRun(None, error="테스트: agy 를 부르지 않는다")
 sys.exit(gr.main(sys.argv[3:] or ["--staged"]))
@@ -4720,6 +4871,22 @@ def _check_lens_selection(gr):
     gate = _load_gate()
     yield (None if tuple(gate._LENS_RECORD_MODES) == tuple(gr._LENS_RECORD_MODES) else
            "게이트와 스크립트의 렌즈 기록 mode 가 다르다: %r · %r" % (gate._LENS_RECORD_MODES, gr._LENS_RECORD_MODES))
+    # [1.11.1 1회차 일반 · 배선 렌즈 질문] "이미 기록돼 있다" 는 게이트가 여는 만큼만 본다.
+    yield (None if gate._RESULT_SCAN_CAP == gr._LENS_RECORD_SCAN_CAP else
+           "게이트의 결과 훑기 상한(%r)과 '이미 기록돼 있다' 의 상한(%r)이 다르다"
+           % (gate._RESULT_SCAN_CAP, gr._LENS_RECORD_SCAN_CAP))
+    # [1.11.1 4회차 배선 렌즈 low] "이미 기록돼 있다" 는 게이트와 같은 비수행 집합으로 가장 최근 판정을 고른다.
+    yield (None if set(gate._UNPERFORMED_MODES) == set(gr._UNDECIDED_MODES) else
+           "게이트 비수행 목록과 스크립트의 _UNDECIDED_MODES 가 다르다: %r"
+           % sorted(set(gate._UNPERFORMED_MODES) ^ set(gr._UNDECIDED_MODES)))
+    # [1.11.1 3 · 4회차 테스트 렌즈] 한 실행 안에서도 결과 파일 이름이 겹치지 않는다(앞선 판정을 덮지 않는다).
+    first_name, second_name = gr._result_file_name(), gr._result_file_name()
+    yield (None if first_name != second_name else
+           "한 실행에서 결과 파일 이름이 겹친다: %r" % first_name)
+    # [1.11.1 1회차 테스트 렌즈 low] Gemini 응답 mode 는 모두 토큰을 쓴 회차다 — `--stats` 가 회차로 센다.
+    yield (None if set(gr._GEMINI_RESPONSE_MODES) <= set(gr._STATS_ROUND_MODES) else
+           "--stats 회차 목록에 Gemini 응답 mode 가 빠졌다: %r"
+           % sorted(set(gr._GEMINI_RESPONSE_MODES) - set(gr._STATS_ROUND_MODES)))
     # [1.11.0 2회차 테스트 · 배선 · 적대적 렌즈] 게이트의 판정 mode 는 스크립트의 Gemini 응답 mode 사본이다 — 갈라지면 게이트가
     #   새 응답 mode 를 "수행되지 않은 시도" 로 건너뛰어 옛 렌즈 기록으로 커밋을 연다(fail-open).
     #   [3회차 보안 · 적대적 렌즈] 게이트는 **알려진 비수행 목록**으로 가른다 — 응답 · 기록 mode 가 거기 섞이면 안 되고, 스크립트의
@@ -5030,6 +5197,368 @@ def _check_lens_default_flow(gr):
         yield (None if rc == 0 and rc2 == 0 and passed and rc3 == 2 else
                "게이트 [Gemini 통과 뒤 텍스트 원문]: 리뷰 %d · 게이트 %d → %d (기대 0 · 0 → 2): %s"
                % (rc, rc2, rc3, err.strip()[:240]))
+    finally:
+        _rmtree_sandbox(sandbox, sandbox)
+
+
+def _check_lens_followups(gr):
+    """1.11.1 — 1.11.0 이 TODOS 에 남긴 렌즈 리뷰 후속 넷을 실제 프로세스로 고정한다.
+
+    ① 같은 기록을 다시 돌리면 "이미 기록돼 있다"(exit 0) — 지금 바이트의 가장 최근 판정이 준비 시각 있는 렌즈 기록일 때만.
+    ② 게이트는 렌즈 기록을 열 때 기록 시각과 무관하게 같은 바이트의 Gemini 지적을 본다 — 1.11.1 에서 기록 시각 언저리만 보는
+       창 최적화를 넣었다가 사용자 결정으로 되돌렸다(CHANGELOG 1.11.1). 그 결정을 고정한다.
+    ③ `--discard-lens` 가 범위 리뷰의 준비 diff 를 지운다(결과 파일 · 민감 경로 가드 · agy 와 무관).
+    ④ 응답을 받은 뒤의 예외는 `response_lost` — 게이트가 막고 렌즈로 덮지 못한다. 그 예외의 두 원인(`_render` 의 타입 ·
+       서로게이트 쓰기)은 고쳐서 판정(exit 5)이 그대로 남는다.
+    """
+    del gr
+    if shutil.which("git") is None:
+        yield _Skip("git 이 없다")
+        return
+    sandbox = tempfile.mkdtemp(prefix="gr_test_lens1111_")
+    try:
+        env = _gate_env(sandbox)
+        repo = os.path.join(sandbox, "repo")
+        os.makedirs(repo)
+        results = os.path.join(sandbox, "state", "gemini-review")
+        gate = [sys.executable, _GATE_PY]
+        run = _review_runner(repo, env)
+        pdir = os.path.join(repo, ".git", "gemini-review")
+
+        def git(*args):
+            subprocess.run(["git"] + list(args), cwd=repo, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def write(name, text):
+            with io.open(os.path.join(repo, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+
+        def lens(*argv):
+            proc = subprocess.run([sys.executable, "-c", _CHILD_NO_AGY, os.path.abspath(_TARGET)] + list(argv),
+                                  cwd=repo, env=env, capture_output=True, timeout=120, check=False)
+            return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+        def prepared():
+            return sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []
+
+        def result_paths(mode=None):
+            found = []
+            for n in (os.listdir(results) if os.path.isdir(results) else []):
+                if n.startswith("gemini_review_") and n.endswith(".json"):
+                    p = os.path.join(results, n)
+                    if mode is None or (_read_json(p).get("_meta") or {}).get("mode") == mode:
+                        found.append(p)
+            return sorted(found, key=os.path.getmtime)
+
+        def planted(mark, age):
+            path_ = os.path.join(pdir, "fallback-%s.diff" % (mark * 64))
+            with io.open(path_, "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+            when = time.time() - age
+            os.utime(path_, (when, when))
+            return os.path.basename(path_)
+
+        git("init", "-q")
+        write("a.py", "a = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("config", "gemini-review.gate", "true")
+        record = ["--record-lens", "--reviewer", "테스트 7렌즈", "--summary", "지적 없음"]
+
+        # ① 같은 기록을 다시 돌린다 — 준비 diff 는 첫 기록이 지웠다.
+        write("a.py", "a = 2\n")
+        git("add", "a.py")
+        rc0, _out = lens("--staged", "--lens")
+        # [2회차 적대적 렌즈 low] 기록의 정리 기준도 기록한 준비의 시각과 하루 전 가운데 늦은 쪽 — 사흘 된 준비를 기록해도 이틀 된
+        #   다른 준비를 지운다.
+        for n in prepared():
+            when = time.time() - 3 * 86400
+            os.utime(os.path.join(pdir, n), (when, when))
+        planted("c", 2 * 86400)
+        rc1, out1 = lens("--staged", *record)
+        yield (None if rc1 == 0 and prepared() == [] else
+               "렌즈 기록 [사흘 된 준비를 기록]: exit %d · 남은 준비 %r (기대 0 · 없음 — 이틀 된 준비도 하루가 지났다): %s"
+               % (rc1, prepared(), out1[-200:]))
+        rc2, out = lens("--staged", *record)
+        yield (None if rc0 == 9 and rc1 == 0 and rc2 == 0 and "렌즈 리뷰 기록이 이미 있다" in out
+               and len(result_paths("lens_reviewed")) == 1 else
+               "렌즈 기록 [같은 기록을 다시]: 준비 %d · 기록 %d · 다시 %d · 기록 %d건 (기대 9 · 0 · 0 · 1건 · 이미 있다): %s"
+               % (rc0, rc1, rc2, len(result_paths("lens_reviewed")), out[-240:]))
+        # [변이 검사] "이미 기록돼 있다" 는 거부 검사 뒤에 있다 — 같은 바이트의 렌즈 기록이 있어도 운영자가 렌즈 기록을 끈 뒤면
+        #   0 이 아니다(게이트가 그 기록을 인정하지 않는다). 렌즈 기록이 가장 최근 판정인 채로 거부만 걸리는 장면이 이것뿐이다.
+        git("config", "gemini-review.gateFallback", "false")
+        try:
+            rc_op, out_op = lens("--staged", *record)
+        finally:
+            git("config", "--unset", "gemini-review.gateFallback")
+        yield (None if rc_op == 2 and "인정하지 않는다" in out_op and "이미 있다" not in out_op else
+               "렌즈 기록 [운영자가 렌즈 기록을 끈 뒤 다시]: exit %d (기대 2 · 운영자 거부 · 이미 있다로 빠지지 않는다): %s"
+               % (rc_op, out_op[-200:]))
+        # [2회차 테스트 렌즈 low] "이미 기록돼 있다" 는 게이트처럼 최근 결과 500개 안만 본다 — 더 새 결과 500개 뒤의 기록은 치지 않는다.
+        dummies = []
+        later = time.time() + 120
+        os.makedirs(results, exist_ok=True)
+        for i in range(500):
+            path_ = os.path.join(results, "gemini_review_20991231_000000_%d.json" % i)
+            with io.open(path_, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+            os.utime(path_, (later, later))
+            dummies.append(path_)
+        rc_cap, out_cap = lens("--staged", *record)
+        for path_ in dummies:
+            os.unlink(path_)
+        yield (None if rc_cap == 2 and "준비한 렌즈 리뷰 diff 가 없다" in out_cap else
+               "렌즈 기록 [같은 기록을 다시 · 더 새 결과 500개 뒤]: exit %d (기대 2 · 게이트가 못 보는 기록으로 이미 있다고 하지 않는다): %s"
+               % (rc_cap, out_cap[-200:]))
+        # [4회차 배선 렌즈 low] 게이트처럼 **가장 최근** 판정 · 기록 하나로 본다 — 더 새 옛 판 기록(준비 시각 없음)이 있으면
+        #   앞선 렌즈 기록이 있어도 "이미 있다" 가 아니다(게이트가 그 옛 기록으로 막는다).
+        rec_path = result_paths("lens_reviewed")[-1]
+        # 더 새 **비수행** 결과(쿼터 등)는 건너뛴다 — 게이트도 그것으로 판정하지 않는다.
+        undecided = _read_json(rec_path)
+        undecided["mode"] = undecided["_meta"]["mode"] = "quota_exhausted"
+        undecided["_meta"]["exit_code"] = 4
+        newer_undecided = os.path.join(results, "gemini_review_20991231_000002_1_1.json")
+        with io.open(newer_undecided, "w", encoding="utf-8") as fh:
+            json.dump(undecided, fh, ensure_ascii=False)
+        later = time.time() + 60
+        os.utime(newer_undecided, (later, later))
+        rc_und, out_und = lens("--staged", *record)
+        os.unlink(newer_undecided)
+        yield (None if rc_und == 0 and "렌즈 리뷰 기록이 이미 있다" in out_und else
+               "렌즈 기록 [더 새 쿼터 결과 뒤]: exit %d (기대 0 · 비수행은 건너뛴다): %s" % (rc_und, out_und[-200:]))
+        old = _read_json(rec_path)
+        old["mode"] = old["_meta"]["mode"] = "fallback_reviewed"
+        old["_meta"].pop("prepared_at", None)
+        newer_old = os.path.join(results, "gemini_review_20991231_000001_1_1.json")
+        with io.open(newer_old, "w", encoding="utf-8") as fh:
+            json.dump(old, fh, ensure_ascii=False)
+        later = time.time() + 60
+        os.utime(newer_old, (later, later))
+        rc_new, out_new = lens("--staged", *record)
+        os.unlink(newer_old)
+        yield (None if rc_new == 2 and "이미 있다" not in out_new else
+               "렌즈 기록 [더 새 옛 판 기록]: exit %d (기대 2 · 게이트가 막을 기록으로 이미 있다고 하지 않는다): %s"
+               % (rc_new, out_new[-200:]))
+        write("a.py", "a = 3\n")
+        git("add", "a.py")
+        rc, out = lens("--staged", *record)
+        yield (None if rc == 2 and "준비한 렌즈 리뷰 diff 가 없다" in out and "이미 있다" not in out else
+               "렌즈 기록 [내용을 바꾸고 준비 없이]: exit %d (기대 2 · 다른 바이트의 기록으로 열지 않는다): %s"
+               % (rc, out[-240:]))
+        # 준비 시각이 없는 옛 기록(1.9.0 이하)은 게이트가 인정하지 않는다 — "이미 있다" 로 치지 않는다.
+        write("a.py", "a = 2\n")
+        git("add", "a.py")
+        rec_path = result_paths("lens_reviewed")[-1]
+        data = _read_json(rec_path)
+        data["_meta"].pop("prepared_at", None)
+        with io.open(rec_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        rc, out = lens("--staged", *record)
+        yield (None if rc == 2 and "이미 있다" not in out else
+               "렌즈 기록 [준비 시각 없는 옛 기록]: exit %d (기대 2 · 이미 있다로 치지 않는다): %s" % (rc, out[-240:]))
+
+        # ② 늦은 지적 — [1.11.1 사용자 결정] 게이트는 렌즈 기록을 열 때 기록 시각과 무관하게 최근 결과를 다시 연다(창 최적화를
+        #   되돌렸다). 기록보다 30초 앞이든 2시간 앞이든 같은 바이트의 Gemini 지적이면 막는다.
+        write("b.py", "b = 1\n")
+        git("add", "b.py")
+        lens("--staged", "--lens")
+        rc, _out = lens("--staged", *record)
+        lens_rec = result_paths("lens_reviewed")[-1]
+        rc5, _out = run(["request_changes", "--staged"])
+        flagged = [p for p in result_paths("reviewed") if (_read_json(p).get("_meta") or {}).get("exit_code") == 5]
+        stamp = os.path.getmtime(lens_rec)
+        for p in flagged:
+            os.utime(p, (stamp - 30, stamp - 30))
+        rc_in, err_in = _gate_call(gate, repo, "git commit -m x", env)
+        for p in flagged:
+            os.utime(p, (stamp - 2 * 3600, stamp - 2 * 3600))
+        rc_out, err_out = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc == 0 and rc5 == 5 and flagged and rc_in == 2 and "덮을 수 없다" in err_in
+               and rc_out == 2 and "덮을 수 없다" in err_out else
+               "게이트 [렌즈 기록보다 앞선 Gemini 지적]: 기록 %d · Gemini %d · 지적 %d건 · 30초 앞 %d · 2시간 앞 %d "
+               "(기대 0 · 5 · 1건 · 2 · 2 — 기록 시각과 무관하게 본다): %s / %s"
+               % (rc, rc5, len(flagged), rc_in, rc_out, err_in.strip()[:160], err_out.strip()[:160]))
+        for p in flagged:
+            os.unlink(p)
+
+        # ③ 범위 리뷰의 준비 diff 를 지운다 — 지적을 반영하며 다시 준비한 앞 회차까지(1회차 상태 · 일반 · 배선 · 적대적 렌즈).
+        git("commit", "-qm", "two")
+        base = subprocess.run(["git", "rev-parse", "HEAD~1"], cwd=repo, env=env, capture_output=True,
+                              check=True).stdout.decode("ascii").strip()
+        write(".env", "K=v\n")
+        git("add", ".env")
+        git("commit", "-qm", "three")
+        before = result_paths()
+
+
+        rc_a, out = lens("--base", base, "--lens", "--allow-sensitive")
+        first = prepared()
+        for n in first:
+            when = time.time() - 60
+            os.utime(os.path.join(pdir, n), (when, when))
+        write("c.py", "c = 1\n")
+        git("add", "c.py")
+        git("commit", "-qm", "four")
+        rc_b, _out = lens("--base", base, "--lens", "--allow-sensitive")
+        stale = planted("0", 3 * 86400)
+        newer = planted("f", -600)          # 다른 세션이 더 나중에 만든 준비 — 지우지 않는다
+        made = prepared()
+        rc2, out2 = lens("--base", base, "--discard-lens")
+        left = prepared()
+        os.unlink(os.path.join(pdir, newer))
+        rc3, out3 = lens("--base", base, "--discard-lens", "--allow-sensitive")   # [2회차 배선 렌즈 질문] 준비 인자 그대로
+        yield (None if rc_a == 9 and rc_b == 9 and "`--base %s --discard-lens`" % base in out and len(first) == 1
+               and len(made) == 4 and rc2 == 0 and "지웠다" in out2 and left == [newer] and "1개가 남았다" in out2
+               and rc3 == 0 and "지울 것이 없다" in out3 and prepared() == [] and result_paths() == before else
+               "--discard-lens [범위 리뷰]: 준비 %d · %d · 지우기 전 %r · 지우기 %d → 남은 준비 %r (기대 더 나중 것 %s 하나) · "
+               "다시 %d · 결과 파일 %d → %d (기대 9 · 9 · 4개 · 0 · 0 · 그대로 · 민감 경로에 막히지 않는다): %s / %s"
+               % (rc_a, rc_b, made, rc2, left, newer, rc3, len(before), len(result_paths()), out2[-240:], out3[-160:]))
+        # [2회차 적대적 렌즈 low] 정리 기준은 지운 준비의 시각과 하루 전 가운데 늦은 쪽 — 지운 준비가 사흘 전이어도 이틀 전 준비는 지운다.
+        lens("--base", base, "--lens", "--allow-sensitive")
+        for n in prepared():
+            when = time.time() - 3 * 86400
+            os.utime(os.path.join(pdir, n), (when, when))
+        two_days = planted("d", 2 * 86400)
+        rc_old, out_old = lens("--base", base, "--discard-lens")
+        yield (None if rc_old == 0 and "지웠다" in out_old and prepared() == [] else
+               "--discard-lens [사흘 된 준비 · 이틀 된 다른 준비]: exit %d · 남은 준비 %r (기대 0 · 없음 — %s 도 하루가 지났다): %s"
+               % (rc_old, prepared(), two_days, out_old[-200:]))
+        # [2회차 테스트 렌즈 low] 지우지 못하면 exit 2 — "지울 것이 없다"(0)로 넘어가지 않는다.
+        if os.name != "nt" and getattr(os, "geteuid", lambda: 1)() != 0:
+            lens("--base", base, "--lens", "--allow-sensitive")
+            os.chmod(pdir, 0o500)
+            try:
+                rc_ro, out_ro = lens("--base", base, "--discard-lens")
+            finally:
+                os.chmod(pdir, 0o700)
+            rc_rw, _out = lens("--base", base, "--discard-lens")
+            yield (None if rc_ro == 2 and "지우지 못했다" in out_ro and rc_rw == 0 and prepared() == [] else
+                   "--discard-lens [지우지 못함]: 읽기 전용 %d · 되돌린 뒤 %d · 남은 준비 %r (기대 2 · 0 · 없음): %s"
+                   % (rc_ro, rc_rw, prepared(), out_ro[-200:]))
+        else:
+            # [3회차 테스트 렌즈 low] 조용히 빠지지 않는다 — 건너뜀으로 알린다.
+            yield _Skip("--discard-lens [지우지 못함]: 읽기 전용 폴더를 만들 수 없는 환경(Windows · root)")
+        # [1회차 테스트 · 적대적 렌즈 low] 경계 — 범위를 읽지 못함(2 · 결과 파일 없음) · 빈 범위(0 · 다른 준비는 알리고 남긴다) ·
+        #   기록 인자와 함께(2).
+        other = planted("e", 0)
+        rc_bad, out_bad = lens("--base", "no-such-ref", "--discard-lens")
+        rc_empty, out_empty = lens("--base", "HEAD", "--discard-lens")
+        kept = prepared()
+        os.unlink(os.path.join(pdir, other))
+        rc, _out = lens("--base", base, "--discard-lens", "--lens")
+        rc2, _out = lens("--stats", "--discard-lens")
+        rc3, _out = lens("--staged", "--record-lens", "--reviewer", "r", "--summary", "s", "--discard-lens")
+        yield (None if rc_bad == 2 and rc_empty == 0 and "변경이 없다" in out_empty and "1개가 남았다" in out_empty
+               and kept == [other] and result_paths() == before and rc == 2 and rc2 == 2 and rc3 == 2 else
+               "--discard-lens [경계]: 없는 범위 %d · 빈 범위 %d · 남은 준비 %r · 결과 파일 %d → %d · --lens %d · --stats %d · "
+               "--record-lens %d (기대 2 · 0 · 알린 하나 · 그대로 · 2 · 2 · 2): %s / %s"
+               % (rc_bad, rc_empty, kept, len(before), len(result_paths()), rc, rc2, rc3, out_bad[-160:], out_empty[-200:]))
+
+        # ④ 응답 뒤 내부 오류 — 앞선 렌즈 기록으로 커밋을 열지 않는다.
+        write("a.py", "a = 5\n")
+        git("add", "a.py")
+        lens("--staged", "--lens")
+        rc0, _out = lens("--staged", *record)
+        rc, out = run(["render_boom", "--staged"])
+        lost = result_paths("response_lost")
+        data = _read_json(lost[-1]) if lost else {}
+        rc2, err = _gate_call(gate, repo, "git commit -m x", env)
+        rc3, out3 = lens("--staged", "--lens")
+        yield (None if rc0 == 0 and rc == 1 and lost and (data.get("_meta") or {}).get("exit_code") == 1
+               and "request_changes" in str(data.get("response_excerpt")) and rc2 == 2 and "response_lost" in err
+               and rc3 == 2 and "덮을 수 없다" in out3 else
+               "응답 뒤 내부 오류 [response_lost]: 기록 %d · 리뷰 %d · 결과 %d건 · 게이트 %d · 재준비 %d "
+               "(기대 0 · 1 · 1건 · 2 · 2): %s / %s / %s"
+               % (rc0, rc, len(lost), rc2, rc3, out[-200:], err.strip()[:160], out3[-160:]))
+        # [1회차 테스트 렌즈 low] 같은 바이트의 렌즈 기록이 있어도 Gemini 응답이 뒤에 있으면 기록을 다시 돌려도 0 이 아니다.
+        #   [4회차 뒤] `_lens_record` 가 가장 최근 판정에서 멈추므로 거부 검사의 순서와 무관하게 막힌다 — 순서는 ① 의
+        #   "운영자가 렌즈 기록을 끈 뒤 다시" 가 고정한다.
+        rc4, out4 = lens("--staged", *record)
+        yield (None if rc4 == 2 and "덮을 수 없다" in out4 and "이미 있다" not in out4 else
+               "렌즈 기록 [렌즈 기록 뒤 response_lost · 다시 기록]: exit %d (기대 2 · 이미 있다로 빠지지 않는다): %s"
+               % (rc4, out4[-200:]))
+        # [2회차 보안 · 적대적 렌즈 low] 응답을 찍다 출력 파이프가 닫혀도(그 뒤 출력도 모두 실패) response_lost 는 남는다.
+        write("a.py", "a = 9\n")
+        git("add", "a.py")
+        lens("--staged", "--lens")
+        rc0, _out = lens("--staged", *record)
+        before_lost = len(result_paths("response_lost"))
+        rc, out = run(["pipe_boom", "--staged"])
+        after_lost = len(result_paths("response_lost"))
+        rc2, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc0 == 0 and rc == 1 and after_lost == before_lost + 1 and rc2 == 2 and "response_lost" in err else
+               "응답 뒤 내부 오류 [출력 파이프가 닫힘]: 기록 %d · 리뷰 %d · response_lost %d → %d · 게이트 %d "
+               "(기대 0 · 1 · 하나 늘어남 · 2): %s"
+               % (rc0, rc, before_lost, after_lost, rc2, err.strip()[:200]))
+        # [1회차 일반 · 보안 · 테스트 · 배선 렌즈] 텍스트 재시도의 원문을 받은 뒤 터져도 response_lost — 원문이 깊게 중첩돼 발췌
+        #   계산이 RecursionError 를 내도 기록은 남는다.
+        write("a.py", "a = 8\n")
+        git("add", "a.py")
+        lens("--staged", "--lens")
+        rc0, _out = lens("--staged", *record)
+        rc, out = run(["text_boom", "--staged"])
+        lost = result_paths("response_lost")
+        data = _read_json(lost[-1]) if lost else {}
+        excerpt = str(data.get("response_excerpt"))
+        rc2, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc0 == 0 and rc == 1 and len(lost) == 3 and excerpt.startswith("[[[[") and len(excerpt) == 4000
+               and rc2 == 2 and "response_lost" in err else
+               "응답 뒤 내부 오류 [텍스트 재시도 · 발췌 실패]: 기록 %d · 리뷰 %d · response_lost %d건 · 발췌 %r… · 게이트 %d "
+               "(기대 0 · 1 · 3건 · '[[[[' 4000자 · 2): %s / %s"
+               % (rc0, rc, len(lost), excerpt[:20], rc2, out[-200:], err.strip()[:160]))
+        # [3회차 상태 · 적대적 렌즈 low] 응답을 받은 직후의 "응답: …" 줄에서 끊겨도 response_lost.
+        write("a.py", "a = 10\n")
+        git("add", "a.py")
+        lens("--staged", "--lens")
+        rc0, _out = lens("--staged", *record)
+        before_lost = len(result_paths("response_lost"))
+        rc, out = run(["reply_line_boom", "--staged"])
+        after_lost = len(result_paths("response_lost"))
+        rc2, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc0 == 0 and rc == 1 and after_lost == before_lost + 1 and rc2 == 2 and "response_lost" in err else
+               "응답 뒤 내부 오류 [응답 줄에서 끊김]: 기록 %d · 리뷰 %d · response_lost %d → %d · 게이트 %d "
+               "(기대 0 · 1 · 하나 늘어남 · 2): %s" % (rc0, rc, before_lost, after_lost, rc2, err.strip()[:200]))
+        # [3회차 상태 · 배선 · 적대적 · 일반 렌즈 low] 결과 폴더에 쓰지 못했으면 "남겼다 · 덮을 수 없다" 고 말하지 않는다.
+        # [4회차 테스트 렌즈 low] 경고의 **고유 문구**로 본다 — "판정을 남기지 못했다"(첫 줄)로 통과하지 않게.
+        rc, out = run(["boom_nowrite", "--staged"])
+        yield (None if rc == 1 and "그 사실도 결과 폴더에 남기지 못했다" in out
+               and "결과 파일(response_excerpt)에 남겼다" not in out else
+               "응답 뒤 내부 오류 [기록도 실패]: exit %d (기대 1 · 경고 · '남겼다' 없음): %s" % (rc, out[-300:]))
+        rc, out = run(["boom_nocopy", "--staged", "--out", os.path.join(sandbox, "o_nocopy.json")])
+        yield (None if rc == 1 and "그 사실도 결과 폴더에 남기지 못했다" in out
+               and "결과 파일(response_excerpt)에 남겼다" not in out else
+               "응답 뒤 내부 오류 [--out 은 썼지만 결과 폴더 사본 실패]: exit %d (기대 1 · 경고): %s" % (rc, out[-300:]))
+        rc, out = run(["boom_internal_nowrite", "--staged"])
+        yield (None if rc == 1 and "결과도 남기지 못했다" in out else
+               "내부 오류 [기록도 실패]: exit %d (기대 1 · '결과도 남기지 못했다'): %s" % (rc, out[-300:]))
+        # [3회차 상태 · 적대적 · 테스트 렌즈] 판정을 쓴 뒤 "결과 저장:" 줄에서 끊겨도 그 판정이 그대로 게이트를 연다 — 응답 표시는
+        #   그 줄보다 먼저 꺼지고(response_lost 아님), 내부 오류 기록은 다른 이름으로 남는다(판정을 덮지 않는다).
+        write("a.py", "a = 11\n")
+        git("add", "a.py")
+        before = len(result_paths())
+        rc, out = run(["save_line_boom", "--staged"])
+        newest = [(_read_json(p).get("_meta") or {}).get("mode") for p in result_paths()[before:]]
+        rc2, err = _gate_call(gate, repo, "git commit -m x", env)
+        yield (None if rc == 1 and sorted(newest) == ["internal_error", "reviewed"] and rc2 == 0 else
+               "응답 [결과 저장 줄에서 끊김]: exit %d · 새 결과 %r · 게이트 %d (기대 1 · reviewed 와 internal_error · 0): %s"
+               % (rc, newest, rc2, err.strip()[:200]))
+        write("a.py", "a = 6\n")
+        git("add", "a.py")
+        rc, out = run(["odd", "--staged"])
+        last = result_paths()[-1]
+        yield (None if rc == 5 and (_read_json(last).get("_meta") or {}).get("mode") == "reviewed"
+               and "[?] t" in out and "위치: 7:3" in out and "질문: 5" in out else
+               "응답 [필드 타입이 어긋난 지적]: exit %d · %s (기대 5 · reviewed · 그대로 찍는다): %s"
+               % (rc, (_read_json(last).get("_meta") or {}).get("mode"), out[-300:]))
+        write("a.py", "a = 7\n")
+        git("add", "a.py")
+        rc, out = run(["surrogate", "--staged"])
+        last = result_paths()[-1]
+        body = _read_json(last)
+        titles = [f.get("title") for f in body.get("findings") or []]
+        yield (None if rc == 5 and (body.get("_meta") or {}).get("mode") == "reviewed" and titles == ["\ud800"] else
+               "응답 [짝 없는 서로게이트]: exit %d · %s · 제목 %r (기대 5 · reviewed · 읽으면 같은 값): %s"
+               % (rc, (body.get("_meta") or {}).get("mode"), titles, out[-240:]))
     finally:
         _rmtree_sandbox(sandbox, sandbox)
 
@@ -5345,6 +5874,9 @@ _BEHAVIOR_CHECKS = (
     _check_fallback_lenses_have_agents,
     _check_lens_selection,
     _check_lens_default_flow,
+    _check_lens_followups,
+    _check_text_retry_marks_response,
+    _check_stats_keeps_distinct_records_of_one_run,
     _check_out_copies_to_result_dir,
     _check_out_inside_result_dir,
     _check_standin_quota_short_circuit,

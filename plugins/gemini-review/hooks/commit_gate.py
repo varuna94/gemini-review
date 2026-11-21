@@ -41,6 +41,9 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REVIEW_SCRIPT = os.path.join(_HERE, os.pardir, "skills", "gemini-review", "gemini_review.py")
 _GIT_TIMEOUT = 20
 _RESULT_SCAN_CAP = 500          # mtime 최신순으로 이만큼만 읽는다 — 커밋마다 도는 경로다
+# ⛔ [1.11.1 — 사용자 결정] 렌즈 기록을 열 때 늦은 Gemini 지적을 찾으려고 최근 결과를 다시 여는 것을 "기록 시각 언저리"로
+#   좁히는 최적화를 넣었다가 되돌렸다. 그 창의 전제("앞선 지적은 기록이 거부했다")가 시계 보정 · 판 섞임 · 기록의 읽기 실패 ·
+#   네트워크 파일 시스템의 시계에서 차례로 깨졌고(렌즈 리뷰 1~3회차), 얻는 것은 재 보지 않은 성능뿐이었다.
 # [1.11.0] 렌즈 리뷰 기록 mode — `gemini_review._LENS_RECORD_MODES` 와 같다(테스트가 본다). 1.10.x 는 `fallback_reviewed`.
 _LENS_RECORD_MODES = ("lens_reviewed", "fallback_reviewed")
 # [1.11.0 1회차 상태 · 배선 · 적대적 렌즈] 아무것도 리뷰하지 않은 결과 — 쿼터 · 시간 초과 · 무응답 · 민감 경로 중단 · 실행
